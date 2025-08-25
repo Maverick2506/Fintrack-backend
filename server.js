@@ -185,6 +185,32 @@ app.post("/api/debts", authMiddleware, async (req, res) => {
   }
 });
 
+app.post("/api/debts/:id/pay", authMiddleware, async (req, res) => {
+  try {
+    const debt = await Debt.findByPk(req.params.id);
+    if (debt) {
+      const paymentAmount = parseFloat(req.body.amount);
+      debt.total_remaining = parseFloat(debt.total_remaining) - paymentAmount;
+      await debt.save();
+
+      // Also create an expense for this payment
+      await Expense.create({
+        name: `Payment for ${debt.name}`,
+        amount: paymentAmount,
+        due_date: new Date(),
+        is_paid: true,
+        category: "Debt",
+      });
+
+      res.json(debt);
+    } else {
+      res.status(404).send("Debt not found");
+    }
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.delete("/api/debts/:id", authMiddleware, async (req, res) => {
   try {
     const debt = await Debt.findByPk(req.params.id);
