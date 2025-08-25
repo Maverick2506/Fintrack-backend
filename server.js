@@ -20,7 +20,6 @@ app.use(express.json());
 // --- HARDCODED PASSWORD & SECRET KEY ---
 // --- SECRETS FROM ENVIRONMENT VARIABLES ---
 const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD;
-const JWT_SECRET = process.env.JWT_SECRET;
 
 // --- AUTH MIDDLEWARE ---
 const authMiddleware = (req, res, next) => {
@@ -30,7 +29,7 @@ const authMiddleware = (req, res, next) => {
   }
   const token = authHeader.split(" ")[1];
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, SUPER_SECRET_PASSWORD);
     req.user = decoded;
     next();
   } catch (error) {
@@ -45,7 +44,7 @@ app.post("/api/auth/login", async (req, res) => {
     if (password !== SUPER_SECRET_PASSWORD) {
       return res.status(401).json({ error: "Invalid credentials." });
     }
-    const token = jwt.sign({ user: "Maverick" }, JWT_SECRET, {
+    const token = jwt.sign({ user: "Maverick" }, SUPER_SECRET_PASSWORD, {
       expiresIn: "1d",
     });
     res.json({ token });
