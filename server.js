@@ -8,7 +8,7 @@ const {
   SavingsGoal,
 } = require("./models");
 const { Op } = require("sequelize");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { GoogleGenerativeAI } = require("@google/genai");
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -330,7 +330,7 @@ app.post("/api/financial-advice", authMiddleware, async (req, res) => {
   }
   try {
     const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash-latest",
+      model: "gemini-2.5-flash-latest",
     });
     const prompt = `Based on the following financial data, provide a short, actionable financial tip for a user named Maverick: ${JSON.stringify(
       req.body
@@ -350,7 +350,7 @@ app.post("/api/categorize-expense", authMiddleware, async (req, res) => {
   }
   try {
     const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash-latest",
+      model: "gemini-2.5-flash-latest",
     });
     const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
     const result = await model.generateContent(prompt);
