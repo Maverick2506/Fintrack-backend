@@ -87,7 +87,21 @@ app.get("/api/expenses/monthly", authMiddleware, async (req, res) => {
 
 app.post("/api/expenses", authMiddleware, async (req, res) => {
   try {
-    const newExpense = await Expense.create({ ...req.body, is_paid: false });
+    const { name, amount, category } = req.body;
+
+    if (category === "Debt") {
+      const debt = await Debt.findOne({ where: { name } });
+      if (debt) {
+        debt.total_remaining =
+          parseFloat(debt.total_remaining) - parseFloat(amount);
+        await debt.save();
+      }
+    }
+
+    const newExpense = await Expense.create({
+      ...req.body,
+      is_paid: category === "Debt",
+    });
     res.status(201).json(newExpense);
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -147,28 +161,17 @@ app.post("/api/debts", authMiddleware, async (req, res) => {
   }
 });
 
-app.post("/api/debts/:id/pay", authMiddleware, async (req, res) => {
+app.delete("/api/debts/:id", authMiddleware, async (req, res) => {
   try {
     const debt = await Debt.findByPk(req.params.id);
     if (debt) {
-      const paymentAmount = parseFloat(req.body.amount);
-      debt.total_remaining = parseFloat(debt.total_remaining) - paymentAmount;
-      await debt.save();
-
-      await Expense.create({
-        name: `Payment for ${debt.name}`,
-        amount: paymentAmount,
-        due_date: new Date(),
-        is_paid: true,
-        category: "Debt",
-      });
-
-      res.json(debt);
+      await debt.destroy();
+      res.status(204).send();
     } else {
       res.status(404).send("Debt not found");
     }
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -188,6 +191,20 @@ app.post("/api/savings-goals", authMiddleware, async (req, res) => {
     res.status(201).json(newGoal);
   } catch (error) {
     res.status(400).json({ error: error.message });
+  }
+});
+
+app.delete("/api/savings-goals/:id", authMiddleware, async (req, res) => {
+  try {
+    const goal = await SavingsGoal.findByPk(req.params.id);
+    if (goal) {
+      await goal.destroy();
+      res.status(204).send();
+    } else {
+      res.status(404).send("Savings Goal not found");
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
