@@ -94,7 +94,9 @@ app.post("/api/expenses", authMiddleware, async (req, res) => {
     const { name, amount, category } = req.body;
 
     if (category === "Debt") {
-      const debt = await Debt.findOne({ where: { name } });
+      const debt = await Debt.findOne({
+        where: { name: name.replace("Payment for ", "") },
+      });
       if (debt) {
         debt.total_remaining =
           parseFloat(debt.total_remaining) - parseFloat(amount);
@@ -102,10 +104,7 @@ app.post("/api/expenses", authMiddleware, async (req, res) => {
       }
     }
 
-    const newExpense = await Expense.create({
-      ...req.body,
-      is_paid: category === "Debt",
-    });
+    const newExpense = await Expense.create({ ...req.body, is_paid: true });
     res.status(201).json(newExpense);
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -250,18 +249,14 @@ app.get("/api/dashboard", authMiddleware, async (req, res) => {
     });
     const totalSpending = await Expense.sum("amount", {
       where: {
-        is_paid: true,
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
       },
     });
-    const upcomingBills =
-      month === new Date().getMonth() && year === new Date().getFullYear()
-        ? await Expense.findAll({
-            where: { is_paid: false, due_date: { [Op.gte]: today } },
-            order: [["due_date", "ASC"]],
-            limit: 5,
-          })
-        : [];
+    const upcomingBills = await Expense.findAll({
+      where: { is_paid: false, due_date: { [Op.gte]: today } },
+      order: [["due_date", "ASC"]],
+      limit: 5,
+    });
 
     const debtSummary = await Debt.findAll();
     const savingsSummary = await SavingsGoal.findAll();
@@ -298,7 +293,6 @@ app.get("/api/spending-summary", authMiddleware, async (req, res) => {
         [sequelize.fn("SUM", sequelize.col("amount")), "total_amount"],
       ],
       where: {
-        is_paid: true,
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
       },
       group: ["category"],
@@ -323,7 +317,7 @@ app.post("/api/financial-advice", authMiddleware, async (req, res) => {
     )}`;
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    res.json(response.text());
+    res.json({ advice: response.text() });
   } catch (error) {
     res.status(500).json({ error: "Failed to generate financial advice." });
   }
