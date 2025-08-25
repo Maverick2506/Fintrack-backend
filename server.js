@@ -13,14 +13,14 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 app.use(cors());
-const port = 8000;
+const port = process.env.PORT || 8000;
 
 app.use(express.json());
 
 // --- HARDCODED PASSWORD & SECRET KEY ---
-const SUPER_SECRET_PASSWORD = "Elite#250603";
-const JWT_SECRET =
-  "9f0941c54dd3ea8d164c060dbc5bf1fbfc73a967e9f1bb6dc70f2128578ed3f0";
+// --- SECRETS FROM ENVIRONMENT VARIABLES ---
+const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD;
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // --- AUTH MIDDLEWARE ---
 const authMiddleware = (req, res, next) => {
