@@ -12,7 +12,15 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-app.use(cors());
+
+// --- CORS CONFIGURATION ---
+const corsOptions = {
+  origin: "https://fintrack-frontend-jet.vercel.app",
+  optionsSuccessStatus: 200, // For legacy browser support
+};
+app.use(cors(corsOptions));
+// --- END CORS CONFIGURATION ---
+
 const port = process.env.PORT || 8000;
 
 app.use(express.json());
