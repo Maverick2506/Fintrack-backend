@@ -8,7 +8,7 @@ const {
   SavingsGoal,
 } = require("./models");
 const { Op } = require("sequelize");
-const fetch = require("node-fetch");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
 const jwt = require("jsonwebtoken");
 
 const app = express();
@@ -19,6 +19,10 @@ app.use(express.json());
 
 // --- SECRETS FROM ENVIRONMENT VARIABLES ---
 const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
+// --- GEMINI SETUP ---
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
 // --- AUTH MIDDLEWARE ---
 const authMiddleware = (req, res, next) => {
@@ -312,11 +316,29 @@ app.get("/api/spending-summary", authMiddleware, async (req, res) => {
 
 // Gemini Endpoints
 app.post("/api/financial-advice", authMiddleware, async (req, res) => {
-  // ... your financial advice logic
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const prompt = `Based on the following financial data, provide a short, actionable financial tip for a user named Maverick: ${JSON.stringify(
+      req.body
+    )}`;
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    res.json(response.text());
+  } catch (error) {
+    res.status(500).json({ error: "Failed to generate financial advice." });
+  }
 });
 
 app.post("/api/categorize-expense", authMiddleware, async (req, res) => {
-  // ... your categorization logic
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    res.json({ category: response.text() });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to categorize expense." });
+  }
 });
 
 // --- Initialize Server ---
