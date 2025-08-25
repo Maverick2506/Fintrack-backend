@@ -65,6 +65,26 @@ app.post("/api/paycheques", authMiddleware, async (req, res) => {
 });
 
 // Expense Endpoints
+app.get("/api/expenses/monthly", authMiddleware, async (req, res) => {
+  try {
+    const { year, month } = req.query;
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0);
+
+    const expenses = await Expense.findAll({
+      where: {
+        due_date: {
+          [Op.between]: [startDate, endDate],
+        },
+      },
+      order: [["due_date", "ASC"]],
+    });
+    res.json(expenses);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/expenses", authMiddleware, async (req, res) => {
   try {
     const newExpense = await Expense.create({ ...req.body, is_paid: false });
@@ -135,7 +155,6 @@ app.post("/api/debts/:id/pay", authMiddleware, async (req, res) => {
       debt.total_remaining = parseFloat(debt.total_remaining) - paymentAmount;
       await debt.save();
 
-      // Also create an expense for this payment
       await Expense.create({
         name: `Payment for ${debt.name}`,
         amount: paymentAmount,
