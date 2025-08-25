@@ -107,6 +107,9 @@ app.post("/api/expenses", authMiddleware, async (req, res) => {
   try {
     const { name, amount, category } = req.body;
 
+    // Default is_paid to false
+    let is_paid = false;
+
     if (category === "Debt") {
       const debt = await Debt.findOne({
         where: { name: name.replace("Payment for ", "") },
@@ -115,10 +118,11 @@ app.post("/api/expenses", authMiddleware, async (req, res) => {
         debt.total_remaining =
           parseFloat(debt.total_remaining) - parseFloat(amount);
         await debt.save();
+        is_paid = true; // Mark debt payments as paid immediately
       }
     }
 
-    const newExpense = await Expense.create({ ...req.body, is_paid: true });
+    const newExpense = await Expense.create({ ...req.body, is_paid });
     res.status(201).json(newExpense);
   } catch (error) {
     console.error("Error creating expense:", error);
@@ -153,6 +157,8 @@ app.delete("/api/expenses/:id", authMiddleware, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ... (The rest of your server.js file remains the same)
 
 // Debt Endpoints
 app.get("/api/debts", authMiddleware, async (req, res) => {
