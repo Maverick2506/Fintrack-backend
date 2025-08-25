@@ -15,8 +15,8 @@ const app = express();
 
 // --- CORS CONFIGURATION ---
 const corsOptions = {
-  origin: "https://fintrack-frontend-jet.vercel.app",
-  optionsSuccessStatus: 200, // For legacy browser support
+  origin: "https://fintrack-frontend-jet.vercel.app", // Your frontend URL
+  optionsSuccessStatus: 200,
 };
 app.use(cors(corsOptions));
 // --- END CORS CONFIGURATION ---
@@ -25,12 +25,17 @@ const port = process.env.PORT || 8000;
 
 app.use(express.json());
 
-// --- SECRETS FROM ENVIRONMENT VARIABLES ---
+// --- SECRETS & API KEYS ---
 const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 // --- GEMINI SETUP ---
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+let genAI;
+if (GEMINI_API_KEY) {
+  genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+} else {
+  console.error("GEMINI_API_KEY is not set. AI features will be disabled.");
+}
 
 // --- AUTH MIDDLEWARE ---
 const authMiddleware = (req, res, next) => {
@@ -60,6 +65,7 @@ app.post("/api/auth/login", async (req, res) => {
     });
     res.json({ token });
   } catch (error) {
+    console.error("Login Error:", error);
     res.status(500).json({ error: "Server error during login." });
   }
 });
@@ -115,6 +121,7 @@ app.post("/api/expenses", authMiddleware, async (req, res) => {
     const newExpense = await Expense.create({ ...req.body, is_paid: true });
     res.status(201).json(newExpense);
   } catch (error) {
+    console.error("Error creating expense:", error);
     res.status(400).json({ error: error.message });
   }
 });
@@ -322,7 +329,9 @@ app.post("/api/financial-advice", authMiddleware, async (req, res) => {
     return res.status(500).json({ error: "AI service is not configured." });
   }
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({
+      model: "gemini-1.5-flash-latest",
+    });
     const prompt = `Based on the following financial data, provide a short, actionable financial tip for a user named Maverick: ${JSON.stringify(
       req.body
     )}`;
@@ -340,7 +349,9 @@ app.post("/api/categorize-expense", authMiddleware, async (req, res) => {
     return res.status(500).json({ error: "AI service is not configured." });
   }
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+    const model = genAI.getGenerativeModel({
+      model: "gemini-1.5-flash-latest",
+    });
     const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
     const result = await model.generateContent(prompt);
     const response = await result.response;
