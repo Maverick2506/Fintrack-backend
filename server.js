@@ -316,7 +316,7 @@ app.get("/api/spending-summary", authMiddleware, async (req, res) => {
   }
 });
 
-// Gemini Endpoints
+// --- GEMINI ENDPOINTS ---
 app.post("/api/financial-advice", authMiddleware, async (req, res) => {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-pro" });
@@ -327,6 +327,7 @@ app.post("/api/financial-advice", authMiddleware, async (req, res) => {
     const response = await result.response;
     res.json({ advice: response.text() });
   } catch (error) {
+    console.error("Gemini financial advice error:", error);
     res.status(500).json({ error: "Failed to generate financial advice." });
   }
 });
@@ -339,6 +340,7 @@ app.post("/api/categorize-expense", authMiddleware, async (req, res) => {
     const response = await result.response;
     res.json({ category: response.text() });
   } catch (error) {
+    console.error("Gemini categorization error:", error);
     res.status(500).json({ error: "Failed to categorize expense." });
   }
 });
