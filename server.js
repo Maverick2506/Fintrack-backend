@@ -19,7 +19,8 @@ app.use(express.json());
 
 // --- HARDCODED PASSWORD & SECRET KEY ---
 const SUPER_SECRET_PASSWORD = "Elite#250603";
-const JWT_SECRET = "your_super_secret_jwt_key_that_is_long_and_secure";
+const JWT_SECRET =
+  "9f0941c54dd3ea8d164c060dbc5bf1fbfc73a967e9f1bb6dc70f2128578ed3f0";
 
 // --- AUTH MIDDLEWARE ---
 const authMiddleware = (req, res, next) => {
