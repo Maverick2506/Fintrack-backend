@@ -17,7 +17,6 @@ const port = process.env.PORT || 8000;
 
 app.use(express.json());
 
-// --- HARDCODED PASSWORD & SECRET KEY ---
 // --- SECRETS FROM ENVIRONMENT VARIABLES ---
 const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD;
 
@@ -113,19 +112,38 @@ app.get("/api/debts", authMiddleware, async (req, res) => {
   }
 });
 
+app.post("/api/debts", authMiddleware, async (req, res) => {
+  try {
+    const { name, total_amount, monthly_payment } = req.body;
+    const newDebt = await Debt.create({
+      name,
+      total_amount,
+      total_remaining: total_amount,
+      monthly_payment,
+    });
+    res.status(201).json(newDebt);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.post("/api/debts/:id/pay", authMiddleware, async (req, res) => {
   try {
     const debt = await Debt.findByPk(req.params.id);
     if (debt) {
-      debt.total_remaining -= parseFloat(req.body.amount);
+      const paymentAmount = parseFloat(req.body.amount);
+      debt.total_remaining = parseFloat(debt.total_remaining) - paymentAmount;
       await debt.save();
+
+      // Also create an expense for this payment
       await Expense.create({
         name: `Payment for ${debt.name}`,
-        amount: req.body.amount,
-        due_date: req.body.payment_date,
+        amount: paymentAmount,
+        due_date: new Date(),
         is_paid: true,
         category: "Debt",
       });
+
       res.json(debt);
     } else {
       res.status(404).send("Debt not found");
@@ -142,6 +160,15 @@ app.get("/api/savings-goals", authMiddleware, async (req, res) => {
     res.json(goals);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+app.post("/api/savings-goals", authMiddleware, async (req, res) => {
+  try {
+    const newGoal = await SavingsGoal.create(req.body);
+    res.status(201).json(newGoal);
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 

@@ -6,6 +6,10 @@ const Debt = sequelize.define("Debt", {
     type: DataTypes.STRING,
     allowNull: false,
   },
+  total_amount: {
+    type: DataTypes.DECIMAL(10, 2),
+    allowNull: false,
+  },
   total_remaining: {
     type: DataTypes.DECIMAL(10, 2),
     allowNull: false,
