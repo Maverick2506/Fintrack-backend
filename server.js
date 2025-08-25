@@ -316,8 +316,11 @@ app.get("/api/spending-summary", authMiddleware, async (req, res) => {
   }
 });
 
-// --- GEMINI ENDPOINTS ---
+// Gemini Endpoints
 app.post("/api/financial-advice", authMiddleware, async (req, res) => {
+  if (!genAI) {
+    return res.status(500).json({ error: "AI service is not configured." });
+  }
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-pro" });
     const prompt = `Based on the following financial data, provide a short, actionable financial tip for a user named Maverick: ${JSON.stringify(
@@ -333,6 +336,9 @@ app.post("/api/financial-advice", authMiddleware, async (req, res) => {
 });
 
 app.post("/api/categorize-expense", authMiddleware, async (req, res) => {
+  if (!genAI) {
+    return res.status(500).json({ error: "AI service is not configured." });
+  }
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-pro" });
     const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
