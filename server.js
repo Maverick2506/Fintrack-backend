@@ -387,7 +387,7 @@ app.post("/api/categorize-expense", authMiddleware, async (req, res) => {
     const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    res.json({ category: response.text() });
+    res.json({ category: response.text().trim() });
   } catch (error) {
     console.error("Gemini categorization error:", error);
     res.status(500).json({ error: "Failed to categorize expense." });
