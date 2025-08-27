@@ -5,11 +5,11 @@ const {
   Expense,
   Debt,
   SavingsGoal,
+  CreditCard, // Import CreditCard
 } = require("../models");
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
-const { CreditCard } = require("../models");
 
 router.use(authMiddleware);
 
@@ -28,11 +28,15 @@ router.get("/dashboard", async (req, res) => {
     const totalIncome = await Paycheque.sum("amount", {
       where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
     });
+
+    // MODIFIED: Only sum expenses that were NOT paid with a credit card
     const totalSpending = await Expense.sum("amount", {
       where: {
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
+        paid_with_credit_card: false, // This is the new condition
       },
     });
+
     const upcomingBills = await Expense.findAll({
       where: { is_paid: false, due_date: { [Op.gte]: today } },
       order: [["due_date", "ASC"]],
@@ -59,6 +63,7 @@ router.get("/dashboard", async (req, res) => {
   }
 });
 
+// This route remains the same
 router.get("/spending-summary", async (req, res) => {
   try {
     const year = req.query.year

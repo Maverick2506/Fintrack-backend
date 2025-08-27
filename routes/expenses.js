@@ -1,11 +1,12 @@
 const express = require("express");
-const { Expense, Debt } = require("../models");
+const { Expense, CreditCard, Debt } = require("../models"); // Make sure to import CreditCard
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 router.use(authMiddleware);
 
+// This route remains the same
 router.get("/expenses/monthly", async (req, res) => {
   try {
     const { year, month } = req.query;
@@ -26,16 +27,18 @@ router.get("/expenses/monthly", async (req, res) => {
   }
 });
 
+// MODIFIED: Logic to update credit card balance on creation
 router.post("/expenses", async (req, res) => {
   try {
-    const { amount, creditCardId, isCreditCardTransaction } = req.body;
+    const { amount, creditCardId } = req.body;
     const newExpense = await Expense.create(req.body);
 
-    // If it's a credit card transaction, update the card's balance
-    if (isCreditCardTransaction && creditCardId) {
+    // If a credit card was used, find it and increase its balance
+    if (creditCardId) {
       const card = await CreditCard.findByPk(creditCardId);
       if (card) {
-        card.balance = parseFloat(card.balance) + parseFloat(amount);
+        card.currentBalance =
+          parseFloat(card.currentBalance) + parseFloat(amount);
         await card.save();
       }
     }
@@ -47,6 +50,7 @@ router.post("/expenses", async (req, res) => {
   }
 });
 
+// This route remains the same
 router.put("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
@@ -61,15 +65,17 @@ router.put("/expenses/:id", async (req, res) => {
   }
 });
 
+// MODIFIED: Logic to revert credit card balance on deletion
 router.delete("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
     if (expense) {
-      // If the deleted expense was on a credit card, revert the balance
-      if (expense.isCreditCardTransaction && expense.creditCardId) {
+      // If the deleted expense was on a credit card, revert the balance change
+      if (expense.creditCardId) {
         const card = await CreditCard.findByPk(expense.creditCardId);
         if (card) {
-          card.balance = parseFloat(card.balance) - parseFloat(expense.amount);
+          card.currentBalance =
+            parseFloat(card.currentBalance) - parseFloat(expense.amount);
           await card.save();
         }
       }
