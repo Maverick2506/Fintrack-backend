@@ -1,12 +1,13 @@
 const express = require("express");
-const { Expense, CreditCard, Debt } = require("../models"); // Make sure to import CreditCard
+// Make sure to import the CreditCard model
+const { Expense, Debt, CreditCard } = require("../models");
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 router.use(authMiddleware);
 
-// This route remains the same
+// No changes needed for this route
 router.get("/expenses/monthly", async (req, res) => {
   try {
     const { year, month } = req.query;
@@ -27,13 +28,13 @@ router.get("/expenses/monthly", async (req, res) => {
   }
 });
 
-// MODIFIED: Logic to update credit card balance on creation
+// MODIFIED: This route now updates the credit card balance when an expense is created
 router.post("/expenses", async (req, res) => {
   try {
     const { amount, creditCardId } = req.body;
     const newExpense = await Expense.create(req.body);
 
-    // If a credit card was used, find it and increase its balance
+    // If a creditCardId is provided, find the card and increase its balance
     if (creditCardId) {
       const card = await CreditCard.findByPk(creditCardId);
       if (card) {
@@ -50,7 +51,7 @@ router.post("/expenses", async (req, res) => {
   }
 });
 
-// This route remains the same
+// No changes needed for this route
 router.put("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
@@ -65,12 +66,12 @@ router.put("/expenses/:id", async (req, res) => {
   }
 });
 
-// MODIFIED: Logic to revert credit card balance on deletion
+// MODIFIED: This route now reverts the balance change if a credit card expense is deleted
 router.delete("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
     if (expense) {
-      // If the deleted expense was on a credit card, revert the balance change
+      // If the deleted expense was on a credit card, find the card and decrease its balance
       if (expense.creditCardId) {
         const card = await CreditCard.findByPk(expense.creditCardId);
         if (card) {

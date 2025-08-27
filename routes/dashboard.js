@@ -29,10 +29,11 @@ router.get("/dashboard", async (req, res) => {
       where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
     });
 
+    // MODIFIED: Only sum expenses that were NOT paid with a credit card for cash flow calculation
     const totalSpending = await Expense.sum("amount", {
       where: {
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
-        paid_with_credit_card: false, // Correctly excludes CC transactions
+        paid_with_credit_card: false, // This ensures we only count cash/debit expenses
       },
     });
 
@@ -44,13 +45,8 @@ router.get("/dashboard", async (req, res) => {
 
     const debtSummary = await Debt.findAll();
     const savingsSummary = await SavingsGoal.findAll();
-    // MODIFIED: Correctly include associated Expenses when fetching cards
     const creditCardSummary = await CreditCard.findAll({
-      include: [
-        {
-          model: Expense,
-        },
-      ],
+      include: [{ model: Expense }],
     });
 
     res.json({
@@ -65,12 +61,12 @@ router.get("/dashboard", async (req, res) => {
       creditCardSummary,
     });
   } catch (error) {
-    console.error("Dashboard Error:", error); // Added for better logging
+    console.error("Dashboard Error:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// This route remains the same
+// No changes needed for this route
 router.get("/spending-summary", async (req, res) => {
   try {
     const year = req.query.year

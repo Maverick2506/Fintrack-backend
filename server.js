@@ -1,8 +1,8 @@
 const express = require("express");
 const cors = require("cors");
-const { sequelize, Expense } = require("./models");
-const { Op } = require("sequelize");
-const cron = require("node-cron");
+const { sequelize, Expense } = require("./models"); // Import Expense model
+const { Op } = require("sequelize"); // Import Op for queries
+const cron = require("node-cron"); // Import the cron library
 const authRoutes = require("./routes/auth");
 const expenseRoutes = require("./routes/expenses");
 const debtRoutes = require("./routes/debts");
@@ -13,28 +13,23 @@ const creditCardRoutes = require("./routes/creditCards");
 
 const app = express();
 
-// --- NEW, MORE ROBUST CORS CONFIGURATION ---
+// --- CORS CONFIGURATION ---
 const allowedOrigins = [
   "https://fintrack-frontend-jet.vercel.app",
-  "http://localhost:5173", // Also allow your local development server
+  "http://localhost:5173",
 ];
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) === -1) {
-      const msg =
-        "The CORS policy for this site does not " +
-        "allow access from the specified Origin.";
-      return callback(new Error(msg), false);
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
     }
-    return callback(null, true);
   },
   methods: "GET,POST,PUT,DELETE,OPTIONS",
   allowedHeaders: "Content-Type,Authorization",
   credentials: true,
-  optionsSuccessStatus: 200, // For legacy browser support
 };
 
 app.use(cors(corsOptions));
@@ -53,14 +48,16 @@ app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
 
-// --- Automated Task Scheduler ---
+// --- NEW: Automated Daily Task Scheduler ---
+// This task runs every day at midnight.
 cron.schedule("0 0 * * *", async () => {
-  console.log("Running daily check for credit card bills due...");
+  console.log("Running daily check for due credit card bills...");
   try {
     const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    today.setHours(0, 0, 0, 0); // Normalize to the start of the day
 
-    const billsToPay = await Expense.findAll({
+    // Find all unpaid expenses that were made with a credit card and are due today or in the past
+    const billsToUpdate = await Expense.findAll({
       where: {
         is_paid: false,
         paid_with_credit_card: true,
@@ -70,22 +67,23 @@ cron.schedule("0 0 * * *", async () => {
       },
     });
 
-    if (billsToPay.length > 0) {
+    if (billsToUpdate.length > 0) {
       console.log(
-        `Found ${billsToPay.length} credit card bills to mark as paid.`
+        `Found ${billsToUpdate.length} credit card bill(s) to mark as paid.`
       );
-      for (const bill of billsToPay) {
+      for (const bill of billsToUpdate) {
         bill.is_paid = true;
         await bill.save();
         console.log(`Marked bill "${bill.name}" (ID: ${bill.id}) as paid.`);
       }
     } else {
-      console.log("No credit card bills due today.");
+      console.log("No overdue credit card bills found today.");
     }
   } catch (error) {
-    console.error("Error in scheduled task:", error);
+    console.error("Error running the scheduled bill payment task:", error);
   }
 });
+// --- END: Automated Task Scheduler ---
 
 // --- Initialize Server ---
 async function initialize() {
