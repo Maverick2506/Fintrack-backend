@@ -5,7 +5,7 @@ const {
   Expense,
   Debt,
   SavingsGoal,
-  CreditCard, // Make sure CreditCard is imported
+  CreditCard,
 } = require("../models");
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -29,18 +29,29 @@ router.get("/dashboard", async (req, res) => {
       where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
     });
 
-    // MODIFIED: Only sum expenses that were NOT paid with a credit card for cash flow calculation
     const totalSpending = await Expense.sum("amount", {
       where: {
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
-        paid_with_credit_card: false, // This ensures we only count cash/debit expenses
+        paid_with_credit_card: false,
       },
     });
 
+    // This remains for the UI component
     const upcomingBills = await Expense.findAll({
       where: { is_paid: false, due_date: { [Op.gte]: today } },
       order: [["due_date", "ASC"]],
       limit: 5,
+    });
+
+    // NEW: Fetch ALL upcoming bills for the current month for the AI advisor
+    const allUpcomingBills = await Expense.findAll({
+      where: {
+        is_paid: false,
+        due_date: {
+          [Op.between]: [today, endOfMonth],
+        },
+      },
+      order: [["due_date", "ASC"]],
     });
 
     const debtSummary = await Debt.findAll();
@@ -56,6 +67,7 @@ router.get("/dashboard", async (req, res) => {
         netFlow: (totalIncome || 0) - (totalSpending || 0),
       },
       upcomingBills,
+      allUpcomingBills, // Add the new data to the response
       debtSummary,
       savingsSummary,
       creditCardSummary,
@@ -66,7 +78,7 @@ router.get("/dashboard", async (req, res) => {
   }
 });
 
-// No changes needed for this route
+// No changes needed for the spending summary route
 router.get("/spending-summary", async (req, res) => {
   try {
     const year = req.query.year

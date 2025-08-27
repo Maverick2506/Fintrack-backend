@@ -14,7 +14,7 @@ if (GEMINI_API_KEY) {
 
 router.use(authMiddleware);
 
-// MODIFIED: This route now uses a much more detailed prompt
+// MODIFIED: This route now uses a much more detailed and comprehensive prompt
 router.post("/financial-advice", async (req, res) => {
   if (!genAI) {
     return res.status(500).json({ error: "AI service is not configured." });
@@ -25,7 +25,7 @@ router.post("/financial-advice", async (req, res) => {
     });
 
     // Destructure the detailed financial data from the request body
-    const { monthlySummary, upcomingBills, debtSummary, creditCardSummary } =
+    const { monthlySummary, allUpcomingBills, debtSummary, creditCardSummary } =
       req.body;
 
     // Create a more comprehensive prompt for the AI
@@ -34,13 +34,13 @@ router.post("/financial-advice", async (req, res) => {
 
       1.  **Monthly Cash Flow:**
           * Total Income: $${monthlySummary.totalIncome.toFixed(2)}
-          * Total Cash Spending (excluding credit card expenses): $${monthlySummary.totalSpending.toFixed(
+          * Total Cash Spending (not including new credit card debt): $${monthlySummary.totalSpending.toFixed(
             2
           )}
           * Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}
 
-      2.  **Upcoming Bills for the Rest of the Month:**
-          * You have the following unpaid bills due: ${upcomingBills
+      2.  **All Upcoming Bills for This Month:**
+          * You have the following unpaid bills due: ${allUpcomingBills
             .map((bill) => `${bill.name} ($${bill.amount}) on ${bill.due_date}`)
             .join(", ")}.
 
@@ -56,7 +56,7 @@ router.post("/financial-advice", async (req, res) => {
             )
             .join("\n          * ")}
 
-      4.  **Overall Debts:**
+      4.  **Overall Installment Debts:**
           * ${debtSummary
             .map(
               (debt) =>
@@ -66,7 +66,7 @@ router.post("/financial-advice", async (req, res) => {
             )
             .join("\n          * ")}
 
-      Based on this complete picture, what is one specific, actionable piece of advice you can give Maverick? (For example, suggest paying down a high-interest card, warn about an upcoming large expense, or praise a low spending amount).
+      Based on this complete picture, what is one specific, actionable piece of advice you can give Maverick? Focus on the most immediate and impactful action they can take.
     `;
 
     const result = await model.generateContent(prompt);
