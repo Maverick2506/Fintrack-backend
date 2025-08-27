@@ -9,6 +9,7 @@ const {
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
+const { CreditCard } = require("../models");
 
 router.use(authMiddleware);
 
@@ -40,6 +41,7 @@ router.get("/dashboard", async (req, res) => {
 
     const debtSummary = await Debt.findAll();
     const savingsSummary = await SavingsGoal.findAll();
+    const creditCardSummary = await CreditCard.findAll();
 
     res.json({
       monthlySummary: {
@@ -50,6 +52,7 @@ router.get("/dashboard", async (req, res) => {
       upcomingBills,
       debtSummary,
       savingsSummary,
+      creditCardSummary,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });

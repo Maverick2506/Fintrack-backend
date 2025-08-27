@@ -7,6 +7,7 @@ const debtRoutes = require("./routes/debts");
 const savingsGoalRoutes = require("./routes/savingsGoals");
 const dashboardRoutes = require("./routes/dashboard");
 const geminiRoutes = require("./routes/gemini");
+const creditCardRoutes = require("./routes/creditCards");
 
 const app = express();
 
@@ -29,6 +30,7 @@ app.use("/api", debtRoutes);
 app.use("/api", savingsGoalRoutes);
 app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
+app.use("/api", creditCardRoutes);
 
 // --- Initialize Server ---
 async function initialize() {

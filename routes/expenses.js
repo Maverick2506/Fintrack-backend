@@ -28,22 +28,18 @@ router.get("/expenses/monthly", async (req, res) => {
 
 router.post("/expenses", async (req, res) => {
   try {
-    const { name, amount, category } = req.body;
-    let is_paid = false;
+    const { amount, creditCardId, isCreditCardTransaction } = req.body;
+    const newExpense = await Expense.create(req.body);
 
-    if (category === "Debt") {
-      const debt = await Debt.findOne({
-        where: { name: name.replace("Payment for ", "") },
-      });
-      if (debt) {
-        debt.total_remaining =
-          parseFloat(debt.total_remaining) - parseFloat(amount);
-        await debt.save();
-        is_paid = true;
+    // If it's a credit card transaction, update the card's balance
+    if (isCreditCardTransaction && creditCardId) {
+      const card = await CreditCard.findByPk(creditCardId);
+      if (card) {
+        card.balance = parseFloat(card.balance) + parseFloat(amount);
+        await card.save();
       }
     }
 
-    const newExpense = await Expense.create({ ...req.body, is_paid });
     res.status(201).json(newExpense);
   } catch (error) {
     console.error("Error creating expense:", error);
@@ -69,15 +65,12 @@ router.delete("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
     if (expense) {
-      // If the deleted expense was a debt payment, revert the debt amount.
-      if (expense.category === "Debt") {
-        const debt = await Debt.findOne({
-          where: { name: expense.name.replace("Payment for ", "") },
-        });
-        if (debt) {
-          debt.total_remaining =
-            parseFloat(debt.total_remaining) + parseFloat(expense.amount);
-          await debt.save();
+      // If the deleted expense was on a credit card, revert the balance
+      if (expense.isCreditCardTransaction && expense.creditCardId) {
+        const card = await CreditCard.findByPk(expense.creditCardId);
+        if (card) {
+          card.balance = parseFloat(card.balance) - parseFloat(expense.amount);
+          await card.save();
         }
       }
 

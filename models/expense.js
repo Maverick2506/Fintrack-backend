@@ -18,7 +18,7 @@ const Expense = sequelize.define("Expense", {
     type: DataTypes.BOOLEAN,
     defaultValue: false,
   },
-  // We've added more useful categories to the ENUM list
+
   category: {
     type: DataTypes.ENUM(
       "Essentials",
@@ -35,6 +35,11 @@ const Expense = sequelize.define("Expense", {
   recurrence: {
     type: DataTypes.ENUM("none", "monthly", "yearly"),
     defaultValue: "none",
+  },
+
+  isCreditCardTransaction: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
   },
 });
 

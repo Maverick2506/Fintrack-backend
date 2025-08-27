@@ -3,19 +3,25 @@ const Paycheque = require("./paycheque");
 const Expense = require("./expense");
 const Debt = require("./debt");
 const SavingsGoal = require("./savingsGoal");
+const CreditCard = require("./creditCard");
 
-// Define the relationship: One-to-Many
-// A Paycheque can have many Expenses.
-// This will add a `paychequeId` column to the Expenses table.
+// Paycheque to Expense Relationship
 Paycheque.hasMany(Expense, {
   foreignKey: "paychequeId",
-  onDelete: "SET NULL", // If a paycheque is deleted, the expense's link is set to null
+  onDelete: "SET NULL",
 });
 Expense.belongsTo(Paycheque, {
   foreignKey: "paychequeId",
 });
 
-// We can add other relationships here in the future if needed
+// Credit Card to Expense Relationship
+CreditCard.hasMany(Expense, {
+  foreignKey: "creditCardId",
+  onDelete: "SET NULL",
+});
+Expense.belongsTo(CreditCard, {
+  foreignKey: "creditCardId",
+});
 
 module.exports = {
   sequelize,
@@ -23,4 +29,5 @@ module.exports = {
   Expense,
   Debt,
   SavingsGoal,
+  CreditCard,
 };
