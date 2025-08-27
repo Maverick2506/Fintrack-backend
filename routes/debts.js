@@ -68,4 +68,20 @@ router.delete("/debts/:id", async (req, res) => {
   }
 });
 
+router.put("/debts/:id", async (req, res) => {
+  try {
+    const debt = await Debt.findByPk(req.params.id);
+    if (debt) {
+      // We don't update total_remaining here, as that's handled by payments
+      const { name, total_amount, monthly_payment } = req.body;
+      await debt.update({ name, total_amount, monthly_payment });
+      res.json(debt);
+    } else {
+      res.status(404).send("Debt not found");
+    }
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 module.exports = router;

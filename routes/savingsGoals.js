@@ -53,4 +53,18 @@ router.post("/savings-goals/:id/contribute", async (req, res) => {
   }
 });
 
+router.put("/savings-goals/:id", async (req, res) => {
+  try {
+    const goal = await SavingsGoal.findByPk(req.params.id);
+    if (goal) {
+      await goal.update(req.body);
+      res.json(goal);
+    } else {
+      res.status(404).send("Savings Goal not found");
+    }
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 module.exports = router;

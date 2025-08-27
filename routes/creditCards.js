@@ -100,4 +100,18 @@ router.delete("/credit-cards/:id", async (req, res) => {
   }
 });
 
+router.put("/credit-cards/:id", async (req, res) => {
+  try {
+    const card = await CreditCard.findByPk(req.params.id);
+    if (card) {
+      await card.update(req.body);
+      res.json(card);
+    } else {
+      res.status(404).send("Credit Card not found");
+    }
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 module.exports = router;
