@@ -14,6 +14,7 @@ if (GEMINI_API_KEY) {
 
 router.use(authMiddleware);
 
+// MODIFIED: Updated the prompt to include credit card data
 router.post("/financial-advice", async (req, res) => {
   if (!genAI) {
     return res.status(500).json({ error: "AI service is not configured." });
@@ -22,9 +23,39 @@ router.post("/financial-advice", async (req, res) => {
     const model = genAI.getGenerativeModel({
       model: "gemini-1.5-flash-latest",
     });
-    const prompt = `Based on the following financial data, provide a short, actionable financial tip for a user named Maverick: ${JSON.stringify(
-      req.body
+
+    // Create a cleaner, more focused summary for the AI
+    const financialData = req.body;
+    const summaryForAI = {
+      monthlySummary: financialData.monthlySummary,
+      upcomingBills: financialData.upcomingBills.map((b) => ({
+        name: b.name,
+        amount: b.amount,
+        due_date: b.due_date,
+      })),
+      debtSummary: financialData.debtSummary.map((d) => ({
+        name: d.name,
+        total_remaining: d.total_remaining,
+        monthly_payment: d.monthly_payment,
+      })),
+      savingsSummary: financialData.savingsSummary.map((s) => ({
+        name: s.name,
+        current_amount: s.current_amount,
+        goal_amount: s.goal_amount,
+      })),
+      // Add a clear summary of credit cards
+      creditCardSummary: financialData.creditCardSummary.map((c) => ({
+        name: c.name,
+        currentBalance: c.currentBalance,
+        creditLimit: c.creditLimit,
+        dueDate: c.dueDate,
+      })),
+    };
+
+    const prompt = `Based on the following financial data for a user named Maverick, provide a short, actionable financial tip. Focus on practical advice regarding their income, spending, upcoming bills, debts, savings, or credit card usage. Financial Data: ${JSON.stringify(
+      summaryForAI
     )}`;
+
     const result = await model.generateContent(prompt);
     const response = await result.response;
     res.json({ advice: response.text() });
@@ -34,6 +65,7 @@ router.post("/financial-advice", async (req, res) => {
   }
 });
 
+// This route remains the same
 router.post("/categorize-expense", async (req, res) => {
   if (!genAI) {
     return res.status(500).json({ error: "AI service is not configured." });
