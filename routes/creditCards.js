@@ -8,38 +8,53 @@ router.use(authMiddleware);
 // Get all credit cards
 router.get("/credit-cards", async (req, res) => {
   try {
-    const cards = await CreditCard.findAll({
-      include: [{ model: Expense, as: "Expenses" }],
-    });
+    const cards = await CreditCard.findAll();
     res.json(cards);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// MODIFIED: Add a new credit card with data validation
+// Add a new credit card with corrected validation
 router.post("/credit-cards", async (req, res) => {
   try {
-    const { name, credit_limit, statement_balance, due_date } = req.body;
+    // Expect the new field names from the frontend
+    const { name, creditLimit, currentBalance, dueDate } = req.body;
 
-    // Build the payload safely
+    if (!name || creditLimit === undefined) {
+      return res
+        .status(400)
+        .json({ error: "Name and Credit Limit are required." });
+    }
+
+    const parsedCreditLimit = parseFloat(creditLimit);
+    if (isNaN(parsedCreditLimit)) {
+      return res
+        .status(400)
+        .json({ error: "Credit Limit must be a valid number." });
+    }
+
+    const parsedCurrentBalance = currentBalance
+      ? parseFloat(currentBalance)
+      : 0.0;
+    if (isNaN(parsedCurrentBalance)) {
+      return res
+        .status(400)
+        .json({ error: "Current Balance must be a valid number." });
+    }
+
     const payload = {
       name,
-      credit_limit: parseFloat(credit_limit),
-      statement_balance: statement_balance
-        ? parseFloat(statement_balance)
-        : 0.0,
-      // Explicitly set to null if due_date is empty or not provided
-      due_date: due_date ? due_date : null,
+      creditLimit: parsedCreditLimit,
+      currentBalance: parsedCurrentBalance,
+      dueDate: dueDate || null,
     };
 
     const newCard = await CreditCard.create(payload);
     res.status(201).json(newCard);
   } catch (error) {
     console.error("Error creating credit card:", error);
-    res.status(400).json({
-      error: "Failed to create credit card. Please check your input.",
-    });
+    res.status(400).json({ error: "Failed to create credit card." });
   }
 });
 
@@ -49,8 +64,8 @@ router.post("/credit-cards/:id/pay", async (req, res) => {
     const card = await CreditCard.findByPk(req.params.id);
     if (card) {
       const paymentAmount = parseFloat(req.body.amount);
-      card.statement_balance =
-        parseFloat(card.statement_balance) - paymentAmount;
+      // Update the correct field name
+      card.currentBalance = parseFloat(card.currentBalance) - paymentAmount;
       await card.save();
 
       await Expense.create({

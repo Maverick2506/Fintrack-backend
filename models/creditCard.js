@@ -6,13 +6,21 @@ const CreditCard = sequelize.define("CreditCard", {
     type: DataTypes.STRING,
     allowNull: false,
   },
-  limit: {
+  // Use a more descriptive name: creditLimit
+  creditLimit: {
     type: DataTypes.DECIMAL(10, 2),
     allowNull: false,
   },
-  balance: {
+  // Use a more descriptive name: currentBalance
+  currentBalance: {
     type: DataTypes.DECIMAL(10, 2),
+    allowNull: false,
     defaultValue: 0.0,
+  },
+  // Add the dueDate field
+  dueDate: {
+    type: DataTypes.DATEONLY,
+    allowNull: true,
   },
 });
 
