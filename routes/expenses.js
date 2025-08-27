@@ -69,6 +69,18 @@ router.delete("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
     if (expense) {
+      // If the deleted expense was a debt payment, revert the debt amount.
+      if (expense.category === "Debt") {
+        const debt = await Debt.findOne({
+          where: { name: expense.name.replace("Payment for ", "") },
+        });
+        if (debt) {
+          debt.total_remaining =
+            parseFloat(debt.total_remaining) + parseFloat(expense.amount);
+          await debt.save();
+        }
+      }
+
       await expense.destroy();
       res.status(204).send();
     } else {
