@@ -18,7 +18,6 @@ const Expense = sequelize.define("Expense", {
     type: DataTypes.BOOLEAN,
     defaultValue: false,
   },
-
   category: {
     type: DataTypes.ENUM(
       "Essentials",
@@ -36,8 +35,8 @@ const Expense = sequelize.define("Expense", {
     type: DataTypes.ENUM("none", "monthly", "yearly"),
     defaultValue: "none",
   },
-
-  isCreditCardTransaction: {
+  // MODIFIED: Corrected field name to match API logic
+  paid_with_credit_card: {
     type: DataTypes.BOOLEAN,
     defaultValue: false,
   },

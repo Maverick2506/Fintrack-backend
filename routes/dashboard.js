@@ -5,7 +5,7 @@ const {
   Expense,
   Debt,
   SavingsGoal,
-  CreditCard, // Import CreditCard
+  CreditCard, // Make sure CreditCard is imported
 } = require("../models");
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -29,11 +29,10 @@ router.get("/dashboard", async (req, res) => {
       where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
     });
 
-    // MODIFIED: Only sum expenses that were NOT paid with a credit card
     const totalSpending = await Expense.sum("amount", {
       where: {
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
-        paid_with_credit_card: false, // This is the new condition
+        paid_with_credit_card: false, // Correctly excludes CC transactions
       },
     });
 
@@ -45,7 +44,14 @@ router.get("/dashboard", async (req, res) => {
 
     const debtSummary = await Debt.findAll();
     const savingsSummary = await SavingsGoal.findAll();
-    const creditCardSummary = await CreditCard.findAll();
+    // MODIFIED: Correctly include associated Expenses when fetching cards
+    const creditCardSummary = await CreditCard.findAll({
+      include: [
+        {
+          model: Expense,
+        },
+      ],
+    });
 
     res.json({
       monthlySummary: {
@@ -59,6 +65,7 @@ router.get("/dashboard", async (req, res) => {
       creditCardSummary,
     });
   } catch (error) {
+    console.error("Dashboard Error:", error); // Added for better logging
     res.status(500).json({ error: error.message });
   }
 });
