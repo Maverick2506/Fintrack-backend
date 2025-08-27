@@ -28,6 +28,35 @@ router.get("/expenses/monthly", async (req, res) => {
   }
 });
 
+// --- NEW ROUTE for fetching expenses by category ---
+router.get("/expenses/category", async (req, res) => {
+  try {
+    const { year, month, category } = req.query;
+    if (!year || !month || !category) {
+      return res
+        .status(400)
+        .json({ error: "Year, month, and category are required." });
+    }
+
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0);
+
+    const expenses = await Expense.findAll({
+      where: {
+        category: category,
+        due_date: {
+          [Op.between]: [startDate, endDate],
+        },
+      },
+      order: [["due_date", "ASC"]],
+    });
+    res.json(expenses);
+  } catch (error) {
+    console.error("Error fetching expenses by category:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // MODIFIED: This route now updates the credit card balance when an expense is created
 router.post("/expenses", async (req, res) => {
   try {
