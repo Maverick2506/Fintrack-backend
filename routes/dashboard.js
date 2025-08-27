@@ -13,6 +13,7 @@ const router = express.Router();
 
 router.use(authMiddleware);
 
+// No changes to this existing route
 router.get("/dashboard", async (req, res) => {
   try {
     const year = req.query.year
@@ -36,14 +37,12 @@ router.get("/dashboard", async (req, res) => {
       },
     });
 
-    // This remains for the UI component
     const upcomingBills = await Expense.findAll({
       where: { is_paid: false, due_date: { [Op.gte]: today } },
       order: [["due_date", "ASC"]],
       limit: 5,
     });
 
-    // NEW: Fetch ALL upcoming bills for the current month for the AI advisor
     const allUpcomingBills = await Expense.findAll({
       where: {
         is_paid: false,
@@ -67,7 +66,7 @@ router.get("/dashboard", async (req, res) => {
         netFlow: (totalIncome || 0) - (totalSpending || 0),
       },
       upcomingBills,
-      allUpcomingBills, // Add the new data to the response
+      allUpcomingBills,
       debtSummary,
       savingsSummary,
       creditCardSummary,
@@ -78,7 +77,7 @@ router.get("/dashboard", async (req, res) => {
   }
 });
 
-// No changes needed for the spending summary route
+// No changes to this existing route
 router.get("/spending-summary", async (req, res) => {
   try {
     const year = req.query.year
@@ -108,6 +107,43 @@ router.get("/spending-summary", async (req, res) => {
     res.json(formattedData);
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch spending summary." });
+  }
+});
+
+// --- NEW ROUTE for 6-Month Trend Data ---
+router.get("/trends", async (req, res) => {
+  try {
+    const trends = [];
+    for (let i = 5; i >= 0; i--) {
+      const date = new Date();
+      date.setMonth(date.getMonth() - i);
+      const year = date.getFullYear();
+      const month = date.getMonth();
+
+      const startOfMonth = new Date(year, month, 1);
+      const endOfMonth = new Date(year, month + 1, 0);
+
+      const income = await Paycheque.sum("amount", {
+        where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
+      });
+
+      const spending = await Expense.sum("amount", {
+        where: {
+          due_date: { [Op.between]: [startOfMonth, endOfMonth] },
+          paid_with_credit_card: false,
+        },
+      });
+
+      trends.push({
+        name: date.toLocaleString("default", { month: "short" }),
+        income: income || 0,
+        spending: spending || 0,
+      });
+    }
+    res.json(trends);
+  } catch (error) {
+    console.error("Error fetching trends:", error);
+    res.status(500).json({ error: "Failed to fetch trends data." });
   }
 });
 
