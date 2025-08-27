@@ -14,7 +14,7 @@ if (GEMINI_API_KEY) {
 
 router.use(authMiddleware);
 
-// MODIFIED: Updated the prompt to include credit card data
+// MODIFIED: This route now uses a much more detailed prompt
 router.post("/financial-advice", async (req, res) => {
   if (!genAI) {
     return res.status(500).json({ error: "AI service is not configured." });
@@ -24,37 +24,50 @@ router.post("/financial-advice", async (req, res) => {
       model: "gemini-1.5-flash-latest",
     });
 
-    // Create a cleaner, more focused summary for the AI
-    const financialData = req.body;
-    const summaryForAI = {
-      monthlySummary: financialData.monthlySummary,
-      upcomingBills: financialData.upcomingBills.map((b) => ({
-        name: b.name,
-        amount: b.amount,
-        due_date: b.due_date,
-      })),
-      debtSummary: financialData.debtSummary.map((d) => ({
-        name: d.name,
-        total_remaining: d.total_remaining,
-        monthly_payment: d.monthly_payment,
-      })),
-      savingsSummary: financialData.savingsSummary.map((s) => ({
-        name: s.name,
-        current_amount: s.current_amount,
-        goal_amount: s.goal_amount,
-      })),
-      // Add a clear summary of credit cards
-      creditCardSummary: financialData.creditCardSummary.map((c) => ({
-        name: c.name,
-        currentBalance: c.currentBalance,
-        creditLimit: c.creditLimit,
-        dueDate: c.dueDate,
-      })),
-    };
+    // Destructure the detailed financial data from the request body
+    const { monthlySummary, upcomingBills, debtSummary, creditCardSummary } =
+      req.body;
 
-    const prompt = `Based on the following financial data for a user named Maverick, provide a short, actionable financial tip. Focus on practical advice regarding their income, spending, upcoming bills, debts, savings, or credit card usage. Financial Data: ${JSON.stringify(
-      summaryForAI
-    )}`;
+    // Create a more comprehensive prompt for the AI
+    const prompt = `
+      As a financial advisor for a user named Maverick, provide a short, actionable financial tip based on the following data for the current month:
+
+      1.  **Monthly Cash Flow:**
+          * Total Income: $${monthlySummary.totalIncome.toFixed(2)}
+          * Total Cash Spending (excluding credit card expenses): $${monthlySummary.totalSpending.toFixed(
+            2
+          )}
+          * Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}
+
+      2.  **Upcoming Bills for the Rest of the Month:**
+          * You have the following unpaid bills due: ${upcomingBills
+            .map((bill) => `${bill.name} ($${bill.amount}) on ${bill.due_date}`)
+            .join(", ")}.
+
+      3.  **Credit Card Balances:**
+          * ${creditCardSummary
+            .map(
+              (card) =>
+                `${card.name}: $${parseFloat(card.currentBalance).toFixed(
+                  2
+                )} balance on a $${parseFloat(card.creditLimit).toFixed(
+                  2
+                )} limit.`
+            )
+            .join("\n          * ")}
+
+      4.  **Overall Debts:**
+          * ${debtSummary
+            .map(
+              (debt) =>
+                `${debt.name}: $${parseFloat(debt.total_remaining).toFixed(
+                  2
+                )} remaining.`
+            )
+            .join("\n          * ")}
+
+      Based on this complete picture, what is one specific, actionable piece of advice you can give Maverick? (For example, suggest paying down a high-interest card, warn about an upcoming large expense, or praise a low spending amount).
+    `;
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
