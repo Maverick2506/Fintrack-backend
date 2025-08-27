@@ -5,42 +5,60 @@ const router = express.Router();
 
 router.use(authMiddleware);
 
-// GET all credit cards
+// Get all credit cards
 router.get("/credit-cards", async (req, res) => {
   try {
-    const cards = await CreditCard.findAll();
+    const cards = await CreditCard.findAll({
+      include: [{ model: Expense, as: "Expenses" }],
+    });
     res.json(cards);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// POST a new credit card
+// MODIFIED: Add a new credit card with data validation
 router.post("/credit-cards", async (req, res) => {
   try {
-    const newCard = await CreditCard.create(req.body);
+    const { name, credit_limit, statement_balance, due_date } = req.body;
+
+    // Build the payload safely
+    const payload = {
+      name,
+      credit_limit: parseFloat(credit_limit),
+      statement_balance: statement_balance
+        ? parseFloat(statement_balance)
+        : 0.0,
+      // Explicitly set to null if due_date is empty or not provided
+      due_date: due_date ? due_date : null,
+    };
+
+    const newCard = await CreditCard.create(payload);
     res.status(201).json(newCard);
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    console.error("Error creating credit card:", error);
+    res.status(400).json({
+      error: "Failed to create credit card. Please check your input.",
+    });
   }
 });
 
-// POST a payment to a credit card
+// Log a payment to a credit card
 router.post("/credit-cards/:id/pay", async (req, res) => {
   try {
     const card = await CreditCard.findByPk(req.params.id);
     if (card) {
       const paymentAmount = parseFloat(req.body.amount);
-      card.balance = parseFloat(card.balance) - paymentAmount;
+      card.statement_balance =
+        parseFloat(card.statement_balance) - paymentAmount;
       await card.save();
 
-      // Create a corresponding expense for the payment
       await Expense.create({
         name: `Payment for ${card.name}`,
         amount: paymentAmount,
         due_date: new Date(),
         is_paid: true,
-        category: "Debt", // Or a new 'Credit Card Payment' category
+        category: "Debt",
       });
 
       res.json(card);
@@ -52,7 +70,7 @@ router.post("/credit-cards/:id/pay", async (req, res) => {
   }
 });
 
-// DELETE a credit card
+// Delete a credit card
 router.delete("/credit-cards/:id", async (req, res) => {
   try {
     const card = await CreditCard.findByPk(req.params.id);
