@@ -1,8 +1,8 @@
 const express = require("express");
 const cors = require("cors");
-const { sequelize, Expense } = require("./models"); // Import Expense model
-const { Op } = require("sequelize"); // Import Op for queries
-const cron = require("node-cron"); // Import the cron library
+const { sequelize, Expense } = require("./models");
+const { Op } = require("sequelize");
+const cron = require("node-cron");
 const authRoutes = require("./routes/auth");
 const expenseRoutes = require("./routes/expenses");
 const debtRoutes = require("./routes/debts");
@@ -10,6 +10,10 @@ const savingsGoalRoutes = require("./routes/savingsGoals");
 const dashboardRoutes = require("./routes/dashboard");
 const geminiRoutes = require("./routes/gemini");
 const creditCardRoutes = require("./routes/creditCards");
+const {
+  router: recurringRoutes,
+  createRecurringExpenses,
+} = require("./routes/recurring");
 
 const app = express();
 
@@ -47,16 +51,16 @@ app.use("/api", savingsGoalRoutes);
 app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
+app.use("/api/recurring", recurringRoutes);
 
-// --- NEW: Automated Daily Task Scheduler ---
-// This task runs every day at midnight.
+// --- Automated Task Schedulers ---
+// This job runs daily at midnight to mark due credit card bills as paid.
 cron.schedule("0 0 * * *", async () => {
   console.log("Running daily check for due credit card bills...");
   try {
     const today = new Date();
-    today.setHours(0, 0, 0, 0); // Normalize to the start of the day
+    today.setHours(0, 0, 0, 0);
 
-    // Find all unpaid expenses that were made with a credit card and are due today or in the past
     const billsToUpdate = await Expense.findAll({
       where: {
         is_paid: false,
@@ -83,7 +87,10 @@ cron.schedule("0 0 * * *", async () => {
     console.error("Error running the scheduled bill payment task:", error);
   }
 });
-// --- END: Automated Task Scheduler ---
+
+// This job runs at 1 AM on the first day of every month to create recurring expenses.
+cron.schedule("0 1 1 * *", createRecurringExpenses);
+// --- END Automated Task Schedulers ---
 
 // --- Initialize Server ---
 async function initialize() {
