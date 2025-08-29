@@ -10,9 +10,15 @@ router.use(authMiddleware);
 // No changes needed for this route
 router.get("/expenses/monthly", async (req, res) => {
   try {
-    const { year, month } = req.query;
+    const { year, month, sortBy = "due_date", sortOrder = "ASC" } = req.query;
     const startDate = new Date(year, month - 1, 1);
     const endDate = new Date(year, month, 0);
+
+    // Validate sortBy to prevent SQL injection
+    const allowedSortBy = ["due_date", "name", "amount"];
+    if (!allowedSortBy.includes(sortBy)) {
+      return res.status(400).json({ error: "Invalid sort parameter." });
+    }
 
     const expenses = await Expense.findAll({
       where: {
@@ -20,7 +26,8 @@ router.get("/expenses/monthly", async (req, res) => {
           [Op.between]: [startDate, endDate],
         },
       },
-      order: [["due_date", "ASC"]],
+      // Use the query parameters to order the results
+      order: [[sortBy, sortOrder.toUpperCase()]],
     });
     res.json(expenses);
   } catch (error) {
