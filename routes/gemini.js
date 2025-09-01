@@ -21,7 +21,7 @@ router.post("/financial-advice", async (req, res) => {
   }
   try {
     const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash-latest",
+      model: "gemini-2.5-flash",
     });
 
     // Log the incoming data to help with debugging
@@ -47,7 +47,7 @@ router.post("/financial-advice", async (req, res) => {
 
     // Create a more comprehensive prompt for the AI
     const prompt = `
-      As a financial advisor for a user named Maverick, provide a short, actionable financial tip based on the following data for the current month:
+      As a financial advisor for a user named Maverick, provide a short, actionable financial tip based on the following data for the current month so far. This is a snapshot and not the final monthly numbers.:
 
       1.  **Monthly Cash Flow:**
           * Total Income: $${monthlySummary.totalIncome.toFixed(2)}
@@ -117,7 +117,7 @@ router.post("/categorize-expense", async (req, res) => {
   }
   try {
     const model = genAI.getGenerativeModel({
-      model: "gemini-1.5-flash-latest",
+      model: "gemini-2.5-flash",
     });
     const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
     const result = await model.generateContent(prompt);
