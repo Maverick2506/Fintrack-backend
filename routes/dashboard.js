@@ -26,6 +26,26 @@ router.get("/dashboard", async (req, res) => {
     const endOfMonth = new Date(year, month + 1, 0);
     const today = new Date();
 
+    const startOfPreviousMonth = new Date(year, month - 1, 1);
+    const endOfPreviousMonth = new Date(year, month, 0);
+
+    const previousMonthIncome = await Paycheque.sum("amount", {
+      where: {
+        payment_date: {
+          [Op.between]: [startOfPreviousMonth, endOfPreviousMonth],
+        },
+      },
+    });
+
+    const previousMonthSpending = await Expense.sum("amount", {
+      where: {
+        due_date: {
+          [Op.between]: [startOfPreviousMonth, endOfPreviousMonth],
+        },
+        paid_with_credit_card: false,
+      },
+    });
+
     const totalIncome = await Paycheque.sum("amount", {
       where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
     });
@@ -64,6 +84,8 @@ router.get("/dashboard", async (req, res) => {
         totalIncome: totalIncome || 0,
         totalSpending: totalSpending || 0,
         netFlow: (totalIncome || 0) - (totalSpending || 0),
+        previousMonthNetFlow:
+          (previousMonthIncome || 0) - (previousMonthSpending || 0),
       },
       upcomingBills,
       allUpcomingBills,
