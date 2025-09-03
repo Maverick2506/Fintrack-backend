@@ -10,6 +10,7 @@ const savingsGoalRoutes = require("./routes/savingsGoals");
 const dashboardRoutes = require("./routes/dashboard");
 const geminiRoutes = require("./routes/gemini");
 const creditCardRoutes = require("./routes/creditCards");
+const paychequeRoutes = require("./routes/paycheques");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -52,6 +53,7 @@ app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
 app.use("/api/recurring", recurringRoutes);
+app.use("/api", paychequeRoutes);
 
 // --- Automated Task Schedulers ---
 // This job runs daily at midnight to mark due credit card bills as paid.
