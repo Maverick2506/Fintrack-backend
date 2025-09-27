@@ -55,9 +55,7 @@ app.use("/api", creditCardRoutes);
 app.use("/api/recurring", recurringRoutes);
 app.use("/api", paychequeRoutes);
 
-// --- Automated Task Schedulers ---
-// This job runs daily at midnight to mark due credit card bills as paid.
-cron.schedule("0 0 * * *", async () => {
+app.get("/api/daily-check", async (req, res) => {
   console.log("Running daily check for due credit card bills...");
   try {
     const today = new Date();
@@ -85,14 +83,51 @@ cron.schedule("0 0 * * *", async () => {
     } else {
       console.log("No overdue credit card bills found today.");
     }
+    res.status(200).send("Daily check complete.");
   } catch (error) {
     console.error("Error running the scheduled bill payment task:", error);
+    res.status(500).send("Error in daily check.");
   }
 });
 
-// This job runs at 1 AM on the first day of every month to create recurring expenses.
-cron.schedule("0 1 1 * *", createRecurringExpenses);
-// --- END Automated Task Schedulers ---
+// --- Automated Task Schedulers ---
+// This job runs daily at midnight to mark due credit card bills as paid.
+// cron.schedule("0 0 * * *", async () => {
+//   console.log("Running daily check for due credit card bills...");
+//   try {
+//     const today = new Date();
+//     today.setHours(0, 0, 0, 0);
+
+//     const billsToUpdate = await Expense.findAll({
+//       where: {
+//         is_paid: false,
+//         paid_with_credit_card: true,
+//         due_date: {
+//           [Op.lte]: today,
+//         },
+//       },
+//     });
+
+//     if (billsToUpdate.length > 0) {
+//       console.log(
+//         `Found ${billsToUpdate.length} credit card bill(s) to mark as paid.`
+//       );
+//       for (const bill of billsToUpdate) {
+//         bill.is_paid = true;
+//         await bill.save();
+//         console.log(`Marked bill "${bill.name}" (ID: ${bill.id}) as paid.`);
+//       }
+//     } else {
+//       console.log("No overdue credit card bills found today.");
+//     }
+//   } catch (error) {
+//     console.error("Error running the scheduled bill payment task:", error);
+//   }
+// });
+
+// // This job runs at 1 AM on the first day of every month to create recurring expenses.
+// cron.schedule("0 1 1 * *", createRecurringExpenses);
+// // --- END Automated Task Schedulers ---
 
 // --- Initialize Server ---
 async function initialize() {
