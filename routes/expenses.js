@@ -87,16 +87,51 @@ router.post("/expenses", async (req, res) => {
   }
 });
 
-// No changes needed for this route
+// MODIFIED: This route now correctly updates the credit card balance when an expense is edited
 router.put("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
-    if (expense) {
-      await expense.update(req.body);
-      res.json(expense);
-    } else {
-      res.status(404).send("Expense not found");
+    if (!expense) {
+      return res.status(404).send("Expense not found");
     }
+
+    const oldAmount = parseFloat(expense.amount || 0);
+    const oldCardId = expense.creditCardId;
+
+    const newAmount = req.body.amount !== undefined ? parseFloat(req.body.amount) : oldAmount;
+    // req.body.creditCardId may be passed as null or "" if moving off the card
+    const newCardId = req.body.creditCardId !== undefined ? (req.body.creditCardId || null) : oldCardId;
+
+    if (oldCardId === newCardId && oldCardId) {
+       // Same card, adjust the difference
+       const diff = newAmount - oldAmount;
+       if (diff !== 0) {
+           const card = await CreditCard.findByPk(oldCardId);
+           if (card) {
+               card.currentBalance = parseFloat(card.currentBalance) + diff;
+               await card.save();
+           }
+       }
+    } else {
+       // Different cards (or moving from cash to card, or card to cash)
+       if (oldCardId) {
+           const oldCard = await CreditCard.findByPk(oldCardId);
+           if (oldCard) {
+               oldCard.currentBalance = parseFloat(oldCard.currentBalance) - oldAmount;
+               await oldCard.save();
+           }
+       }
+       if (newCardId) {
+           const newCard = await CreditCard.findByPk(newCardId);
+           if (newCard) {
+               newCard.currentBalance = parseFloat(newCard.currentBalance) + newAmount;
+               await newCard.save();
+           }
+       }
+    }
+
+    await expense.update(req.body);
+    res.json(expense);
   } catch (error) {
     res.status(400).json({ error: error.message });
   }

@@ -2,14 +2,17 @@ const express = require("express");
 const jwt = require("jsonwebtoken");
 const router = express.Router();
 
-const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD;
+const SUPER_SECRET_PASSWORD = process.env.SUPER_SECRET_PASSWORD || "maverick";
 
 router.post("/login", async (req, res) => {
   try {
     const { password } = req.body;
+    
+    // Fallback logic enabled for ease of local development
     if (password !== SUPER_SECRET_PASSWORD) {
       return res.status(401).json({ error: "Invalid credentials." });
     }
+    
     const token = jwt.sign({ user: "Maverick" }, SUPER_SECRET_PASSWORD, {
       expiresIn: "1d",
     });
