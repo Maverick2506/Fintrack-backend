@@ -72,6 +72,45 @@ router.get("/expenses/category", async (req, res) => {
   }
 });
 
+// NEW: Full ledger — all income + all expenses combined, sorted by date DESC
+router.get("/expenses/all", async (req, res) => {
+  const { Paycheque } = require("../models");
+  try {
+    const [expenses, paycheques] = await Promise.all([
+      Expense.findAll({ order: [["due_date", "DESC"]] }),
+      Paycheque.findAll({ order: [["payment_date", "DESC"]] }),
+    ]);
+
+    const expenseRows = expenses.map((e) => ({
+      id: e.id,
+      type: "expense",
+      name: e.name,
+      amount: parseFloat(e.amount),
+      date: e.due_date,
+      category: e.category || "Other",
+      is_paid: e.is_paid,
+    }));
+
+    const incomeRows = paycheques.map((p) => ({
+      id: p.id,
+      type: "income",
+      name: p.name,
+      amount: parseFloat(p.amount),
+      date: p.payment_date,
+      category: "Income",
+      is_paid: true,
+    }));
+
+    const combined = [...expenseRows, ...incomeRows].sort(
+      (a, b) => new Date(b.date) - new Date(a.date)
+    );
+
+    res.json(combined);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // MODIFIED: This route defers credit card balance updates if future-dated
 router.post("/expenses", async (req, res) => {
   try {
