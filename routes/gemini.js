@@ -1,5 +1,8 @@
 const express = require("express");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const { Paycheque } = require("../models");
+const { Op } = require("sequelize");
+const { addDays, parseISO, isSameMonth, isAfter, format } = require("date-fns");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
@@ -30,7 +33,7 @@ router.post("/financial-advice", async (req, res) => {
       JSON.stringify(req.body, null, 2)
     );
 
-    const { monthlySummary, allUpcomingBills, debtSummary, creditCardSummary } =
+    const { monthlySummary, allUpcomingBills, debtSummary, creditCardSummary, savingsSummary } =
       req.body;
 
     // --- NEW: Add validation to ensure data exists before using it ---
@@ -38,11 +41,52 @@ router.post("/financial-advice", async (req, res) => {
       !monthlySummary ||
       !allUpcomingBills ||
       !debtSummary ||
-      !creditCardSummary
+      !creditCardSummary ||
+      !savingsSummary
     ) {
       return res
         .status(400)
         .json({ error: "Incomplete financial data provided." });
+    }
+
+    // --- NEW: Mathematical Paycheque Projection Engine ---
+    let projectedIncomeText = "No future income accurately projected for the rest of this month.";
+    try {
+      const recentPaycheques = await Paycheque.findAll({
+        where: {
+          name: {
+            [Op.or]: [
+              { [Op.like]: "%pay%" },
+              { [Op.like]: "%paycheck%" },
+              { [Op.like]: "%paycheque%" }
+            ]
+          }
+        },
+        order: [["payment_date", "DESC"]],
+        limit: 3
+      });
+
+      if (recentPaycheques.length > 0) {
+        // Calculate average amount
+        const totalAmount = recentPaycheques.reduce((sum, p) => sum + parseFloat(p.amount), 0);
+        const averageAmount = totalAmount / recentPaycheques.length; // Flawlessly handles length of 1
+        
+        let lastDate = parseISO(recentPaycheques[0].payment_date);
+        const today = new Date();
+        let nextDate = addDays(lastDate, 14);
+
+        // Advance 14 days iteratively until the date is strictly in the future
+        while (!isAfter(nextDate, today)) {
+            nextDate = addDays(nextDate, 14);
+        }
+
+        // If the calculated next payday still falls within the CURRENT calendar month
+        if (isSameMonth(nextDate, today)) {
+          projectedIncomeText = `Expected Upcoming Income: $${averageAmount.toFixed(2)} arriving accurately on ${format(nextDate, "MMM do")}.`;
+        }
+      }
+    } catch (err) {
+      console.error("Failed to project income, continuing without it.", err);
     }
 
     // Create a more comprehensive prompt for the AI
@@ -98,7 +142,26 @@ router.post("/financial-advice", async (req, res) => {
               : "No installment debts."
           }
 
-      Based on this complete picture, what is one specific, actionable piece of advice you can give Maverick? Focus on the most immediate and impactful action they can take.
+      5.  **Projected Upcoming Inflow:**
+          * ${projectedIncomeText}
+
+      6.  **Active Savings Goals:**
+          * ${
+            savingsSummary.length > 0
+              ? savingsSummary
+                  .map(
+                    (goal) =>
+                      `${goal.name}: $${parseFloat(goal.current_amount).toFixed(2)} saved out of $${parseFloat(goal.goal_amount).toFixed(2)} goal.`
+                  )
+                  .join("\n          * ")
+              : "No active savings goals."
+          }
+
+      Based on this complete picture, follow this STRICT Mathematical Cashflow Constraint before giving your single actionable advice:
+      You must mentally calculate: (Current Net Cash Flow) + (Projected Upcoming Inflow) - (Upcoming Bills). 
+      If that number is very negative, advise them to immediately scale back non-essentials.
+      If that number is highly positive, advise them specifically on which exact "Active Savings Goal" or "Installment Debt" they should allocate their leftover surplus into!
+      Keep the final response short and human-readable.
     `;
 
     const result = await model.generateContent(prompt);
