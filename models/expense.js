@@ -32,7 +32,7 @@ const Expense = sequelize.define("Expense", {
     defaultValue: "Other",
   },
   recurrence: {
-    type: DataTypes.ENUM("none", "monthly", "yearly"),
+    type: DataTypes.ENUM("none", "weekly", "bi-weekly", "monthly", "yearly"),
     defaultValue: "none",
   },
   // MODIFIED: Corrected field name to match API logic
