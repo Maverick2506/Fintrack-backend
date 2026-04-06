@@ -53,15 +53,6 @@ router.post("/financial-advice", async (req, res) => {
     let projectedIncomeText = "No future income accurately projected for the rest of this month.";
     try {
       const recentPaycheques = await Paycheque.findAll({
-        where: {
-          name: {
-            [Op.or]: [
-              { [Op.like]: "%pay%" },
-              { [Op.like]: "%paycheck%" },
-              { [Op.like]: "%paycheque%" }
-            ]
-          }
-        },
         order: [["payment_date", "DESC"]],
         limit: 3
       });
@@ -99,79 +90,44 @@ router.post("/financial-advice", async (req, res) => {
       console.error("Failed to project income, continuing without it.", err);
     }
 
+    const upcomingBillsTotal = allUpcomingBills.reduce((sum, b) => sum + parseFloat(b.amount), 0);
+    const finalProjectedCashflow = monthlySummary.netFlow + totalProjectedAmount - upcomingBillsTotal;
+
     // Create a more comprehensive prompt for the AI
     const prompt = `
-      As a financial advisor for a user named Maverick, provide a short, actionable financial tip based on the following data for the current month so far. This is a snapshot and not the final monthly numbers.:
+      As a financial advisor for a user named Maverick, provide a short, actionable financial tip based on the following data for the current month.
 
-      1.  **Monthly Cash Flow:**
-          * Total Income: $${monthlySummary.totalIncome.toFixed(2)}
-          * Total Cash Spending (not including new credit card debt): $${monthlySummary.totalSpending.toFixed(
-            2
-          )}
-          * Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}
+      1.  **Current Cash Snapshot:**
+          * Total Income Received: $${monthlySummary.totalIncome.toFixed(2)}
+          * Total Past Spending: $${monthlySummary.totalSpending.toFixed(2)}
+          * Current Live Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}
 
-      2.  **All Upcoming Bills for This Month:**
+      2.  **Required Upcoming Bill Deductions:**
           * You have the following unpaid bills due: ${
             allUpcomingBills.length > 0
-              ? allUpcomingBills
-                  .map(
-                    (bill) =>
-                      `${bill.name} ($${bill.amount}) on ${bill.due_date}`
-                  )
-                  .join(", ")
+              ? allUpcomingBills.map((bill) => `${bill.name} ($${bill.amount}) on ${bill.due_date}`).join(", ")
               : "None"
           }.
+          * Total Upcoming Bill Burden: $${upcomingBillsTotal.toFixed(2)}
 
-      3.  **Credit Card Balances:**
-          * ${
-            creditCardSummary.length > 0
-              ? creditCardSummary
-                  .map(
-                    (card) =>
-                      `${card.name}: $${parseFloat(card.currentBalance).toFixed(
-                        2
-                      )} balance on a $${parseFloat(card.creditLimit).toFixed(
-                        2
-                      )} limit.`
-                  )
-                  .join("\n          * ")
-              : "No credit cards."
-          }
-
-      4.  **Overall Installment Debts:**
-          * ${
-            debtSummary.length > 0
-              ? debtSummary
-                  .map(
-                    (debt) =>
-                      `${debt.name}: $${parseFloat(
-                        debt.total_remaining
-                      ).toFixed(2)} remaining.`
-                  )
-                  .join("\n          * ")
-              : "No installment debts."
-          }
-
-      5.  **Projected Upcoming Inflow:**
+      3.  **Projected Upcoming Paycheques (Rest of Month):**
           * ${projectedIncomeText}
 
-      6.  **Active Savings Goals:**
+      4.  **Mathematically Verified End-of-Month Float:**
+          * Guaranteed Remaining Cash (Net Flow + Projected Income - Upcoming Bills): $${finalProjectedCashflow.toFixed(2)}
+
+      5.  **Active Savings Goals:**
           * ${
             savingsSummary.length > 0
-              ? savingsSummary
-                  .map(
-                    (goal) =>
-                      `${goal.name}: $${parseFloat(goal.current_amount).toFixed(2)} saved out of $${parseFloat(goal.goal_amount).toFixed(2)} goal.`
-                  )
-                  .join("\n          * ")
+              ? savingsSummary.map((goal) => `${goal.name}: $${parseFloat(goal.current_amount).toFixed(2)} saved out of $${parseFloat(goal.goal_amount).toFixed(2)} goal.`).join("\n          * ")
               : "No active savings goals."
           }
 
-      Based on this complete picture, follow this STRICT Mathematical Cashflow Constraint before giving your single actionable advice:
-      You must mentally calculate: (Current Net Cash Flow) + (Projected Upcoming Inflow) - (Upcoming Bills). 
-      If that number is very negative, advise them to immediately scale back non-essentials.
-      If that number is highly positive, advise them specifically on which exact "Active Savings Goal" or "Installment Debt" they should allocate their leftover surplus into!
-      Keep the final response short and human-readable.
+      Based on this absolute picture: 
+      The most important number is the **End-of-Month Float** ($${finalProjectedCashflow.toFixed(2)}). 
+      If it is negative, tell them immediately to stop non-essential spending.
+      If it is highly positive, advise them specifically on which exact "Active Savings Goal" they should allocate their leftover surplus into!
+      Keep the final response short and human-readable, and specifically call out the End-of-Month float number.
     `;
 
     const result = await model.generateContent(prompt);
