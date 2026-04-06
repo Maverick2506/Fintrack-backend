@@ -119,10 +119,29 @@ router.post("/categorize-expense", async (req, res) => {
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash",
     });
-    const prompt = `Categorize the following expense into one of these categories: Essentials, Subscription, Debt, Food & Drink, Transportation, Entertainment, Shopping, Other. Expense: "${req.body.name}"`;
+    
+    const validCategories = ["Essentials", "Subscription", "Debt", "Food & Drink", "Transportation", "Entertainment", "Shopping", "Other"];
+    
+    const prompt = `Categorize the following expense into exactly one of these categories: ${validCategories.join(", ")}. 
+    Return ONLY the exact category name and absolutely nothing else. Do not include any explanations, asterisks, or markdown formatting.
+    Expense: "${req.body.name}"`;
+    
     const result = await model.generateContent(prompt);
-    const response = await result.response;
-    res.json({ category: response.text().trim() });
+    let responseText = await result.response.text();
+    
+    // Sanitize the response (strip markdown like ** ** or \n)
+    responseText = responseText.replace(/[*_`"'\n]/g, "").trim();
+    
+    // Fallback safety check: verify the response actually matches an ENUM
+    let finalCategory = "Other"; 
+    for (const cat of validCategories) {
+      if (responseText.toLowerCase().includes(cat.toLowerCase())) {
+        finalCategory = cat;
+        break;
+      }
+    }
+    
+    res.json({ category: finalCategory });
   } catch (error) {
     console.error("Gemini categorization error:", error);
     res.status(500).json({ error: "Failed to categorize expense." });
