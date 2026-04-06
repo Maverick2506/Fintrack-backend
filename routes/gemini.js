@@ -51,6 +51,7 @@ router.post("/financial-advice", async (req, res) => {
 
     // --- NEW: Mathematical Paycheque Projection Engine ---
     let projectedIncomeText = "No future income accurately projected for the rest of this month.";
+    let totalProjectedAmount = 0;
     try {
       const recentPaycheques = await Paycheque.findAll({
         order: [["payment_date", "DESC"]],
@@ -67,7 +68,7 @@ router.post("/financial-advice", async (req, res) => {
         const today = new Date();
         let nextDate = addDays(lastDate, 14);
 
-        let totalProjectedAmount = 0;
+        let totalProjectedInLoop = 0;
         let upcomingDates = [];
 
         // Advance 14 days iteratively until the mathematical date is strictly in the future
@@ -78,11 +79,12 @@ router.post("/financial-advice", async (req, res) => {
         // Keep accumulating explicitly for EVERY remaining pay schedule inside this calendar month
         while (isSameMonth(nextDate, today)) {
             upcomingDates.push(format(nextDate, "MMM do"));
-            totalProjectedAmount += averageAmount;
+            totalProjectedInLoop += averageAmount;
             nextDate = addDays(nextDate, 14);
         }
 
         if (upcomingDates.length > 0) {
+          totalProjectedAmount = totalProjectedInLoop;
           projectedIncomeText = `Expected Upcoming Income: $${totalProjectedAmount.toFixed(2)} total, arriving across ${upcomingDates.length} upcoming paychecks (${upcomingDates.join(" and ")}).`;
         }
       }
