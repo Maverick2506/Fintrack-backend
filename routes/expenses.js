@@ -3,9 +3,17 @@ const express = require("express");
 const { Expense, Debt, CreditCard } = require("../models");
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
+const { toZonedTime, format } = require("date-fns-tz");
 const router = express.Router();
 
 router.use(authMiddleware);
+
+const TIMEZONE = "America/Toronto";
+const getTodayString = () => {
+    const nowUtc = new Date();
+    const nowZoned = toZonedTime(nowUtc, TIMEZONE);
+    return format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
+};
 
 // No changes needed for this route
 router.get("/expenses/monthly", async (req, res) => {
@@ -64,14 +72,26 @@ router.get("/expenses/category", async (req, res) => {
   }
 });
 
-// MODIFIED: This route now updates the credit card balance when an expense is created
+// MODIFIED: This route defers credit card balance updates if future-dated
 router.post("/expenses", async (req, res) => {
   try {
-    const { amount, creditCardId } = req.body;
+    const { amount, creditCardId, due_date } = req.body;
+    
+    const todayStr = getTodayString();
+    const isCreditCard = !!creditCardId;
+    const isPastOrPresent = due_date <= todayStr;
+    
+    // Only auto-mark as paid if it's a credit card expense and the date has arrived
+    if (isCreditCard && isPastOrPresent) {
+        req.body.is_paid = true;
+    } else {
+        req.body.is_paid = req.body.is_paid || false;
+    }
+
     const newExpense = await Expense.create(req.body);
 
-    // If a creditCardId is provided, find the card and increase its balance
-    if (creditCardId) {
+    // Only apply to balance if the date has natively arrived
+    if (creditCardId && isPastOrPresent) {
       const card = await CreditCard.findByPk(creditCardId);
       if (card) {
         card.currentBalance =
@@ -87,7 +107,7 @@ router.post("/expenses", async (req, res) => {
   }
 });
 
-// MODIFIED: This route now correctly updates the credit card balance when an expense is edited
+// MODIFIED: Perfect State Machine for Edit Deltas
 router.put("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
@@ -95,39 +115,47 @@ router.put("/expenses/:id", async (req, res) => {
       return res.status(404).send("Expense not found");
     }
 
+    const oldIsPaid = expense.is_paid;
     const oldAmount = parseFloat(expense.amount || 0);
     const oldCardId = expense.creditCardId;
 
     const newAmount = req.body.amount !== undefined ? parseFloat(req.body.amount) : oldAmount;
-    // req.body.creditCardId may be passed as null or "" if moving off the card
     const newCardId = req.body.creditCardId !== undefined ? (req.body.creditCardId || null) : oldCardId;
+    
+    // User might manually send `is_paid: true` by clicking "Mark as Paid"
+    let newIsPaid = req.body.is_paid !== undefined ? req.body.is_paid : oldIsPaid;
+    
+    // If they changed the due_date to past/present on a credit card, enforce is_paid cleanly
+    if (req.body.due_date && newCardId) {
+        const todayStr = getTodayString();
+        if (req.body.due_date <= todayStr) {
+            newIsPaid = true;
+            req.body.is_paid = true;
+        } else if (req.body.due_date > todayStr && req.body.is_paid === undefined) {
+            // if moving to future and not explicitly marking paid manually
+            newIsPaid = false;
+            req.body.is_paid = false;
+        }
+    }
 
-    if (oldCardId === newCardId && oldCardId) {
-       // Same card, adjust the difference
-       const diff = newAmount - oldAmount;
-       if (diff !== 0) {
-           const card = await CreditCard.findByPk(oldCardId);
-           if (card) {
-               card.currentBalance = parseFloat(card.currentBalance) + diff;
-               await card.save();
-           }
-       }
-    } else {
-       // Different cards (or moving from cash to card, or card to cash)
-       if (oldCardId) {
-           const oldCard = await CreditCard.findByPk(oldCardId);
-           if (oldCard) {
-               oldCard.currentBalance = parseFloat(oldCard.currentBalance) - oldAmount;
-               await oldCard.save();
-           }
-       }
-       if (newCardId) {
-           const newCard = await CreditCard.findByPk(newCardId);
-           if (newCard) {
-               newCard.currentBalance = parseFloat(newCard.currentBalance) + newAmount;
-               await newCard.save();
-           }
-       }
+    // STATE CHANGE REVERSION:
+    // If it historically affected a card balance, revert it first.
+    if (oldCardId && oldIsPaid) {
+        const oldCard = await CreditCard.findByPk(oldCardId);
+        if (oldCard) {
+            oldCard.currentBalance = parseFloat(oldCard.currentBalance) - oldAmount;
+            await oldCard.save();
+        }
+    }
+    
+    // STATE CHANGE APPLICATION:
+    // If it newly affects a card balance, apply it now.
+    if (newCardId && newIsPaid) {
+        const newCard = await CreditCard.findByPk(newCardId);
+        if (newCard) {
+            newCard.currentBalance = parseFloat(newCard.currentBalance) + newAmount;
+            await newCard.save();
+        }
     }
 
     await expense.update(req.body);
@@ -137,13 +165,13 @@ router.put("/expenses/:id", async (req, res) => {
   }
 });
 
-// MODIFIED: This route now reverts the balance change if a credit card expense is deleted
+// MODIFIED: This route only reverts balance if it was officially applied already
 router.delete("/expenses/:id", async (req, res) => {
   try {
     const expense = await Expense.findByPk(req.params.id);
     if (expense) {
-      // If the deleted expense was on a credit card, find the card and decrease its balance
-      if (expense.creditCardId) {
+      // If the expense was successfully applied to a credit card, revert it.
+      if (expense.creditCardId && expense.is_paid) {
         const card = await CreditCard.findByPk(expense.creditCardId);
         if (card) {
           card.currentBalance =
