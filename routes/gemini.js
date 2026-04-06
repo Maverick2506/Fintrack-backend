@@ -71,18 +71,28 @@ router.post("/financial-advice", async (req, res) => {
         const totalAmount = recentPaycheques.reduce((sum, p) => sum + parseFloat(p.amount), 0);
         const averageAmount = totalAmount / recentPaycheques.length; // Flawlessly handles length of 1
         
-        let lastDate = parseISO(recentPaycheques[0].payment_date);
+        // Ensure parsing aligns flawlessly with local noon to prevent UTC shifting backwards a day
+        let lastDate = new Date(`${recentPaycheques[0].payment_date}T12:00:00`);
         const today = new Date();
         let nextDate = addDays(lastDate, 14);
 
-        // Advance 14 days iteratively until the date is strictly in the future
+        let totalProjectedAmount = 0;
+        let upcomingDates = [];
+
+        // Advance 14 days iteratively until the mathematical date is strictly in the future
         while (!isAfter(nextDate, today)) {
             nextDate = addDays(nextDate, 14);
         }
 
-        // If the calculated next payday still falls within the CURRENT calendar month
-        if (isSameMonth(nextDate, today)) {
-          projectedIncomeText = `Expected Upcoming Income: $${averageAmount.toFixed(2)} arriving accurately on ${format(nextDate, "MMM do")}.`;
+        // Keep accumulating explicitly for EVERY remaining pay schedule inside this calendar month
+        while (isSameMonth(nextDate, today)) {
+            upcomingDates.push(format(nextDate, "MMM do"));
+            totalProjectedAmount += averageAmount;
+            nextDate = addDays(nextDate, 14);
+        }
+
+        if (upcomingDates.length > 0) {
+          projectedIncomeText = `Expected Upcoming Income: $${totalProjectedAmount.toFixed(2)} total, arriving across ${upcomingDates.length} upcoming paychecks (${upcomingDates.join(" and ")}).`;
         }
       }
     } catch (err) {
