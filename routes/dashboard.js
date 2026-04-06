@@ -33,6 +33,7 @@ router.get("/dashboard", async (req, res) => {
       where: {
         payment_date: {
           [Op.between]: [startOfPreviousMonth, endOfPreviousMonth],
+          [Op.lte]: today,
         },
       },
     });
@@ -43,17 +44,24 @@ router.get("/dashboard", async (req, res) => {
           [Op.between]: [startOfPreviousMonth, endOfPreviousMonth],
         },
         paid_with_credit_card: false,
+        is_paid: true,
       },
     });
 
     const totalIncome = await Paycheque.sum("amount", {
-      where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
+      where: { 
+        payment_date: { 
+          [Op.between]: [startOfMonth, endOfMonth],
+          [Op.lte]: today,
+        } 
+      },
     });
 
     const totalSpending = await Expense.sum("amount", {
       where: {
         due_date: { [Op.between]: [startOfMonth, endOfMonth] },
         paid_with_credit_card: false,
+        is_paid: true,
       },
     });
 
