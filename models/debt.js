@@ -17,6 +17,18 @@ const Debt = sequelize.define("Debt", {
   monthly_payment: {
     type: DataTypes.DECIMAL(10, 2),
   },
+  auto_pay: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+  },
+  next_due_date: {
+    type: DataTypes.DATEONLY,
+    allowNull: true,
+  },
+  payment_frequency: {
+    type: DataTypes.ENUM("weekly", "bi-weekly", "monthly", "yearly"),
+    defaultValue: "monthly",
+  },
 });
 
 module.exports = Debt;

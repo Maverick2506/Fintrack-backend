@@ -16,12 +16,15 @@ router.get("/debts", async (req, res) => {
 
 router.post("/debts", async (req, res) => {
   try {
-    const { name, total_amount, monthly_payment } = req.body;
+    const { name, total_amount, monthly_payment, auto_pay, next_due_date, payment_frequency } = req.body;
     const newDebt = await Debt.create({
       name,
       total_amount,
       total_remaining: total_amount,
       monthly_payment,
+      auto_pay: auto_pay || false,
+      next_due_date: next_due_date || null,
+      payment_frequency: payment_frequency || "monthly",
     });
     res.status(201).json(newDebt);
   } catch (error) {
@@ -73,8 +76,15 @@ router.put("/debts/:id", async (req, res) => {
     const debt = await Debt.findByPk(req.params.id);
     if (debt) {
       // We don't update total_remaining here, as that's handled by payments
-      const { name, total_amount, monthly_payment } = req.body;
-      await debt.update({ name, total_amount, monthly_payment });
+      const { name, total_amount, monthly_payment, auto_pay, next_due_date, payment_frequency } = req.body;
+      await debt.update({ 
+        name, 
+        total_amount, 
+        monthly_payment,
+        auto_pay,
+        next_due_date,
+        payment_frequency
+      });
       res.json(debt);
     } else {
       res.status(404).send("Debt not found");
