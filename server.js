@@ -1,5 +1,6 @@
 const express = require("express");
 const cors = require("cors");
+const compression = require("compression");
 const { sequelize, Expense, CreditCard, Debt } = require("./models");
 const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
@@ -19,6 +20,7 @@ const {
 } = require("./routes/recurring");
 
 const app = express();
+app.use(compression());
 
 // --- CORS CONFIGURATION ---
 const allowedOrigins = [
