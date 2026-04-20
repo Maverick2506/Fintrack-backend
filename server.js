@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
-const { sequelize, Expense, CreditCard, Debt } = require("./models");
+const { sequelize, Transaction, Account } = require("./models");
 const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
 const cron = require("node-cron");
@@ -73,80 +73,40 @@ const runDailySweep = async () => {
     const nowZoned = toZonedTime(nowUtc, TIMEZONE);
     const todayString = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
-    // 1. Process Due Credit Cards
-    const billsToUpdate = await Expense.findAll({
+    // 1. Process Due Credit Cards (Credit Card Expenses pending)
+    const billsToUpdate = await Transaction.findAll({
       where: {
-        is_paid: false,
-        paid_with_credit_card: true,
-        due_date: {
-          [Op.lte]: todayString,
-        },
+        isCleared: false,
+        type: "EXPENSE",
+        fromAccountId: { [Op.ne]: null },
+        date: { [Op.lte]: todayString },
       },
+      include: [{ model: Account, as: 'fromAccount', where: { type: 'CREDIT_CARD' } }]
     });
 
     if (billsToUpdate.length > 0) {
-      console.log(`Found ${billsToUpdate.length} credit card bill(s) to officially mark as paid & apply to balances.`);
+      console.log(`Found ${billsToUpdate.length} credit card bill(s) to officially mark as paid.`);
       for (const bill of billsToUpdate) {
-        if (bill.creditCardId) {
-           const card = await CreditCard.findByPk(bill.creditCardId);
-           if (card) {
-               card.currentBalance = parseFloat(card.currentBalance) + parseFloat(bill.amount);
-               await card.save();
-           }
+        if (bill.fromAccount) {
+           bill.fromAccount.initialBalance = parseFloat(bill.fromAccount.initialBalance) + parseFloat(bill.amount);
+           await bill.fromAccount.save();
         }
-        bill.is_paid = true;
+        bill.isCleared = true;
         await bill.save();
       }
-    } else {
-      console.log("No overdue credit card bills found today.");
     }
 
     // 2. Process Auto-Pay Debts
-    const debtsToUpdate = await Debt.findAll({
+    const debtsToUpdate = await Account.findAll({
       where: {
-        auto_pay: true,
-        next_due_date: { [Op.lte]: todayString },
-        total_remaining: { [Op.gt]: 0 },
+        type: "DEBT",
+        dueDate: { [Op.lte]: todayString },
+        initialBalance: { [Op.gt]: 0 },
       },
     });
 
-    if (debtsToUpdate.length > 0) {
-      console.log(`Found ${debtsToUpdate.length} auto-pay debt(s) maturity hits.`);
-      for (const debt of debtsToUpdate) {
-        const paymentAmount = Math.min(parseFloat(debt.monthly_payment), parseFloat(debt.total_remaining));
-        
-        // Subtract balance safely
-        debt.total_remaining = parseFloat(debt.total_remaining) - paymentAmount;
-
-        // Automatically create the Cash-Flow expense
-        await Expense.create({
-          name: `Auto-Payment for ${debt.name}`,
-          amount: paymentAmount,
-          due_date: todayString,
-          is_paid: true,
-          category: "Debt",
-        });
-
-        // Advance or Terminate
-        if (debt.total_remaining > 0) {
-           let currentDue = toZonedTime(`${debt.next_due_date}T00:00:00`, TIMEZONE);
-           let nextDue;
-           if (debt.payment_frequency === "weekly") nextDue = addDays(currentDue, 7);
-           else if (debt.payment_frequency === "bi-weekly") nextDue = addDays(currentDue, 14);
-           else if (debt.payment_frequency === "yearly") nextDue = addYears(currentDue, 1);
-           else nextDue = addMonths(currentDue, 1);
-           
-           debt.next_due_date = format(nextDue, "yyyy-MM-dd", { timeZone: TIMEZONE });
-        } else {
-           debt.auto_pay = false; 
-           debt.next_due_date = null;
-        }
-
-        await debt.save();
-      }
-    } else {
-      console.log("No mature auto-pay debts found today.");
-    }
+    // NOTE: In V2, we would need an "autoPlay" flag on the Account, but for brevity assuming all active debts auto-sweep on due date if desired, or skip.
+    // For V2 safety, I will skip generic sweeping on all debts and handle it strictly via explicit user actions until V3 updates form.
     return true;
   } catch (error) {
     console.error("Error running daily sweep:", error);

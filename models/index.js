@@ -1,33 +1,15 @@
 const sequelize = require("../database");
-const Paycheque = require("./paycheque");
-const Expense = require("./expense");
-const Debt = require("./debt");
-const SavingsGoal = require("./savingsGoal");
-const CreditCard = require("./creditCard");
+const Account = require("./account");
+const Transaction = require("./transaction");
 
-// Paycheque to Expense Relationship
-Paycheque.hasMany(Expense, {
-  foreignKey: "paychequeId",
-  onDelete: "SET NULL",
-});
-Expense.belongsTo(Paycheque, {
-  foreignKey: "paychequeId",
-});
+Account.hasMany(Transaction, { as: "outgoingTransactions", foreignKey: "fromAccountId", onDelete: "CASCADE" });
+Transaction.belongsTo(Account, { as: "fromAccount", foreignKey: "fromAccountId" });
 
-// Credit Card to Expense Relationship
-CreditCard.hasMany(Expense, {
-  foreignKey: "creditCardId",
-  onDelete: "SET NULL",
-});
-Expense.belongsTo(CreditCard, {
-  foreignKey: "creditCardId",
-});
+Account.hasMany(Transaction, { as: "incomingTransactions", foreignKey: "toAccountId", onDelete: "CASCADE" });
+Transaction.belongsTo(Account, { as: "toAccount", foreignKey: "toAccountId" });
 
 module.exports = {
   sequelize,
-  Paycheque,
-  Expense,
-  Debt,
-  SavingsGoal,
-  CreditCard,
+  Account,
+  Transaction
 };

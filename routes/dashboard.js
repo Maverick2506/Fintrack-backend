@@ -1,11 +1,8 @@
 const express = require("express");
 const {
   sequelize,
-  Paycheque,
-  Expense,
-  Debt,
-  SavingsGoal,
-  CreditCard,
+  Account,
+  Transaction,
 } = require("../models");
 const { Op } = require("sequelize");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -13,15 +10,10 @@ const router = express.Router();
 
 router.use(authMiddleware);
 
-// No changes to this existing route
 router.get("/dashboard", async (req, res) => {
   try {
-    const year = req.query.year
-      ? parseInt(req.query.year)
-      : new Date().getFullYear();
-    const month = req.query.month
-      ? parseInt(req.query.month) - 1
-      : new Date().getMonth();
+    const year = req.query.year ? parseInt(req.query.year) : new Date().getFullYear();
+    const month = req.query.month ? parseInt(req.query.month) - 1 : new Date().getMonth();
     const startOfMonth = new Date(year, month, 1);
     const endOfMonth = new Date(year, month + 1, 0);
     const today = new Date();
@@ -29,61 +21,44 @@ router.get("/dashboard", async (req, res) => {
     const startOfPreviousMonth = new Date(year, month - 1, 1);
     const endOfPreviousMonth = new Date(year, month, 0);
 
-    const previousMonthIncome = await Paycheque.sum("amount", {
-      where: {
-        payment_date: {
-          [Op.between]: [startOfPreviousMonth, endOfPreviousMonth],
-        },
-      },
+    const previousMonthIncome = await Transaction.sum("amount", {
+      where: { type: "INCOME", date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] } }
     });
 
-    const previousMonthSpending = await Expense.sum("amount", {
-      where: {
-        due_date: {
-          [Op.between]: [startOfPreviousMonth, endOfPreviousMonth],
-        },
-        paid_with_credit_card: false,
-      },
+    const previousMonthSpending = await Transaction.sum("amount", {
+      where: { type: "EXPENSE", date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] } }
     });
 
     const isCurrentMonth = year === today.getFullYear() && month === today.getMonth();
     const cashFlowEndOfMonth = isCurrentMonth ? today : endOfMonth;
 
-    const totalIncome = await Paycheque.sum("amount", {
-      where: { 
-        payment_date: { 
-          [Op.between]: [startOfMonth, cashFlowEndOfMonth],
-        } 
-      },
+    const totalIncome = await Transaction.sum("amount", {
+      where: { type: "INCOME", date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] } }
     });
 
-    const totalSpending = await Expense.sum("amount", {
-      where: {
-        due_date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] },
-        paid_with_credit_card: false,
-      },
+    const totalSpending = await Transaction.sum("amount", {
+      where: { type: "EXPENSE", date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] } }
     });
 
-    const upcomingBills = await Expense.findAll({
-      where: { is_paid: false, due_date: { [Op.gte]: today } },
-      order: [["due_date", "ASC"]],
+    const upcomingBills = await Transaction.findAll({
+      where: { type: "EXPENSE", isCleared: false, date: { [Op.gte]: today } },
+      order: [["date", "ASC"]],
       limit: 5,
     });
 
-    const allUpcomingBills = await Expense.findAll({
+    const allUpcomingBills = await Transaction.findAll({
       where: {
-        is_paid: false,
-        due_date: {
-          [Op.between]: [today, endOfMonth],
-        },
+        type: "EXPENSE", isCleared: false,
+        date: { [Op.between]: [today, endOfMonth] },
       },
-      order: [["due_date", "ASC"]],
+      order: [["date", "ASC"]],
     });
 
-    const debtSummary = await Debt.findAll();
-    const savingsSummary = await SavingsGoal.findAll();
-    const creditCardSummary = await CreditCard.findAll({
-      include: [{ model: Expense }],
+    const debtSummary = await Account.findAll({ where: { type: "DEBT" } });
+    const savingsSummary = await Account.findAll({ where: { type: "SAVINGS_GOAL" } });
+    const creditCardSummary = await Account.findAll({
+      where: { type: "CREDIT_CARD" },
+      include: [{ model: Transaction, as: "outgoingTransactions" }], 
     });
 
     res.json({
@@ -91,8 +66,7 @@ router.get("/dashboard", async (req, res) => {
         totalIncome: totalIncome || 0,
         totalSpending: totalSpending || 0,
         netFlow: (totalIncome || 0) - (totalSpending || 0),
-        previousMonthNetFlow:
-          (previousMonthIncome || 0) - (previousMonthSpending || 0),
+        previousMonthNetFlow: (previousMonthIncome || 0) - (previousMonthSpending || 0),
       },
       upcomingBills,
       allUpcomingBills,
@@ -106,29 +80,26 @@ router.get("/dashboard", async (req, res) => {
   }
 });
 
-// No changes to this existing route
 router.get("/spending-summary", async (req, res) => {
   try {
-    const year = req.query.year
-      ? parseInt(req.query.year)
-      : new Date().getFullYear();
-    const month = req.query.month
-      ? parseInt(req.query.month) - 1
-      : new Date().getMonth();
+    const year = req.query.year ? parseInt(req.query.year) : new Date().getFullYear();
+    const month = req.query.month ? parseInt(req.query.month) - 1 : new Date().getMonth();
     const startOfMonth = new Date(year, month, 1);
     const endOfMonth = new Date(year, month + 1, 0);
 
-    const spendingByCategory = await Expense.findAll({
+    const spendingByCategory = await Transaction.findAll({
       attributes: [
         "category",
         [sequelize.fn("SUM", sequelize.col("amount")), "total_amount"],
       ],
       where: {
-        due_date: { [Op.between]: [startOfMonth, endOfMonth] },
+        type: "EXPENSE",
+        date: { [Op.between]: [startOfMonth, endOfMonth] },
       },
       group: ["category"],
       raw: true,
     });
+    
     const formattedData = spendingByCategory.map((item) => ({
       name: item.category,
       value: parseFloat(item.total_amount),
@@ -139,32 +110,25 @@ router.get("/spending-summary", async (req, res) => {
   }
 });
 
-// --- NEW ROUTE for 6-Month Trend Data ---
 router.get("/trends", async (req, res) => {
   try {
     const trends = [];
     for (let i = 5; i >= 0; i--) {
-      const date = new Date();
-      date.setMonth(date.getMonth() - i);
-      const year = date.getFullYear();
-      const month = date.getMonth();
+      const d = new Date();
+      d.setMonth(d.getMonth() - i);
+      const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+      const endOfMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0);
 
-      const startOfMonth = new Date(year, month, 1);
-      const endOfMonth = new Date(year, month + 1, 0);
-
-      const income = await Paycheque.sum("amount", {
-        where: { payment_date: { [Op.between]: [startOfMonth, endOfMonth] } },
+      const income = await Transaction.sum("amount", {
+        where: { type: "INCOME", date: { [Op.between]: [startOfMonth, endOfMonth] } },
       });
 
-      const spending = await Expense.sum("amount", {
-        where: {
-          due_date: { [Op.between]: [startOfMonth, endOfMonth] },
-          paid_with_credit_card: false,
-        },
+      const spending = await Transaction.sum("amount", {
+        where: { type: "EXPENSE", date: { [Op.between]: [startOfMonth, endOfMonth] } },
       });
 
       trends.push({
-        name: date.toLocaleString("default", { month: "short" }),
+        name: d.toLocaleString("default", { month: "short" }),
         income: income || 0,
         spending: spending || 0,
       });
