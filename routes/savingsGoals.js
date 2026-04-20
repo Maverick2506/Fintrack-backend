@@ -8,7 +8,13 @@ router.use(authMiddleware);
 router.get("/savings-goals", async (req, res) => {
   try {
     const goals = await Account.findAll({ where: { type: "SAVINGS_GOAL" } });
-    res.json(goals);
+    const formatted = goals.map(g => ({
+      ...g.toJSON(),
+      current_amount: g.initialBalance,
+      goal_amount: g.targetAmount,
+      target_date: g.dueDate
+    }));
+    res.json(formatted);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -19,11 +25,16 @@ router.post("/savings-goals", async (req, res) => {
     const newGoal = await Account.create({
       name: req.body.name,
       type: "SAVINGS_GOAL",
-      targetAmount: req.body.target_amount,
+      targetAmount: req.body.target_amount || req.body.goal_amount,
       dueDate: req.body.target_date,
       initialBalance: 0,
     });
-    res.status(201).json(newGoal);
+    res.status(201).json({
+      ...newGoal.toJSON(),
+      current_amount: newGoal.initialBalance,
+      goal_amount: newGoal.targetAmount,
+      target_date: newGoal.dueDate
+    });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -64,7 +75,12 @@ router.post("/savings-goals/:id/contribute", async (req, res) => {
         isCleared: true,
       });
 
-      res.json(goal);
+      res.json({
+        ...goal.toJSON(),
+        current_amount: goal.initialBalance,
+        goal_amount: goal.targetAmount,
+        target_date: goal.dueDate
+      });
     } else {
       res.status(404).send("Goal or Primary Checking not found");
     }
@@ -79,10 +95,15 @@ router.put("/savings-goals/:id", async (req, res) => {
     if (goal) {
       await goal.update({
         name: req.body.name,
-        targetAmount: req.body.target_amount,
+        targetAmount: req.body.target_amount || req.body.goal_amount,
         dueDate: req.body.target_date
       });
-      res.json(goal);
+      res.json({
+        ...goal.toJSON(),
+        current_amount: goal.initialBalance,
+        goal_amount: goal.targetAmount,
+        target_date: goal.dueDate
+      });
     } else {
       res.status(404).send("Savings Goal not found");
     }

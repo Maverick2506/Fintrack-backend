@@ -25,9 +25,11 @@ const {
 async function migrate() {
   console.log("🚀 Starting V2 Migration...");
   try {
-    // 1. Sync DB to ensure new tables exist
+    // 1. Sync DB and clear V2 tables to prevent duplicates
     await sequelize.sync({ alter: true });
-    console.log("✅ Tables synced.");
+    await require("../models").Transaction.destroy({ where: {} });
+    await require("../models").Account.destroy({ where: {} });
+    console.log("✅ Tables synced and old V2 data cleared.");
 
     // 2. Create the Primary Checking Account
     let checking = await Account.findOne({ where: { name: "Primary Checking" } });
@@ -63,6 +65,7 @@ async function migrate() {
         name: debt.name,
         type: "DEBT",
         initialBalance: debt.total_remaining || 0,
+        targetAmount: debt.total_amount || null,
         minimumPayment: debt.monthly_payment || null,
         interestRate: debt.interest_rate || null,
       });
@@ -78,7 +81,7 @@ async function migrate() {
         name: goal.name,
         type: "SAVINGS_GOAL",
         initialBalance: goal.current_amount || 0,
-        targetAmount: goal.target_amount || null,
+        targetAmount: goal.goal_amount || null,
         dueDate: goal.target_date || null,
       });
       goalMap[goal.id] = acc.id;
