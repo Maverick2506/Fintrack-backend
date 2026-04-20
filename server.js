@@ -18,6 +18,8 @@ const {
   router: recurringRoutes,
   createRecurringExpenses,
 } = require("./routes/recurring");
+const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
+const { apiLimiter, aiLimiter } = require("./middleware/rateLimit");
 
 const app = express();
 app.use(compression());
@@ -49,6 +51,10 @@ const port = process.env.PORT || 8000;
 app.use(express.json());
 
 // --- API ROUTES ---
+app.use("/api/financial-advice", aiLimiter);
+app.use("/api/categorize-expense", aiLimiter);
+app.use("/api", apiLimiter);
+
 app.use("/api/auth", authRoutes);
 app.use("/api", expenseRoutes);
 app.use("/api", debtRoutes);
@@ -156,6 +162,9 @@ app.get("/api/daily-check", async (req, res) => {
     res.status(500).send("Error in daily check.");
   }
 });
+
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 // --- Automated Task Schedulers ---
 cron.schedule("0 0 * * *", async () => {
