@@ -1,9 +1,16 @@
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 router.use(authMiddleware);
+
+const TIMEZONE = "America/Toronto";
+const getTodayString = () =>
+  format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", {
+    timeZone: TIMEZONE,
+  });
 
 router.get("/credit-cards", async (req, res) => {
   try {
@@ -72,9 +79,9 @@ router.post("/credit-cards/:id/pay", async (req, res) => {
       {
         title: `Payment for ${card.name}`,
         amount: paymentAmount,
-        date: new Date(),
-        type: "TRANSFER",
-        category: "Credit Card Payment",
+        date: getTodayString(),
+        type: "EXPENSE",
+        category: "Debt",
         isCleared: true,
         fromAccountId: checking.id,
         toAccountId: card.id,

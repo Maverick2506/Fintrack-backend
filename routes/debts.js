@@ -1,9 +1,16 @@
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 router.use(authMiddleware);
+
+const TIMEZONE = "America/Toronto";
+const getTodayString = () =>
+  format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", {
+    timeZone: TIMEZONE,
+  });
 
 const formatDebtResponse = (d) => {
   const json = d.toJSON ? d.toJSON() : d;
@@ -91,13 +98,14 @@ router.post("/debts/:id/pay", async (req, res) => {
     );
     await debt.save({ transaction: dbTx });
 
+    // Record as EXPENSE under "Debt" category so it registers in both Monthly Expenses/Analytics AND Debt paydown
     await Transaction.create(
       {
         title: `Payment for ${debt.name}`,
         amount: paymentAmount,
-        date: new Date(),
-        type: "TRANSFER",
-        category: "Debt Payment",
+        date: getTodayString(),
+        type: "EXPENSE",
+        category: "Debt",
         isCleared: true,
         fromAccountId: checking.id,
         toAccountId: debt.id,

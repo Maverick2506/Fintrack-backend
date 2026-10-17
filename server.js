@@ -98,35 +98,42 @@ const runDailySweep = async () => {
     const nowZoned = toZonedTime(nowUtc, TIMEZONE);
     const todayString = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
-    // 1. Process Due Credit Card Expenses (pending bills charged to a credit card)
-    const billsToUpdate = await Transaction.findAll({
+    // 1. Process Due Pending Expenses (Credit Card charges & Debt/Card paydown bills)
+    const pendingBillsDue = await Transaction.findAll({
       where: {
         isCleared: false,
         type: "EXPENSE",
-        fromAccountId: { [Op.ne]: null },
         date: { [Op.lte]: todayString },
       },
       include: [
-        {
-          model: Account,
-          as: "fromAccount",
-          where: { type: "CREDIT_CARD" },
-        },
+        { model: Account, as: "fromAccount" },
+        { model: Account, as: "toAccount" },
       ],
       transaction: dbTx,
     });
 
-    if (billsToUpdate.length > 0) {
-      console.log(
-        `Found ${billsToUpdate.length} credit card bill(s) to officially mark as paid.`
-      );
-      for (const bill of billsToUpdate) {
-        if (bill.fromAccount) {
-          bill.fromAccount.initialBalance =
-            parseFloat(bill.fromAccount.initialBalance) +
-            parseFloat(bill.amount);
-          await bill.fromAccount.save({ transaction: dbTx });
-        }
+    for (const bill of pendingBillsDue) {
+      const amt = parseFloat(bill.amount) || 0;
+      if (
+        bill.fromAccount &&
+        bill.fromAccount.type === "CREDIT_CARD" &&
+        !bill.toAccountId
+      ) {
+        bill.fromAccount.initialBalance =
+          parseFloat(bill.fromAccount.initialBalance || 0) + amt;
+        await bill.fromAccount.save({ transaction: dbTx });
+        bill.isCleared = true;
+        await bill.save({ transaction: dbTx });
+      } else if (
+        bill.toAccount &&
+        (bill.toAccount.type === "DEBT" ||
+          bill.toAccount.type === "CREDIT_CARD")
+      ) {
+        bill.toAccount.initialBalance = Math.max(
+          0,
+          parseFloat(bill.toAccount.initialBalance || 0) - amt
+        );
+        await bill.toAccount.save({ transaction: dbTx });
         bill.isCleared = true;
         await bill.save({ transaction: dbTx });
       }
@@ -176,8 +183,8 @@ const runDailySweep = async () => {
             title: `Auto-Pay for ${debt.name}`,
             amount: paymentAmount,
             date: todayString,
-            type: "TRANSFER",
-            category: "Debt Payment",
+            type: "EXPENSE",
+            category: "Debt",
             isCleared: true,
             fromAccountId: checking.id,
             toAccountId: debt.id,
@@ -219,7 +226,6 @@ cron.schedule(
   }
 );
 
-// Runs at 1 AM EVERY DAY to create recurring expenses and paycheques ahead of time
 cron.schedule("0 1 * * *", createRecurringExpenses, {
   timezone: "America/Toronto",
 });
@@ -228,7 +234,9 @@ cron.schedule("0 1 * * *", createRecurringExpenses, {
 // --- Initialize Server ---
 async function initialize() {
   try {
-    await sequelize.sync({ alter: true });
+    const syncOptions =
+      process.env.DB_ALTER_SYNC === "true" ? { alter: true } : undefined;
+    await sequelize.sync(syncOptions);
     await Account.findOrCreate({
       where: { name: "Primary Checking" },
       defaults: { type: "CHECKING", initialBalance: 0.0 },

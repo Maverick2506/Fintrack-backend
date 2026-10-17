@@ -1,10 +1,17 @@
 const express = require("express");
 const { sequelize, Transaction, Account } = require("../models");
 const { Op } = require("sequelize");
+const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 router.use(authMiddleware);
+
+const TIMEZONE = "America/Toronto";
+const getTodayString = () =>
+  format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", {
+    timeZone: TIMEZONE,
+  });
 
 // Helper to format YYYY-MM-DD month boundaries cleanly
 const getMonthDateRange = (year, month) => {
@@ -16,38 +23,92 @@ const getMonthDateRange = (year, month) => {
   return { startDate, endDate };
 };
 
-// Apply or reverse balance effect of a transaction on linked non-checking accounts
+// Apply or reverse balance effect of a cleared transaction on linked non-checking accounts
 const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
   const amount = parseFloat(trx.amount) || 0;
   if (amount === 0) return;
 
-  // 1. Cleared expense charged to a Credit Card increases card balance (+amount)
-  if (trx.type === "EXPENSE" && trx.isCleared && trx.fromAccountId) {
-    const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
+  // Unpaid/pending expenses have not affected account balances yet
+  if (trx.type === "EXPENSE" && !trx.isCleared) return;
+
+  // 1. Cleared expense charged FROM a Credit Card (and not a paydown transfer to another account) increases card balance (+amount)
+  if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
+    const fromAcc = await Account.findByPk(trx.fromAccountId, {
+      transaction: dbTx,
+    });
     if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-      const nextBal = Math.max(0, parseFloat(fromAcc.initialBalance || 0) + direction * amount);
+      const nextBal = Math.max(
+        0,
+        parseFloat(fromAcc.initialBalance || 0) + direction * amount
+      );
       fromAcc.initialBalance = nextBal;
       await fromAcc.save({ transaction: dbTx });
     }
   }
 
-  // 2. Transfer to a Debt, Credit Card, or Savings Goal
-  if (trx.type === "TRANSFER" && trx.toAccountId) {
-    const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
+  // 2. Cleared EXPENSE (e.g. category: "Debt") or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
+  if (
+    (trx.type === "EXPENSE" || trx.type === "TRANSFER") &&
+    trx.toAccountId
+  ) {
+    const toAcc = await Account.findByPk(trx.toAccountId, {
+      transaction: dbTx,
+    });
     if (toAcc) {
       if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-        // Payment reduces debt/card balance when applied (direction=1), restores when reversed (direction=-1)
-        const nextBal = Math.max(0, parseFloat(toAcc.initialBalance || 0) - direction * amount);
+        // Paydown reduces Debt / Credit Card balance when applied (direction=1), restores when reversed (direction=-1)
+        const nextBal = Math.max(
+          0,
+          parseFloat(toAcc.initialBalance || 0) - direction * amount
+        );
         toAcc.initialBalance = nextBal;
         await toAcc.save({ transaction: dbTx });
       } else if (toAcc.type === "SAVINGS_GOAL") {
-        // Contribution increases savings balance when applied (direction=1), reduces when reversed (direction=-1)
-        const nextBal = Math.max(0, parseFloat(toAcc.initialBalance || 0) + direction * amount);
+        // Contribution increases Savings Goal balance when applied (direction=1), reduces when reversed (direction=-1)
+        const nextBal = Math.max(
+          0,
+          parseFloat(toAcc.initialBalance || 0) + direction * amount
+        );
         toAcc.initialBalance = nextBal;
         await toAcc.save({ transaction: dbTx });
       }
     }
   }
+};
+
+// Resolve target Debt or Credit Card account when a transaction is categorized as Debt
+const resolvePaydownTargetId = async (
+  explicitTargetId,
+  category,
+  title,
+  dbTx = null
+) => {
+  if (explicitTargetId) {
+    const acc = await Account.findByPk(explicitTargetId, {
+      transaction: dbTx,
+    });
+    if (acc) return acc.id;
+  }
+
+  if (category === "Debt" && title) {
+    const candidates = await Account.findAll({
+      where: { type: { [Op.in]: ["DEBT", "CREDIT_CARD"] } },
+      transaction: dbTx,
+    });
+    const normalizedTitle = title.toLowerCase().trim();
+    const matched = candidates.find((acc) => {
+      const accName = (acc.name || "").toLowerCase().trim();
+      return (
+        accName &&
+        (normalizedTitle === accName ||
+          normalizedTitle.includes(accName) ||
+          accName.includes(normalizedTitle))
+      );
+    });
+    if (matched) return matched.id;
+  }
+
+  return null;
 };
 
 // Map old "monthly expenses" API shape
@@ -81,6 +142,7 @@ router.get("/expenses/monthly", async (req, res) => {
       due_date: e.date,
       name: e.title,
       is_paid: e.isCleared,
+      targetAccountId: e.toAccountId || null,
     }));
     res.json(formatted);
   } catch (error) {
@@ -113,6 +175,7 @@ router.get("/expenses/category", async (req, res) => {
       due_date: e.date,
       name: e.title,
       is_paid: e.isCleared,
+      targetAccountId: e.toAccountId || null,
     }));
     res.json(formatted);
   } catch (error) {
@@ -149,6 +212,7 @@ router.get("/expenses/all", async (req, res) => {
         t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
           ? t.fromAccount.id
           : null,
+      targetAccountId: t.toAccountId || null,
       fromAccount: t.fromAccount ? t.fromAccount.name : null,
       toAccount: t.toAccount ? t.toAccount.name : null,
     }));
@@ -169,35 +233,56 @@ router.post("/expenses", async (req, res) => {
       category,
       is_paid,
       creditCardId,
+      targetAccountId,
+      toAccountId,
       recurrence,
     } = req.body;
+
+    const todayStr = getTodayString();
+    const expenseDate = due_date || todayStr;
+    const finalCategory = category || "Other";
+
     let [fromAccount] = await Account.findOrCreate({
       where: { name: "Primary Checking" },
       defaults: { type: "CHECKING", initialBalance: 0.0 },
       transaction: dbTx,
     });
-    if (creditCardId) {
+
+    // Resolve whether this expense pays down a specific Debt or Credit Card
+    const resolvedToAccountId = await resolvePaydownTargetId(
+      targetAccountId || toAccountId,
+      finalCategory,
+      name,
+      dbTx
+    );
+
+    if (creditCardId && !resolvedToAccountId) {
       const cardAccount = await Account.findByPk(creditCardId, {
         transaction: dbTx,
       });
       if (cardAccount) fromAccount = cardAccount;
     }
 
+    // Default to cleared (paid) if expense date is today or in the past, unless explicitly specified
+    const isCleared =
+      is_paid !== undefined ? Boolean(is_paid) : expenseDate <= todayStr;
+
     const newExp = await Transaction.create(
       {
         title: name,
         amount: parseFloat(amount),
-        date: due_date,
+        date: expenseDate,
         type: "EXPENSE",
-        category: category || "Other",
-        isCleared: Boolean(is_paid),
+        category: finalCategory,
+        isCleared,
         recurrence: recurrence || "none",
         fromAccountId: fromAccount.id,
+        toAccountId: resolvedToAccountId,
       },
       { transaction: dbTx }
     );
 
-    // If paid immediately on a credit card, increment the card balance
+    // Apply balance change on Credit Card (charge) or Debt/Credit Card (paydown) if cleared
     await adjustAccountForTransaction(newExp, 1, dbTx);
 
     await dbTx.commit();
@@ -219,7 +304,7 @@ router.put("/expenses/:id", async (req, res) => {
       return res.status(404).send("Transaction not found");
     }
 
-    // Reverse old transaction's effect on any linked credit card / account
+    // Reverse old transaction's effect on any linked credit card / debt / savings account
     await adjustAccountForTransaction(trx, -1, dbTx);
 
     let fromAccountId = trx.fromAccountId;
@@ -236,24 +321,54 @@ router.put("/expenses/:id", async (req, res) => {
       }
     }
 
+    const nextTitle = req.body.name || trx.title;
+    const nextCategory = req.body.category || trx.category;
+
+    let nextToAccountId = trx.toAccountId;
+    if (
+      req.body.targetAccountId !== undefined ||
+      req.body.toAccountId !== undefined
+    ) {
+      const explicitTarget =
+        req.body.targetAccountId !== undefined
+          ? req.body.targetAccountId
+          : req.body.toAccountId;
+      nextToAccountId = await resolvePaydownTargetId(
+        explicitTarget,
+        nextCategory,
+        nextTitle,
+        dbTx
+      );
+    } else if (nextCategory === "Debt" && !nextToAccountId) {
+      nextToAccountId = await resolvePaydownTargetId(
+        null,
+        nextCategory,
+        nextTitle,
+        dbTx
+      );
+    }
+
     await trx.update(
       {
-        title: req.body.name || trx.title,
+        title: nextTitle,
         amount:
           req.body.amount !== undefined
             ? parseFloat(req.body.amount)
             : trx.amount,
         date: req.body.due_date || req.body.payment_date || trx.date,
-        category: req.body.category || trx.category,
+        category: nextCategory,
         isCleared:
-          req.body.is_paid !== undefined ? Boolean(req.body.is_paid) : trx.isCleared,
+          req.body.is_paid !== undefined
+            ? Boolean(req.body.is_paid)
+            : trx.isCleared,
         recurrence: req.body.recurrence || trx.recurrence,
         fromAccountId,
+        toAccountId: nextToAccountId,
       },
       { transaction: dbTx }
     );
 
-    // Apply updated transaction's effect on linked credit card / account
+    // Apply updated transaction's effect on linked account
     await adjustAccountForTransaction(trx, 1, dbTx);
 
     await dbTx.commit();

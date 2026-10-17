@@ -44,7 +44,7 @@ router.get("/dashboard", async (req, res) => {
       defaults: { type: "CHECKING", initialBalance: 0.0 },
     });
 
-    // Run all independent dashboard queries in parallel to minimize DB round-trips
+    // Run all independent dashboard queries in parallel (including spendingByCategory) to eliminate extra HTTP round-trips
     const [
       previousMonthIncome,
       previousMonthSpending,
@@ -55,6 +55,7 @@ router.get("/dashboard", async (req, res) => {
       debtSummary,
       savingsSummary,
       creditCardSummary,
+      spendingByCategoryRaw,
       allTimeIncome,
       allTimeCheckingExp,
       allTimeTransfersOut,
@@ -111,6 +112,18 @@ router.get("/dashboard", async (req, res) => {
         where: { type: "CREDIT_CARD" },
         order: [["createdAt", "ASC"]],
       }),
+      Transaction.findAll({
+        attributes: [
+          "category",
+          [sequelize.fn("SUM", sequelize.col("amount")), "total_amount"],
+        ],
+        where: {
+          type: "EXPENSE",
+          date: { [Op.between]: [startOfMonth, endOfMonth] },
+        },
+        group: ["category"],
+        raw: true,
+      }),
       Transaction.sum("amount", { where: { type: "INCOME" } }),
       Transaction.sum("amount", {
         where: {
@@ -136,6 +149,11 @@ router.get("/dashboard", async (req, res) => {
     const checkingCurrentBalance =
       (parseFloat(checking.initialBalance) || 0) + netCheckingActivity;
 
+    const spendingSummary = (spendingByCategoryRaw || []).map((item) => ({
+      name: item.category,
+      value: parseFloat(item.total_amount),
+    }));
+
     res.json({
       monthlySummary: {
         totalIncome: parseFloat(totalIncome) || 0,
@@ -157,6 +175,7 @@ router.get("/dashboard", async (req, res) => {
       debtSummary,
       savingsSummary,
       creditCardSummary,
+      spendingSummary,
     });
   } catch (error) {
     console.error("Dashboard Error:", error);
@@ -262,7 +281,6 @@ router.get("/trends", async (req, res) => {
       ? parseInt(req.query.month) - 1
       : nowZoned.getMonth();
 
-    // Build the 6 month buckets first
     const buckets = [];
     const bucketMap = {};
     for (let i = 5; i >= 0; i--) {
@@ -284,7 +302,6 @@ router.get("/trends", async (req, res) => {
     const windowStart = formatYMD(baseYear, baseMonth - 5, 1);
     const windowEnd = formatYMD(baseYear, baseMonth + 1, 0);
 
-    // Single query for the entire 6-month window instead of 12 sequential queries
     const rows = await Transaction.findAll({
       attributes: ["type", "date", "amount"],
       where: {
