@@ -27,69 +27,90 @@ const createRecurringExpenses = async () => {
   console.log("Running advanced timezone-aware recurring job...");
   try {
     const nowUtc = new Date();
-    // Get absolute current date in Toronto
     const nowZoned = toZonedTime(nowUtc, TIMEZONE);
-    // Generate up to 30 days ahead
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
     const lookupHorizon = addDays(nowZoned, 30);
-    // Format to strictly YYYY-MM-DD
-    const horizonString = format(lookupHorizon, "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const horizonString = format(lookupHorizon, "yyyy-MM-dd", {
+      timeZone: TIMEZONE,
+    });
 
-    const allRecurring = await Transaction.findAll({
+    // Fetch all INCOME and EXPENSE transactions ordered newest first so that
+    // if the latest instance of a series was changed to recurrence: "none",
+    // we respect that and do not resurrect it from an older historical row.
+    const allTransactions = await Transaction.findAll({
       where: {
-        type: "EXPENSE",
-        recurrence: {
-          [Op.in]: ["weekly", "bi-weekly", "monthly", "yearly"],
-        },
+        type: { [Op.in]: ["EXPENSE", "INCOME"] },
       },
-      order: [["date", "DESC"]],
+      order: [
+        ["date", "DESC"],
+        ["createdAt", "DESC"],
+      ],
     });
 
     const latestOccurrences = {};
-    for (const expense of allRecurring) {
-      const key = expense.title.toLowerCase().trim();
+    for (const trx of allTransactions) {
+      const key = `${trx.type}:${trx.title.toLowerCase().trim()}`;
       if (!latestOccurrences[key]) {
-        latestOccurrences[key] = expense;
+        latestOccurrences[key] = trx;
       }
     }
 
-    for (const baseExpense of Object.values(latestOccurrences)) {
-      // Parse YYYY-MM-DD string exactly as midnight in Toronto
-      let nextDate = toZonedTime(`${baseExpense.date}T00:00:00`, TIMEZONE);
-      
+    for (const baseTrx of Object.values(latestOccurrences)) {
+      if (
+        !baseTrx.recurrence ||
+        !["weekly", "bi-weekly", "monthly", "yearly"].includes(
+          baseTrx.recurrence
+        )
+      ) {
+        continue;
+      }
+
+      let nextDate = toZonedTime(`${baseTrx.date}T00:00:00`, TIMEZONE);
+
       while (true) {
-        nextDate = getNextDueDate(nextDate, baseExpense.recurrence);
+        nextDate = getNextDueDate(nextDate, baseTrx.recurrence);
         if (!nextDate) break;
 
-        const nextDateStr = format(nextDate, "yyyy-MM-dd", { timeZone: TIMEZONE });
+        const nextDateStr = format(nextDate, "yyyy-MM-dd", {
+          timeZone: TIMEZONE,
+        });
 
         if (nextDateStr > horizonString) {
-           break;
+          break;
         }
 
         const existing = await Transaction.findOne({
           where: {
-            type: "EXPENSE",
-            title: baseExpense.title,
+            type: baseTrx.type,
+            title: baseTrx.title,
             date: nextDateStr,
           },
         });
 
         if (!existing) {
+          // Income is cleared once its date has arrived; expenses start unpaid (upcoming bill)
+          const isCleared =
+            baseTrx.type === "INCOME" ? nextDateStr <= todayStr : false;
+
           await Transaction.create({
-            ...baseExpense.get({ plain: true }),
-            id: undefined, 
-            isCleared: false,
+            ...baseTrx.get({ plain: true }),
+            id: undefined,
+            isCleared,
             date: nextDateStr,
             createdAt: new Date(),
             updatedAt: new Date(),
           });
-          console.log(`Created recurring expense: ${baseExpense.title} for ${nextDateStr}`);
+          console.log(
+            `Created recurring ${baseTrx.type.toLowerCase()}: ${
+              baseTrx.title
+            } for ${nextDateStr}`
+          );
         }
       }
     }
-    console.log("Recurring expenses job finished.");
+    console.log("Recurring transactions job finished.");
   } catch (error) {
-    console.error("Error creating recurring expenses:", error);
+    console.error("Error creating recurring transactions:", error);
   }
 };
 
@@ -98,4 +119,4 @@ router.post("/trigger-recurring", authMiddleware, async (req, res) => {
   res.status(200).send("Advanced recurring job triggered successfully.");
 });
 
-module.exports = { router, createRecurringExpenses };
+module.exports = { router, createRecurringExpenses, getNextDueDate };

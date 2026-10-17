@@ -1,9 +1,5 @@
 const express = require("express");
-const {
-  sequelize,
-  Account,
-  Transaction,
-} = require("../models");
+const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -26,8 +22,12 @@ router.get("/dashboard", async (req, res) => {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
-    const year = req.query.year ? parseInt(req.query.year) : nowZoned.getFullYear();
-    const month = req.query.month ? parseInt(req.query.month) - 1 : nowZoned.getMonth();
+    const year = req.query.year
+      ? parseInt(req.query.year)
+      : nowZoned.getFullYear();
+    const month = req.query.month
+      ? parseInt(req.query.month) - 1
+      : nowZoned.getMonth();
 
     const startOfMonth = formatYMD(year, month, 1);
     const endOfMonth = formatYMD(year, month + 1, 0);
@@ -35,56 +35,96 @@ router.get("/dashboard", async (req, res) => {
     const startOfPreviousMonth = formatYMD(year, month - 1, 1);
     const endOfPreviousMonth = formatYMD(year, month, 0);
 
-    const previousMonthIncome = await Transaction.sum("amount", {
-      where: { type: "INCOME", date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] } }
-    });
-
-    const previousMonthSpending = await Transaction.sum("amount", {
-      where: { type: "EXPENSE", date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] } }
-    });
-
-    const isCurrentMonth = year === nowZoned.getFullYear() && month === nowZoned.getMonth();
+    const isCurrentMonth =
+      year === nowZoned.getFullYear() && month === nowZoned.getMonth();
     const cashFlowEndOfMonth = isCurrentMonth ? todayStr : endOfMonth;
-
-    const totalIncome = await Transaction.sum("amount", {
-      where: { type: "INCOME", date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] } }
-    });
-
-    const totalSpending = await Transaction.sum("amount", {
-      where: { type: "EXPENSE", date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] } }
-    });
-
-    const upcomingBills = await Transaction.findAll({
-      where: { type: "EXPENSE", isCleared: false, date: { [Op.gte]: todayStr } },
-      order: [["date", "ASC"]],
-      limit: 5,
-    });
-
-    const allUpcomingBills = await Transaction.findAll({
-      where: {
-        type: "EXPENSE", isCleared: false,
-        date: { [Op.between]: [todayStr, endOfMonth] },
-      },
-      order: [["date", "ASC"]],
-    });
-
-    const debtSummary = await Account.findAll({ where: { type: "DEBT" } });
-    const savingsSummary = await Account.findAll({ where: { type: "SAVINGS_GOAL" } });
-    const creditCardSummary = await Account.findAll({
-      where: { type: "CREDIT_CARD" },
-      include: [{ model: Transaction, as: "outgoingTransactions" }], 
-    });
 
     const [checking] = await Account.findOrCreate({
       where: { name: "Primary Checking" },
       defaults: { type: "CHECKING", initialBalance: 0.0 },
     });
 
-    const [allTimeIncome, allTimeCheckingExp, allTimeTransfersOut, allTimeTransfersIn] = await Promise.all([
+    // Run all independent dashboard queries in parallel to minimize DB round-trips
+    const [
+      previousMonthIncome,
+      previousMonthSpending,
+      totalIncome,
+      totalSpending,
+      upcomingBills,
+      allUpcomingBills,
+      debtSummary,
+      savingsSummary,
+      creditCardSummary,
+      allTimeIncome,
+      allTimeCheckingExp,
+      allTimeTransfersOut,
+      allTimeTransfersIn,
+    ] = await Promise.all([
+      Transaction.sum("amount", {
+        where: {
+          type: "INCOME",
+          date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] },
+        },
+      }),
+      Transaction.sum("amount", {
+        where: {
+          type: "EXPENSE",
+          date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] },
+        },
+      }),
+      Transaction.sum("amount", {
+        where: {
+          type: "INCOME",
+          date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] },
+        },
+      }),
+      Transaction.sum("amount", {
+        where: {
+          type: "EXPENSE",
+          ...(isCurrentMonth ? { isCleared: true } : {}),
+          date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] },
+        },
+      }),
+      Transaction.findAll({
+        where: {
+          type: "EXPENSE",
+          isCleared: false,
+          date: { [Op.gte]: todayStr },
+        },
+        order: [["date", "ASC"]],
+        limit: 5,
+      }),
+      Transaction.findAll({
+        where: {
+          type: "EXPENSE",
+          isCleared: false,
+          date: { [Op.between]: [todayStr, endOfMonth] },
+        },
+        order: [["date", "ASC"]],
+      }),
+      Account.findAll({ where: { type: "DEBT" }, order: [["createdAt", "ASC"]] }),
+      Account.findAll({
+        where: { type: "SAVINGS_GOAL" },
+        order: [["createdAt", "ASC"]],
+      }),
+      Account.findAll({
+        where: { type: "CREDIT_CARD" },
+        order: [["createdAt", "ASC"]],
+      }),
       Transaction.sum("amount", { where: { type: "INCOME" } }),
-      Transaction.sum("amount", { where: { type: "EXPENSE", isCleared: true, fromAccountId: checking.id } }),
-      Transaction.sum("amount", { where: { type: "TRANSFER", fromAccountId: checking.id } }),
-      Transaction.sum("amount", { where: { type: "TRANSFER", toAccountId: checking.id } }),
+      Transaction.sum("amount", {
+        where: {
+          type: "EXPENSE",
+          isCleared: true,
+          fromAccountId: checking.id,
+        },
+      }),
+      Transaction.sum("amount", {
+        where: { type: "TRANSFER", fromAccountId: checking.id },
+      }),
+      Transaction.sum("amount", {
+        where: { type: "TRANSFER", toAccountId: checking.id },
+      }),
     ]);
 
     const netCheckingActivity =
@@ -93,14 +133,18 @@ router.get("/dashboard", async (req, res) => {
       (parseFloat(allTimeTransfersOut) || 0) +
       (parseFloat(allTimeTransfersIn) || 0);
 
-    const checkingCurrentBalance = (parseFloat(checking.initialBalance) || 0) + netCheckingActivity;
+    const checkingCurrentBalance =
+      (parseFloat(checking.initialBalance) || 0) + netCheckingActivity;
 
     res.json({
       monthlySummary: {
         totalIncome: parseFloat(totalIncome) || 0,
         totalSpending: parseFloat(totalSpending) || 0,
-        netFlow: (parseFloat(totalIncome) || 0) - (parseFloat(totalSpending) || 0),
-        previousMonthNetFlow: (parseFloat(previousMonthIncome) || 0) - (parseFloat(previousMonthSpending) || 0),
+        netFlow:
+          (parseFloat(totalIncome) || 0) - (parseFloat(totalSpending) || 0),
+        previousMonthNetFlow:
+          (parseFloat(previousMonthIncome) || 0) -
+          (parseFloat(previousMonthSpending) || 0),
       },
       checkingAccount: {
         id: checking.id,
@@ -127,11 +171,26 @@ router.put("/checking", async (req, res) => {
       defaults: { type: "CHECKING", initialBalance: 0.0 },
     });
 
-    const [allTimeIncome, allTimeCheckingExp, allTimeTransfersOut, allTimeTransfersIn] = await Promise.all([
+    const [
+      allTimeIncome,
+      allTimeCheckingExp,
+      allTimeTransfersOut,
+      allTimeTransfersIn,
+    ] = await Promise.all([
       Transaction.sum("amount", { where: { type: "INCOME" } }),
-      Transaction.sum("amount", { where: { type: "EXPENSE", isCleared: true, fromAccountId: checking.id } }),
-      Transaction.sum("amount", { where: { type: "TRANSFER", fromAccountId: checking.id } }),
-      Transaction.sum("amount", { where: { type: "TRANSFER", toAccountId: checking.id } }),
+      Transaction.sum("amount", {
+        where: {
+          type: "EXPENSE",
+          isCleared: true,
+          fromAccountId: checking.id,
+        },
+      }),
+      Transaction.sum("amount", {
+        where: { type: "TRANSFER", fromAccountId: checking.id },
+      }),
+      Transaction.sum("amount", {
+        where: { type: "TRANSFER", toAccountId: checking.id },
+      }),
     ]);
 
     const netCheckingActivity =
@@ -150,7 +209,8 @@ router.put("/checking", async (req, res) => {
       id: checking.id,
       name: checking.name,
       initialBalance: parseFloat(checking.initialBalance) || 0,
-      currentBalance: (parseFloat(checking.initialBalance) || 0) + netCheckingActivity,
+      currentBalance:
+        (parseFloat(checking.initialBalance) || 0) + netCheckingActivity,
     });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -160,8 +220,12 @@ router.put("/checking", async (req, res) => {
 router.get("/spending-summary", async (req, res) => {
   try {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
-    const year = req.query.year ? parseInt(req.query.year) : nowZoned.getFullYear();
-    const month = req.query.month ? parseInt(req.query.month) - 1 : nowZoned.getMonth();
+    const year = req.query.year
+      ? parseInt(req.query.year)
+      : nowZoned.getFullYear();
+    const month = req.query.month
+      ? parseInt(req.query.month) - 1
+      : nowZoned.getMonth();
     const startOfMonth = formatYMD(year, month, 1);
     const endOfMonth = formatYMD(year, month + 1, 0);
 
@@ -177,7 +241,7 @@ router.get("/spending-summary", async (req, res) => {
       group: ["category"],
       raw: true,
     });
-    
+
     const formattedData = spendingByCategory.map((item) => ({
       name: item.category,
       value: parseFloat(item.total_amount),
@@ -191,29 +255,61 @@ router.get("/spending-summary", async (req, res) => {
 router.get("/trends", async (req, res) => {
   try {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
-    const baseYear = req.query.year ? parseInt(req.query.year) : nowZoned.getFullYear();
-    const baseMonth = req.query.month ? parseInt(req.query.month) - 1 : nowZoned.getMonth();
-    const trends = [];
+    const baseYear = req.query.year
+      ? parseInt(req.query.year)
+      : nowZoned.getFullYear();
+    const baseMonth = req.query.month
+      ? parseInt(req.query.month) - 1
+      : nowZoned.getMonth();
+
+    // Build the 6 month buckets first
+    const buckets = [];
+    const bucketMap = {};
     for (let i = 5; i >= 0; i--) {
       const d = new Date(baseYear, baseMonth - i, 1);
-      const startOfMonth = formatYMD(d.getFullYear(), d.getMonth(), 1);
-      const endOfMonth = formatYMD(d.getFullYear(), d.getMonth() + 1, 0);
-
-      const income = await Transaction.sum("amount", {
-        where: { type: "INCOME", date: { [Op.between]: [startOfMonth, endOfMonth] } },
-      });
-
-      const spending = await Transaction.sum("amount", {
-        where: { type: "EXPENSE", date: { [Op.between]: [startOfMonth, endOfMonth] } },
-      });
-
-      trends.push({
-        name: d.toLocaleString("default", { month: "short" }),
-        income: parseFloat(income) || 0,
-        spending: parseFloat(spending) || 0,
-      });
+      const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+        2,
+        "0"
+      )}`;
+      const entry = {
+        ym,
+        name: d.toLocaleString("en-US", { month: "short" }),
+        income: 0,
+        spending: 0,
+      };
+      buckets.push(entry);
+      bucketMap[ym] = entry;
     }
-    res.json(trends);
+
+    const windowStart = formatYMD(baseYear, baseMonth - 5, 1);
+    const windowEnd = formatYMD(baseYear, baseMonth + 1, 0);
+
+    // Single query for the entire 6-month window instead of 12 sequential queries
+    const rows = await Transaction.findAll({
+      attributes: ["type", "date", "amount"],
+      where: {
+        type: { [Op.in]: ["INCOME", "EXPENSE"] },
+        date: { [Op.between]: [windowStart, windowEnd] },
+      },
+      raw: true,
+    });
+
+    for (const r of rows) {
+      const ym = String(r.date).slice(0, 7);
+      const bucket = bucketMap[ym];
+      if (!bucket) continue;
+      const amt = parseFloat(r.amount) || 0;
+      if (r.type === "INCOME") bucket.income += amt;
+      else if (r.type === "EXPENSE") bucket.spending += amt;
+    }
+
+    res.json(
+      buckets.map(({ name, income, spending }) => ({
+        name,
+        income: Number(income.toFixed(2)),
+        spending: Number(spending.toFixed(2)),
+      }))
+    );
   } catch (error) {
     console.error("Error fetching trends:", error);
     res.status(500).json({ error: "Failed to fetch trends data." });
