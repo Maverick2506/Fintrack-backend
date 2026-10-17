@@ -57,7 +57,10 @@ router.delete("/savings-goals/:id", async (req, res) => {
 router.post("/savings-goals/:id/contribute", async (req, res) => {
   try {
     const goal = await Account.findByPk(req.params.id);
-    let checking = await Account.findOne({ where: { name: "Primary Checking" } });
+    const [checking] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 }
+    });
 
     if (goal && checking) {
       goal.initialBalance = parseFloat(goal.initialBalance) + parseFloat(req.body.amount);

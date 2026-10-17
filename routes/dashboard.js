@@ -5,21 +5,35 @@ const {
   Transaction,
 } = require("../models");
 const { Op } = require("sequelize");
+const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 router.use(authMiddleware);
 
+const TIMEZONE = "America/Toronto";
+
+const formatYMD = (y, mZeroIndexed, d) => {
+  const dateObj = new Date(y, mZeroIndexed, d);
+  const yr = dateObj.getFullYear();
+  const mo = String(dateObj.getMonth() + 1).padStart(2, "0");
+  const da = String(dateObj.getDate()).padStart(2, "0");
+  return `${yr}-${mo}-${da}`;
+};
+
 router.get("/dashboard", async (req, res) => {
   try {
-    const year = req.query.year ? parseInt(req.query.year) : new Date().getFullYear();
-    const month = req.query.month ? parseInt(req.query.month) - 1 : new Date().getMonth();
-    const startOfMonth = new Date(year, month, 1);
-    const endOfMonth = new Date(year, month + 1, 0);
-    const today = new Date();
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
-    const startOfPreviousMonth = new Date(year, month - 1, 1);
-    const endOfPreviousMonth = new Date(year, month, 0);
+    const year = req.query.year ? parseInt(req.query.year) : nowZoned.getFullYear();
+    const month = req.query.month ? parseInt(req.query.month) - 1 : nowZoned.getMonth();
+
+    const startOfMonth = formatYMD(year, month, 1);
+    const endOfMonth = formatYMD(year, month + 1, 0);
+
+    const startOfPreviousMonth = formatYMD(year, month - 1, 1);
+    const endOfPreviousMonth = formatYMD(year, month, 0);
 
     const previousMonthIncome = await Transaction.sum("amount", {
       where: { type: "INCOME", date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] } }
@@ -29,8 +43,8 @@ router.get("/dashboard", async (req, res) => {
       where: { type: "EXPENSE", date: { [Op.between]: [startOfPreviousMonth, endOfPreviousMonth] } }
     });
 
-    const isCurrentMonth = year === today.getFullYear() && month === today.getMonth();
-    const cashFlowEndOfMonth = isCurrentMonth ? today : endOfMonth;
+    const isCurrentMonth = year === nowZoned.getFullYear() && month === nowZoned.getMonth();
+    const cashFlowEndOfMonth = isCurrentMonth ? todayStr : endOfMonth;
 
     const totalIncome = await Transaction.sum("amount", {
       where: { type: "INCOME", date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] } }
@@ -41,7 +55,7 @@ router.get("/dashboard", async (req, res) => {
     });
 
     const upcomingBills = await Transaction.findAll({
-      where: { type: "EXPENSE", isCleared: false, date: { [Op.gte]: today } },
+      where: { type: "EXPENSE", isCleared: false, date: { [Op.gte]: todayStr } },
       order: [["date", "ASC"]],
       limit: 5,
     });
@@ -49,7 +63,7 @@ router.get("/dashboard", async (req, res) => {
     const allUpcomingBills = await Transaction.findAll({
       where: {
         type: "EXPENSE", isCleared: false,
-        date: { [Op.between]: [today, endOfMonth] },
+        date: { [Op.between]: [todayStr, endOfMonth] },
       },
       order: [["date", "ASC"]],
     });
@@ -63,10 +77,10 @@ router.get("/dashboard", async (req, res) => {
 
     res.json({
       monthlySummary: {
-        totalIncome: totalIncome || 0,
-        totalSpending: totalSpending || 0,
-        netFlow: (totalIncome || 0) - (totalSpending || 0),
-        previousMonthNetFlow: (previousMonthIncome || 0) - (previousMonthSpending || 0),
+        totalIncome: parseFloat(totalIncome) || 0,
+        totalSpending: parseFloat(totalSpending) || 0,
+        netFlow: (parseFloat(totalIncome) || 0) - (parseFloat(totalSpending) || 0),
+        previousMonthNetFlow: (parseFloat(previousMonthIncome) || 0) - (parseFloat(previousMonthSpending) || 0),
       },
       upcomingBills,
       allUpcomingBills,
@@ -82,10 +96,11 @@ router.get("/dashboard", async (req, res) => {
 
 router.get("/spending-summary", async (req, res) => {
   try {
-    const year = req.query.year ? parseInt(req.query.year) : new Date().getFullYear();
-    const month = req.query.month ? parseInt(req.query.month) - 1 : new Date().getMonth();
-    const startOfMonth = new Date(year, month, 1);
-    const endOfMonth = new Date(year, month + 1, 0);
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const year = req.query.year ? parseInt(req.query.year) : nowZoned.getFullYear();
+    const month = req.query.month ? parseInt(req.query.month) - 1 : nowZoned.getMonth();
+    const startOfMonth = formatYMD(year, month, 1);
+    const endOfMonth = formatYMD(year, month + 1, 0);
 
     const spendingByCategory = await Transaction.findAll({
       attributes: [
@@ -112,12 +127,12 @@ router.get("/spending-summary", async (req, res) => {
 
 router.get("/trends", async (req, res) => {
   try {
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const trends = [];
     for (let i = 5; i >= 0; i--) {
-      const d = new Date();
-      d.setMonth(d.getMonth() - i);
-      const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1);
-      const endOfMonth = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+      const d = new Date(nowZoned.getFullYear(), nowZoned.getMonth() - i, 1);
+      const startOfMonth = formatYMD(d.getFullYear(), d.getMonth(), 1);
+      const endOfMonth = formatYMD(d.getFullYear(), d.getMonth() + 1, 0);
 
       const income = await Transaction.sum("amount", {
         where: { type: "INCOME", date: { [Op.between]: [startOfMonth, endOfMonth] } },
@@ -129,8 +144,8 @@ router.get("/trends", async (req, res) => {
 
       trends.push({
         name: d.toLocaleString("default", { month: "short" }),
-        income: income || 0,
-        spending: spending || 0,
+        income: parseFloat(income) || 0,
+        spending: parseFloat(spending) || 0,
       });
     }
     res.json(trends);

@@ -1,8 +1,9 @@
 const express = require("express");
-const { Expense } = require("../models");
+const { Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
 const { toZonedTime, format } = require("date-fns-tz");
+const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
@@ -33,18 +34,19 @@ const createRecurringExpenses = async () => {
     // Format to strictly YYYY-MM-DD
     const horizonString = format(lookupHorizon, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
-    const allRecurring = await Expense.findAll({
+    const allRecurring = await Transaction.findAll({
       where: {
+        type: "EXPENSE",
         recurrence: {
           [Op.in]: ["weekly", "bi-weekly", "monthly", "yearly"],
         },
       },
-      order: [["due_date", "DESC"]],
+      order: [["date", "DESC"]],
     });
 
     const latestOccurrences = {};
     for (const expense of allRecurring) {
-      const key = expense.name.toLowerCase().trim();
+      const key = expense.title.toLowerCase().trim();
       if (!latestOccurrences[key]) {
         latestOccurrences[key] = expense;
       }
@@ -52,7 +54,7 @@ const createRecurringExpenses = async () => {
 
     for (const baseExpense of Object.values(latestOccurrences)) {
       // Parse YYYY-MM-DD string exactly as midnight in Toronto
-      let nextDate = toZonedTime(`${baseExpense.due_date}T00:00:00`, TIMEZONE);
+      let nextDate = toZonedTime(`${baseExpense.date}T00:00:00`, TIMEZONE);
       
       while (true) {
         nextDate = getNextDueDate(nextDate, baseExpense.recurrence);
@@ -64,23 +66,24 @@ const createRecurringExpenses = async () => {
            break;
         }
 
-        const existing = await Expense.findOne({
+        const existing = await Transaction.findOne({
           where: {
-            name: baseExpense.name,
-            due_date: nextDateStr,
+            type: "EXPENSE",
+            title: baseExpense.title,
+            date: nextDateStr,
           },
         });
 
         if (!existing) {
-          await Expense.create({
+          await Transaction.create({
             ...baseExpense.get({ plain: true }),
             id: undefined, 
-            is_paid: false,
-            due_date: nextDateStr,
+            isCleared: false,
+            date: nextDateStr,
             createdAt: new Date(),
             updatedAt: new Date(),
           });
-          console.log(`Created recurring expense: ${baseExpense.name} for ${nextDateStr}`);
+          console.log(`Created recurring expense: ${baseExpense.title} for ${nextDateStr}`);
         }
       }
     }
@@ -90,7 +93,7 @@ const createRecurringExpenses = async () => {
   }
 };
 
-router.post("/trigger-recurring", async (req, res) => {
+router.post("/trigger-recurring", authMiddleware, async (req, res) => {
   await createRecurringExpenses();
   res.status(200).send("Advanced recurring job triggered successfully.");
 });

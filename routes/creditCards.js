@@ -42,7 +42,10 @@ router.post("/credit-cards", async (req, res) => {
 router.post("/credit-cards/:id/pay", async (req, res) => {
   try {
     const card = await Account.findByPk(req.params.id);
-    const checking = await Account.findOne({ where: { name: "Primary Checking" } });
+    const [checking] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 }
+    });
 
     if (card && checking) {
       const paymentAmount = parseFloat(req.body.amount);
@@ -88,8 +91,13 @@ router.put("/credit-cards/:id", async (req, res) => {
   try {
     const card = await Account.findByPk(req.params.id);
     if (card) {
-      if (req.body.currentBalance !== undefined) req.body.initialBalance = req.body.currentBalance;
-      await card.update(req.body);
+      const { name, creditLimit, currentBalance, initialBalance, dueDate } = req.body;
+      await card.update({
+        name: name !== undefined ? name : card.name,
+        creditLimit: creditLimit !== undefined ? parseFloat(creditLimit) : card.creditLimit,
+        initialBalance: currentBalance !== undefined ? parseFloat(currentBalance) : (initialBalance !== undefined ? parseFloat(initialBalance) : card.initialBalance),
+        dueDate: dueDate !== undefined ? dueDate : card.dueDate,
+      });
       res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
     } else {
       res.status(404).send("Credit Card not found");

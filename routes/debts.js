@@ -46,7 +46,10 @@ router.post("/debts", async (req, res) => {
 router.post("/debts/:id/pay", async (req, res) => {
   try {
     const debt = await Account.findByPk(req.params.id);
-    const checking = await Account.findOne({ where: { name: "Primary Checking" } });
+    const [checking] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 }
+    });
 
     if (debt && checking) {
       const paymentAmount = parseFloat(req.body.amount);

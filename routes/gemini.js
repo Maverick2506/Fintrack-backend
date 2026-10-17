@@ -1,6 +1,6 @@
 const express = require("express");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { Paycheque } = require("../models");
+const { Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { addDays, parseISO, isSameMonth, isAfter, format } = require("date-fns");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -53,8 +53,9 @@ router.post("/financial-advice", async (req, res) => {
     let projectedIncomeText = "No future income accurately projected for the rest of this month.";
     let totalProjectedAmount = 0;
     try {
-      const recentPaycheques = await Paycheque.findAll({
-        order: [["payment_date", "DESC"]],
+      const recentPaycheques = await Transaction.findAll({
+        where: { type: "INCOME" },
+        order: [["date", "DESC"]],
         limit: 3
       });
 
@@ -64,7 +65,7 @@ router.post("/financial-advice", async (req, res) => {
         const averageAmount = totalAmount / recentPaycheques.length; // Flawlessly handles length of 1
         
         // Ensure parsing aligns flawlessly with local noon to prevent UTC shifting backwards a day
-        let lastDate = new Date(`${recentPaycheques[0].payment_date}T12:00:00`);
+        let lastDate = new Date(`${recentPaycheques[0].date}T12:00:00`);
         const today = new Date();
         let nextDate = addDays(lastDate, 14);
 
@@ -107,7 +108,7 @@ router.post("/financial-advice", async (req, res) => {
       2.  **Required Upcoming Bill Deductions:**
           * You have the following unpaid bills due: ${
             allUpcomingBills.length > 0
-              ? allUpcomingBills.map((bill) => `${bill.name} ($${bill.amount}) on ${bill.due_date}`).join(", ")
+              ? allUpcomingBills.map((bill) => `${bill.title || bill.name} ($${bill.amount}) on ${bill.date || bill.due_date}`).join(", ")
               : "None"
           }.
           * Total Upcoming Bill Burden: $${upcomingBillsTotal.toFixed(2)}
@@ -121,7 +122,7 @@ router.post("/financial-advice", async (req, res) => {
       5.  **Active Savings Goals:**
           * ${
             savingsSummary.length > 0
-              ? savingsSummary.map((goal) => `${goal.name}: $${parseFloat(goal.current_amount).toFixed(2)} saved out of $${parseFloat(goal.goal_amount).toFixed(2)} goal.`).join("\n          * ")
+              ? savingsSummary.map((goal) => `${goal.name}: $${parseFloat(goal.initialBalance ?? goal.current_amount ?? 0).toFixed(2)} saved out of $${parseFloat(goal.targetAmount ?? goal.goal_amount ?? 0).toFixed(2)} goal.`).join("\n          * ")
               : "No active savings goals."
           }
 

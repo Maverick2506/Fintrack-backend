@@ -1,9 +1,25 @@
+const fs = require("fs");
+const path = require("path");
+const envPath = path.join(__dirname, ".env");
+if (fs.existsSync(envPath)) {
+  const envContent = fs.readFileSync(envPath, "utf-8");
+  for (const line of envContent.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx > 0) {
+      const key = trimmed.slice(0, eqIdx).trim();
+      const val = trimmed.slice(eqIdx + 1).trim();
+      if (!process.env[key]) process.env[key] = val;
+    }
+  }
+}
+
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
 const { sequelize, Transaction, Account } = require("./models");
 const { Op } = require("sequelize");
-const { addDays, addMonths, addYears } = require("date-fns");
 const cron = require("node-cron");
 const { toZonedTime, format } = require("date-fns-tz");
 const authRoutes = require("./routes/auth");
@@ -18,8 +34,9 @@ const {
   router: recurringRoutes,
   createRecurringExpenses,
 } = require("./routes/recurring");
+const authMiddleware = require("./middleware/authMiddleware");
 const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
-const { apiLimiter, aiLimiter } = require("./middleware/rateLimit");
+const { loginLimiter, apiLimiter, aiLimiter } = require("./middleware/rateLimit");
 
 const app = express();
 app.use(compression());
@@ -28,6 +45,7 @@ app.use(compression());
 const allowedOrigins = [
   "https://fintrack-frontend-jet.vercel.app",
   "http://localhost:5173",
+  "http://127.0.0.1:5173",
 ];
 
 const corsOptions = {
@@ -51,6 +69,7 @@ const port = process.env.PORT || 8000;
 app.use(express.json());
 
 // --- API ROUTES ---
+app.use("/api/auth/login", loginLimiter);
 app.use("/api/financial-advice", aiLimiter);
 app.use("/api/categorize-expense", aiLimiter);
 app.use("/api", apiLimiter);
@@ -96,17 +115,6 @@ const runDailySweep = async () => {
       }
     }
 
-    // 2. Process Auto-Pay Debts
-    const debtsToUpdate = await Account.findAll({
-      where: {
-        type: "DEBT",
-        dueDate: { [Op.lte]: todayString },
-        initialBalance: { [Op.gt]: 0 },
-      },
-    });
-
-    // NOTE: In V2, we would need an "autoPlay" flag on the Account, but for brevity assuming all active debts auto-sweep on due date if desired, or skip.
-    // For V2 safety, I will skip generic sweeping on all debts and handle it strictly via explicit user actions until V3 updates form.
     return true;
   } catch (error) {
     console.error("Error running daily sweep:", error);
@@ -114,7 +122,7 @@ const runDailySweep = async () => {
   }
 };
 
-app.get("/api/daily-check", async (req, res) => {
+app.get("/api/daily-check", authMiddleware, async (req, res) => {
   try {
     await runDailySweep();
     res.status(200).send("Daily check complete.");
@@ -143,6 +151,10 @@ cron.schedule("0 1 * * *", createRecurringExpenses, {
 async function initialize() {
   try {
     await sequelize.sync({ alter: true });
+    await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 },
+    });
     app.listen(port, () => {
       console.log(`🚀 Server is running on http://localhost:${port}`);
     });

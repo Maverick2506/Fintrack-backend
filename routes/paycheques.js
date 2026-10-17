@@ -28,7 +28,10 @@ router.get("/paycheques", async (req, res) => {
 router.post("/paycheques", async (req, res) => {
   try {
     const { name, amount, payment_date, recurrence } = req.body;
-    let checking = await Account.findOne({ where: { name: "Primary Checking" } });
+    const [checking] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 }
+    });
 
     const newIncome = await Transaction.create({
       title: name,

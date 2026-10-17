@@ -14,12 +14,21 @@ const getTodayString = () => {
     return format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 };
 
+// Helper to format YYYY-MM-DD month boundaries cleanly
+const getMonthDateRange = (year, month) => {
+  const y = parseInt(year);
+  const m = parseInt(month);
+  const startDate = `${y}-${String(m).padStart(2, "0")}-01`;
+  const lastDay = new Date(y, m, 0).getDate();
+  const endDate = `${y}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+  return { startDate, endDate };
+};
+
 // Map old "monthly expenses" API shape exactly 
 router.get("/expenses/monthly", async (req, res) => {
   try {
     const { year, month, sortBy = "date", sortOrder = "ASC" } = req.query;
-    const startDate = new Date(year, month - 1, 1);
-    const endDate = new Date(year, month, 0);
+    const { startDate, endDate } = getMonthDateRange(year, month);
 
     const allowedSortBy = ["date", "title", "amount"];
     const sortField = sortBy === "due_date" || sortBy === "payment_date" ? "date" : 
@@ -34,7 +43,7 @@ router.get("/expenses/monthly", async (req, res) => {
         type: "EXPENSE",
         date: { [Op.between]: [startDate, endDate] },
       },
-      order: [[sortField, sortOrder.toUpperCase()]],
+      order: [[sortField, sortOrder.toUpperCase() === "DESC" ? "DESC" : "ASC"]],
     });
 
     const formatted = expenses.map(e => ({
@@ -42,6 +51,36 @@ router.get("/expenses/monthly", async (req, res) => {
        due_date: e.date,
        name: e.title,
        is_paid: e.isCleared
+    }));
+    res.json(formatted);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Category drill-down endpoint for ReportsPage pie chart
+router.get("/expenses/category", async (req, res) => {
+  try {
+    const { year, month, category } = req.query;
+    if (!year || !month || !category) {
+      return res.status(400).json({ error: "year, month, and category are required." });
+    }
+    const { startDate, endDate } = getMonthDateRange(year, month);
+
+    const expenses = await Transaction.findAll({
+      where: {
+        type: "EXPENSE",
+        category,
+        date: { [Op.between]: [startDate, endDate] },
+      },
+      order: [["date", "ASC"]],
+    });
+
+    const formatted = expenses.map(e => ({
+      ...e.toJSON(),
+      due_date: e.date,
+      name: e.title,
+      is_paid: e.isCleared,
     }));
     res.json(formatted);
   } catch (error) {
@@ -81,11 +120,14 @@ router.get("/expenses/all", async (req, res) => {
 router.post("/expenses", async (req, res) => {
   try {
     const { name, amount, due_date, category, is_paid, creditCardId, recurrence } = req.body;
-    let fromAccount = await Account.findOne({ where: { name: "Primary Checking" } });
+    let [fromAccount] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 }
+    });
     if (creditCardId) {
-        fromAccount = await Account.findByPk(creditCardId);
+        const cardAccount = await Account.findByPk(creditCardId);
+        if (cardAccount) fromAccount = cardAccount;
     }
-    if (!fromAccount) throw new Error("Account not found");
 
     const newExp = await Transaction.create({
       title: name,

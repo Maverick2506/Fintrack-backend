@@ -19,7 +19,7 @@
     },
     {
       "path": "/api/recurring/trigger-recurring",
-      "schedule": "0 1 1 * *"
+      "schedule": "0 1 * * *"
     }
   ]
 }
