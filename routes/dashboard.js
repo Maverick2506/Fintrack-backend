@@ -128,9 +128,11 @@ router.get("/spending-summary", async (req, res) => {
 router.get("/trends", async (req, res) => {
   try {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const baseYear = req.query.year ? parseInt(req.query.year) : nowZoned.getFullYear();
+    const baseMonth = req.query.month ? parseInt(req.query.month) - 1 : nowZoned.getMonth();
     const trends = [];
     for (let i = 5; i >= 0; i--) {
-      const d = new Date(nowZoned.getFullYear(), nowZoned.getMonth() - i, 1);
+      const d = new Date(baseYear, baseMonth - i, 1);
       const startOfMonth = formatYMD(d.getFullYear(), d.getMonth(), 1);
       const endOfMonth = formatYMD(d.getFullYear(), d.getMonth() + 1, 0);
 
