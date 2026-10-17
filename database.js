@@ -7,7 +7,14 @@ if (process.env.DATABASE_URL) {
   console.log("DATABASE_URL found. Connecting to remote database...");
   sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialect: process.env.DB_DIALECT || "postgres",
+    pool: {
+      max: 5,
+      min: 0,
+      idle: 10000,
+      acquire: 30000,
+    },
     dialectOptions: {
+      keepAlive: true,
       ssl: {
         require: true,
         rejectUnauthorized: false,
