@@ -22,12 +22,16 @@ router.get("/savings-goals", async (req, res) => {
 
 router.post("/savings-goals", async (req, res) => {
   try {
+    const startingAmount =
+      req.body.current_amount !== undefined && req.body.current_amount !== ""
+        ? parseFloat(req.body.current_amount) || 0
+        : 0;
     const newGoal = await Account.create({
       name: req.body.name,
       type: "SAVINGS_GOAL",
       targetAmount: req.body.target_amount || req.body.goal_amount,
-      dueDate: req.body.target_date,
-      initialBalance: 0,
+      dueDate: req.body.target_date || null,
+      initialBalance: startingAmount,
     });
     res.status(201).json({
       ...newGoal.toJSON(),
@@ -66,7 +70,6 @@ router.post("/savings-goals/:id/contribute", async (req, res) => {
       goal.initialBalance = parseFloat(goal.initialBalance) + parseFloat(req.body.amount);
       await goal.save();
 
-      // **CREATE THE TRANSFER TRANSACTION!** (Fulfills the user's specific request)
       await Transaction.create({
         title: `Contribution to ${goal.name}`,
         amount: req.body.amount,
@@ -96,11 +99,17 @@ router.put("/savings-goals/:id", async (req, res) => {
   try {
     const goal = await Account.findByPk(req.params.id);
     if (goal) {
-      await goal.update({
-        name: req.body.name,
-        targetAmount: req.body.target_amount || req.body.goal_amount,
-        dueDate: req.body.target_date
-      });
+      const updates = {
+        name: req.body.name ?? goal.name,
+        targetAmount: req.body.target_amount || req.body.goal_amount || goal.targetAmount,
+      };
+      if (req.body.target_date !== undefined) {
+        updates.dueDate = req.body.target_date || null;
+      }
+      if (req.body.current_amount !== undefined && req.body.current_amount !== "") {
+        updates.initialBalance = parseFloat(req.body.current_amount);
+      }
+      await goal.update(updates);
       res.json({
         ...goal.toJSON(),
         current_amount: goal.initialBalance,

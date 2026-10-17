@@ -105,8 +105,12 @@ router.get("/expenses/all", async (req, res) => {
       name: t.title,
       amount: parseFloat(t.amount),
       date: t.date,
+      due_date: t.date,
+      payment_date: t.type === "INCOME" ? t.date : undefined,
       category: t.category,
       is_paid: t.isCleared,
+      recurrence: t.recurrence || "none",
+      creditCardId: t.fromAccount && t.fromAccount.type === "CREDIT_CARD" ? t.fromAccount.id : null,
       fromAccount: t.fromAccount ? t.fromAccount.name : null,
       toAccount: t.toAccount ? t.toAccount.name : null
     }));
@@ -151,17 +155,48 @@ router.put("/expenses/:id", async (req, res) => {
     const trx = await Transaction.findByPk(req.params.id);
     if (!trx) return res.status(404).send("Transaction not found");
 
+    let fromAccountId = trx.fromAccountId;
+    if (req.body.creditCardId !== undefined) {
+      if (req.body.creditCardId) {
+        fromAccountId = req.body.creditCardId;
+      } else {
+        const [checking] = await Account.findOrCreate({
+          where: { name: "Primary Checking" },
+          defaults: { type: "CHECKING", initialBalance: 0.0 }
+        });
+        fromAccountId = checking.id;
+      }
+    }
+
     await trx.update({
        title: req.body.name || trx.title,
-       amount: req.body.amount || trx.amount,
-       date: req.body.due_date || trx.date,
+       amount: req.body.amount !== undefined ? parseFloat(req.body.amount) : trx.amount,
+       date: req.body.due_date || req.body.payment_date || trx.date,
        category: req.body.category || trx.category,
        isCleared: req.body.is_paid !== undefined ? req.body.is_paid : trx.isCleared,
-       recurrence: req.body.recurrence || trx.recurrence
+       recurrence: req.body.recurrence || trx.recurrence,
+       fromAccountId
     });
     res.json(trx);
   } catch (error) {
     res.status(400).json({ error: error.message });
+  }
+});
+
+router.post("/expenses/bulk-delete", async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "No transaction IDs provided." });
+    }
+    const deletedCount = await Transaction.destroy({
+      where: {
+        id: { [Op.in]: ids },
+      },
+    });
+    res.json({ deletedCount });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 

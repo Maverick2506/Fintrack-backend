@@ -75,12 +75,38 @@ router.get("/dashboard", async (req, res) => {
       include: [{ model: Transaction, as: "outgoingTransactions" }], 
     });
 
+    const [checking] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 },
+    });
+
+    const [allTimeIncome, allTimeCheckingExp, allTimeTransfersOut, allTimeTransfersIn] = await Promise.all([
+      Transaction.sum("amount", { where: { type: "INCOME" } }),
+      Transaction.sum("amount", { where: { type: "EXPENSE", isCleared: true, fromAccountId: checking.id } }),
+      Transaction.sum("amount", { where: { type: "TRANSFER", fromAccountId: checking.id } }),
+      Transaction.sum("amount", { where: { type: "TRANSFER", toAccountId: checking.id } }),
+    ]);
+
+    const netCheckingActivity =
+      (parseFloat(allTimeIncome) || 0) -
+      (parseFloat(allTimeCheckingExp) || 0) -
+      (parseFloat(allTimeTransfersOut) || 0) +
+      (parseFloat(allTimeTransfersIn) || 0);
+
+    const checkingCurrentBalance = (parseFloat(checking.initialBalance) || 0) + netCheckingActivity;
+
     res.json({
       monthlySummary: {
         totalIncome: parseFloat(totalIncome) || 0,
         totalSpending: parseFloat(totalSpending) || 0,
         netFlow: (parseFloat(totalIncome) || 0) - (parseFloat(totalSpending) || 0),
         previousMonthNetFlow: (parseFloat(previousMonthIncome) || 0) - (parseFloat(previousMonthSpending) || 0),
+      },
+      checkingAccount: {
+        id: checking.id,
+        name: checking.name,
+        initialBalance: parseFloat(checking.initialBalance) || 0,
+        currentBalance: checkingCurrentBalance,
       },
       upcomingBills,
       allUpcomingBills,
@@ -91,6 +117,43 @@ router.get("/dashboard", async (req, res) => {
   } catch (error) {
     console.error("Dashboard Error:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.put("/checking", async (req, res) => {
+  try {
+    const [checking] = await Account.findOrCreate({
+      where: { name: "Primary Checking" },
+      defaults: { type: "CHECKING", initialBalance: 0.0 },
+    });
+
+    const [allTimeIncome, allTimeCheckingExp, allTimeTransfersOut, allTimeTransfersIn] = await Promise.all([
+      Transaction.sum("amount", { where: { type: "INCOME" } }),
+      Transaction.sum("amount", { where: { type: "EXPENSE", isCleared: true, fromAccountId: checking.id } }),
+      Transaction.sum("amount", { where: { type: "TRANSFER", fromAccountId: checking.id } }),
+      Transaction.sum("amount", { where: { type: "TRANSFER", toAccountId: checking.id } }),
+    ]);
+
+    const netCheckingActivity =
+      (parseFloat(allTimeIncome) || 0) -
+      (parseFloat(allTimeCheckingExp) || 0) -
+      (parseFloat(allTimeTransfersOut) || 0) +
+      (parseFloat(allTimeTransfersIn) || 0);
+
+    const desiredBalance = parseFloat(req.body.balance);
+    if (!isNaN(desiredBalance)) {
+      checking.initialBalance = desiredBalance - netCheckingActivity;
+      await checking.save();
+    }
+
+    res.json({
+      id: checking.id,
+      name: checking.name,
+      initialBalance: parseFloat(checking.initialBalance) || 0,
+      currentBalance: (parseFloat(checking.initialBalance) || 0) + netCheckingActivity,
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
