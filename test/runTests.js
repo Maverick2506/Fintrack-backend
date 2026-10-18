@@ -1,4 +1,5 @@
 const http = require("http");
+const { getNextOccurrenceDate, getNextDueDate } = require("../routes/recurring");
 
 function request(options, body = null) {
   return new Promise((resolve, reject) => {
@@ -586,6 +587,75 @@ async function runTestSuite() {
     method: "DELETE",
     headers: authHeaders,
   });
+  // 9. Pure Calendar Recurrence Accuracy & Multi-Frequency Math
+  console.log("\n--- Suite 9: Pure Calendar Recurrence Accuracy & Multi-Frequency Math ---");
+  assert(getNextDueDate("2026-10-01", "monthly") === "2026-11-01", "Monthly recurrence from 1st of month advances to 1st of next month (never drifts to 30th)");
+  assert(getNextDueDate("2026-10-01", "weekly") === "2026-10-08", "Weekly recurrence advances by exactly 7 calendar days");
+  assert(getNextDueDate("2026-10-01", "bi-weekly") === "2026-10-15", "Bi-weekly recurrence advances by exactly 14 calendar days");
+  assert(getNextDueDate("2026-10-01", "yearly") === "2027-10-01", "Yearly recurrence advances by exactly 1 year");
+  assert(getNextDueDate("2026-01-31", "monthly") === "2026-02-28", "Monthly recurrence caps cleanly at month end (Jan 31 -> Feb 28)");
+  assert(getNextOccurrenceDate("2026-01-31", "monthly", 2) === "2026-03-31", "Multi-step monthly recurrence restores day 31 after short month (Jan 31 -> Mar 31)");
+  assert(getNextOccurrenceDate("2024-02-29", "yearly", 4) === "2028-02-29", "Yearly recurrence preserves leap day after full 4-year cycle");
+
+  // End-to-end Rent test: create rent on 2026-10-01 with monthly recurrence
+  const rentRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Automated Suite Rent",
+    amount: 500.0,
+    category: "Essentials",
+    due_date: "2026-10-01",
+    recurrence: "monthly",
+    is_paid: true,
+  });
+  assert(rentRes.status === 201 && rentRes.body.id, "Creates monthly rent expense on Oct 1st");
+  const rentId = rentRes.body.id;
+
+  // Trigger recurring generation
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/recurring/trigger-recurring",
+    method: "POST",
+    headers: authHeaders,
+  });
+
+  const allLedgerRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses/all",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const allTxs = allLedgerRes.body || [];
+  const bad30thRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === "2026-10-30");
+  assert(!bad30thRent, "No duplicate rent transaction generated for 30th of current month");
+
+  const nov1stRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === "2026-11-01");
+  assert(nov1stRent, "Next recurring rent instance generated on exactly November 1st (2026-11-01)");
+
+  // Clean up
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${rentId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  if (nov1stRent) {
+    await request({
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${nov1stRent.id}`,
+      method: "DELETE",
+      headers: authHeaders,
+    });
+  }
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

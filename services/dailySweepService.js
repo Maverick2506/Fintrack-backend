@@ -119,13 +119,12 @@ const runDailySweep = async () => {
         const paymentAmount = Math.min(remaining, minPay);
         debt.initialBalance = Math.max(0, remaining - paymentAmount);
 
-        const currentDue = toZonedTime(`${debt.dueDate}T00:00:00`, TIMEZONE);
-        const nextDue = getNextDueDate(
-          currentDue,
+        const nextDueStr = getNextDueDate(
+          debt.dueDate,
           debt.paymentFrequency || "monthly"
         );
-        if (nextDue && debt.initialBalance > 0) {
-          debt.dueDate = format(nextDue, "yyyy-MM-dd", { timeZone: TIMEZONE });
+        if (nextDueStr && debt.initialBalance > 0) {
+          debt.dueDate = nextDueStr;
         } else if (debt.initialBalance <= 0) {
           debt.autoPay = false;
         }

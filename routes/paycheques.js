@@ -4,6 +4,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { createRecurringExpenses } = require("./recurring");
 const router = express.Router();
 
 router.use(authMiddleware);
@@ -61,6 +62,12 @@ router.post(
       name: newIncome.title,
       payment_date: newIncome.date,
     });
+
+    if (recurrence && recurrence !== "none") {
+      createRecurringExpenses().catch((err) =>
+        console.error("Background recurring generation error:", err)
+      );
+    }
   })
 );
 

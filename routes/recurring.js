@@ -8,19 +8,61 @@ const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
 
-const getNextDueDate = (currentDate, recurrence) => {
+// Pure calendar recurrence calculation helper (pure YYYY-MM-DD arithmetic, completely immune to server timezone or DST boundaries)
+const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1) => {
+  if (!baseDateStr) return null;
+  const parts = String(baseDateStr).split("T")[0].split("-").map(Number);
+  if (parts.length !== 3 || parts.some(isNaN)) return null;
+  const [baseYear, baseMonth, baseDay] = parts;
+
   switch (recurrence) {
-    case "weekly":
-      return addDays(currentDate, 7);
-    case "bi-weekly":
-      return addDays(currentDate, 14);
-    case "monthly":
-      return addMonths(currentDate, 1);
-    case "yearly":
-      return addYears(currentDate, 1);
+    case "weekly": {
+      const baseUtc = new Date(Date.UTC(baseYear, baseMonth - 1, baseDay, 12, 0, 0));
+      const targetUtc = new Date(baseUtc.getTime() + step * 7 * 24 * 60 * 60 * 1000);
+      const y = targetUtc.getUTCFullYear();
+      const m = String(targetUtc.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(targetUtc.getUTCDate()).padStart(2, "0");
+      return `${y}-${m}-${d}`;
+    }
+    case "bi-weekly": {
+      const baseUtc = new Date(Date.UTC(baseYear, baseMonth - 1, baseDay, 12, 0, 0));
+      const targetUtc = new Date(baseUtc.getTime() + step * 14 * 24 * 60 * 60 * 1000);
+      const y = targetUtc.getUTCFullYear();
+      const m = String(targetUtc.getUTCMonth() + 1).padStart(2, "0");
+      const d = String(targetUtc.getUTCDate()).padStart(2, "0");
+      return `${y}-${m}-${d}`;
+    }
+    case "monthly": {
+      const totalMonths = baseYear * 12 + (baseMonth - 1) + step;
+      const targetYear = Math.floor(totalMonths / 12);
+      const targetMonth = (totalMonths % 12) + 1; // 1-indexed
+      const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
+      const targetDay = Math.min(baseDay, daysInTargetMonth);
+      const mm = String(targetMonth).padStart(2, "0");
+      const dd = String(targetDay).padStart(2, "0");
+      return `${targetYear}-${mm}-${dd}`;
+    }
+    case "yearly": {
+      const targetYear = baseYear + step;
+      const daysInTargetMonth = new Date(Date.UTC(targetYear, baseMonth, 0)).getUTCDate();
+      const targetDay = Math.min(baseDay, daysInTargetMonth);
+      const mm = String(baseMonth).padStart(2, "0");
+      const dd = String(targetDay).padStart(2, "0");
+      return `${targetYear}-${mm}-${dd}`;
+    }
     default:
       return null;
   }
+};
+
+const getNextDueDate = (currentDate, recurrence) => {
+  if (currentDate instanceof Date) {
+    const y = currentDate.getFullYear();
+    const m = String(currentDate.getMonth() + 1).padStart(2, "0");
+    const d = String(currentDate.getDate()).padStart(2, "0");
+    currentDate = `${y}-${m}-${d}`;
+  }
+  return getNextOccurrenceDate(currentDate, recurrence, 1);
 };
 
 const createRecurringExpenses = async () => {
@@ -29,10 +71,11 @@ const createRecurringExpenses = async () => {
     const nowUtc = new Date();
     const nowZoned = toZonedTime(nowUtc, TIMEZONE);
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
-    const lookupHorizon = addDays(nowZoned, 30);
-    const horizonString = format(lookupHorizon, "yyyy-MM-dd", {
-      timeZone: TIMEZONE,
-    });
+    
+    // Horizon is 30 calendar days from today in America/Toronto
+    const [tY, tM, tD] = todayStr.split("-").map(Number);
+    const horizonUtc = new Date(Date.UTC(tY, tM - 1, tD, 12, 0, 0) + 30 * 24 * 60 * 60 * 1000);
+    const horizonString = `${horizonUtc.getUTCFullYear()}-${String(horizonUtc.getUTCMonth() + 1).padStart(2, "0")}-${String(horizonUtc.getUTCDate()).padStart(2, "0")}`;
 
     // Fetch all INCOME and EXPENSE transactions ordered newest first so that
     // if the latest instance of a series was changed to recurrence: "none",
@@ -65,17 +108,14 @@ const createRecurringExpenses = async () => {
         continue;
       }
 
-      let nextDate = toZonedTime(`${baseTrx.date}T00:00:00`, TIMEZONE);
-
+      let step = 1;
       while (true) {
-        nextDate = getNextDueDate(nextDate, baseTrx.recurrence);
-        if (!nextDate) break;
-
-        const nextDateStr = format(nextDate, "yyyy-MM-dd", {
-          timeZone: TIMEZONE,
-        });
-
-        if (nextDateStr > horizonString) {
+        const nextDateStr = getNextOccurrenceDate(
+          baseTrx.date,
+          baseTrx.recurrence,
+          step
+        );
+        if (!nextDateStr || nextDateStr > horizonString) {
           break;
         }
 
@@ -130,6 +170,8 @@ const createRecurringExpenses = async () => {
             } for ${nextDateStr}`
           );
         }
+
+        step++;
       }
     }
     console.log("Recurring transactions job finished.");
@@ -143,4 +185,9 @@ router.post("/trigger-recurring", authMiddleware, async (req, res) => {
   res.status(200).send("Advanced recurring job triggered successfully.");
 });
 
-module.exports = { router, createRecurringExpenses, getNextDueDate };
+module.exports = {
+  router,
+  createRecurringExpenses,
+  getNextDueDate,
+  getNextOccurrenceDate,
+};
