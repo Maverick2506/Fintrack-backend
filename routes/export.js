@@ -71,6 +71,10 @@ const getFinancialData = async () => {
           date: { [Op.gte]: todayStr },
         },
         order: [["date", "ASC"]],
+        include: [
+          { model: Account, as: "fromAccount" },
+          { model: Account, as: "toAccount" },
+        ],
         limit: 20,
       }),
       Transaction.findAll({
@@ -187,8 +191,30 @@ const getFinancialData = async () => {
     console.error("Paycheque projection error in export:", err);
   }
 
-  const upcomingBillsTotal = upcomingBills.reduce((s, b) => s + parseFloat(b.amount || 0), 0);
-  const endOfMonthFloat = netFlow + totalProjectedIncome - upcomingBillsTotal;
+  const upcomingBillsFromChecking = upcomingBills.filter(
+    (b) => !b.fromAccount || b.fromAccount.type === "CHECKING"
+  );
+  const upcomingBillsFromCC = upcomingBills.filter(
+    (b) => b.fromAccount && b.fromAccount.type === "CREDIT_CARD"
+  );
+
+  const upcomingBillsTotal = upcomingBills.reduce(
+    (s, b) => s + parseFloat(b.amount || 0),
+    0
+  );
+  const upcomingCheckingBillsTotal = upcomingBillsFromChecking.reduce(
+    (s, b) => s + parseFloat(b.amount || 0),
+    0
+  );
+  const upcomingCCBillsTotal = upcomingBillsFromCC.reduce(
+    (s, b) => s + parseFloat(b.amount || 0),
+    0
+  );
+
+  // Cash float remaining in checking:
+  // Checking balance + expected income - bills that are actually paid from checking
+  const endOfMonthFloat =
+    checkingBalance + totalProjectedIncome - upcomingCheckingBillsTotal;
 
   return {
     todayStr,
@@ -203,6 +229,8 @@ const getFinancialData = async () => {
     totalProjectedIncome,
     projectedPaychequeDates,
     upcomingBillsTotal,
+    upcomingCheckingBillsTotal,
+    upcomingCCBillsTotal,
     endOfMonthFloat,
     checkingAcc,
     creditCards,
@@ -236,8 +264,10 @@ const generateCSV = (d) => {
   rows.push(["OVERVIEW", "Cash Flow", "Month Cleared Spending", `$${d.clearedExpenses.toFixed(2)}`, "Total paid spending this month"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Cash Flow", "Current Net Cash Flow", `$${d.netFlow.toFixed(2)}`, "Cleared Income minus Cleared Spending"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Projections", "Projected Upcoming Income", `$${d.totalProjectedIncome.toFixed(2)}`, `Expected on: ${d.projectedPaychequeDates.join("; ") || "None"}`].map(csvEscape).join(","));
-  rows.push(["OVERVIEW", "Projections", "Upcoming Unpaid Bills Total", `$${d.upcomingBillsTotal.toFixed(2)}`, "Bills remaining this month"].map(csvEscape).join(","));
-  rows.push(["OVERVIEW", "Projections", "Projected End-of-Month Float", `$${d.endOfMonthFloat.toFixed(2)}`, "Cash remaining after upcoming bills & projected income"].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Upcoming Unpaid Bills Total", `$${d.upcomingBillsTotal.toFixed(2)}`, "All unpaid bills remaining this month"].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Upcoming Bills (From Checking)", `$${d.upcomingCheckingBillsTotal.toFixed(2)}`, "Bills directly deducting liquid cash from Primary Checking"].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Upcoming Bills (On Credit Cards)", `$${d.upcomingCCBillsTotal.toFixed(2)}`, "Bills charged to credit cards (adds to card balance)"].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Projected End-of-Month Float", `$${d.endOfMonthFloat.toFixed(2)}`, "Liquid cash remaining after checking bills & projected income"].map(csvEscape).join(","));
 
   // 2. ACCOUNTS & LIABILITIES
   rows.push([]);
@@ -257,9 +287,21 @@ const generateCSV = (d) => {
 
   // 3. UPCOMING UNPAID BILLS
   rows.push([]);
-  rows.push(["SECTION", "DUE_DATE", "BILL_TITLE", "AMOUNT", "RECURRENCE", "TAX_STATUS"].map(csvEscape).join(","));
+  rows.push(["SECTION", "DUE_DATE", "BILL_TITLE", "AMOUNT", "DEDUCTED_FROM", "ACCOUNT_TYPE", "RECURRENCE", "TAX_STATUS"].map(csvEscape).join(","));
   for (const b of d.upcomingBills) {
-    rows.push(["UPCOMING_BILLS", b.date, b.title, parseFloat(b.amount).toFixed(2), b.recurrence || "one-time", b.isTaxExclusive ? "Tax Exclusive (Tax applied on due date)" : "Tax Included"].map(csvEscape).join(","));
+    const isCC = b.fromAccount && b.fromAccount.type === "CREDIT_CARD";
+    const sourceName = b.fromAccount ? b.fromAccount.name : "Primary Checking";
+    const sourceType = isCC ? "CREDIT_CARD" : "CHECKING";
+    rows.push([
+      "UPCOMING_BILLS",
+      b.date,
+      b.title,
+      parseFloat(b.amount).toFixed(2),
+      sourceName,
+      sourceType,
+      b.recurrence || "one-time",
+      b.isTaxExclusive ? "Tax Exclusive (Tax applied on due date)" : "Tax Included",
+    ].map(csvEscape).join(","));
   }
 
   // 4. RECENT TRANSACTIONS
@@ -343,16 +385,23 @@ ${
 ---
 
 ## 3. Upcoming Unpaid Bills
+- **Total Upcoming Bills:** $${d.upcomingBillsTotal.toFixed(2)}
+  - Deducted from Primary Checking: $${d.upcomingCheckingBillsTotal.toFixed(2)}
+  - Charged to Credit Cards: $${d.upcomingCCBillsTotal.toFixed(2)}
+
 ${
   d.upcomingBills.length === 0
     ? "_No upcoming unpaid bills for the rest of this month._"
     : d.upcomingBills
-        .map(
-          (b) =>
-            `- **${b.date}:** ${b.title} — $${parseFloat(b.amount).toFixed(2)} (${
-              b.recurrence || "one-time"
-            })`
-        )
+        .map((b) => {
+          const isCC = b.fromAccount && b.fromAccount.type === "CREDIT_CARD";
+          const sourceName = b.fromAccount ? b.fromAccount.name : "Primary Checking";
+          return `- **${b.date}:** ${b.title} — $${parseFloat(b.amount).toFixed(
+            2
+          )} (${b.recurrence || "one-time"}) — *Deducted from: ${
+            isCC ? `Credit Card (${sourceName})` : `Checking (${sourceName})`
+          }*`;
+        })
         .join("\n")
 }
 
@@ -382,9 +431,11 @@ You have continuous access to Maverick's live FinTrack financial data connected 
 1. **Mathematical Rigor:** Always reference exact numbers from the FinTrack data (Primary Checking balance, Credit Card balances, APRs, minimum payments, debts, and upcoming bills). Never guess or hallucinate numbers.
 2. **The Affordability Test ("Can I afford X?"):**
    - Step 1: Check Primary Checking balance.
-   - Step 2: Subtract all upcoming unpaid bills before the next expected paycheque.
-   - Step 3: Determine the remaining Safe Float.
-   - Step 4: Deliver a direct verdict: **Yes / Caution / No**, with the exact resulting checking balance and float impact.
+   - Step 2: Check the DEDUCTED_FROM and ACCOUNT_TYPE columns in UPCOMING_BILLS:
+     - Bills with ACCOUNT_TYPE "CHECKING" deduct directly from liquid cash before the next expected paycheque.
+     - Bills with ACCOUNT_TYPE "CREDIT_CARD" increase credit card balance instead of immediately reducing checking cash.
+   - Step 3: Determine the remaining Safe Liquid Float (Primary Checking + Projected Income - Upcoming Checking Bills).
+   - Step 4: Deliver a direct verdict: **Yes / Caution / No**, with the exact resulting checking balance, float impact, and any credit card utilization impact.
 3. **Debt Strategy:**
    - Recommend the Avalanche method (highest interest APR first) for maximum interest savings, or Snowball for quick psychological wins if requested.
    - Ensure minimum payments on all debts are protected first before allocating surplus float.

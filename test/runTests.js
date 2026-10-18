@@ -700,8 +700,9 @@ async function runTestSuite() {
     validCsvRes.status === 200 &&
       validCsvRes.headers["content-type"].includes("text/csv") &&
       validCsvRes.raw.includes("OVERVIEW") &&
-      validCsvRes.raw.includes("ACCOUNTS"),
-    "Returns formatted CSV feed containing OVERVIEW and ACCOUNTS sections"
+      validCsvRes.raw.includes("ACCOUNTS") &&
+      validCsvRes.raw.includes("DEDUCTED_FROM"),
+    "Returns formatted CSV feed containing OVERVIEW, ACCOUNTS, and DEDUCTED_FROM in UPCOMING_BILLS"
   );
 
   const validMdRes = await request({

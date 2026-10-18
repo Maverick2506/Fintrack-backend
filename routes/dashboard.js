@@ -79,6 +79,10 @@ router.get(
             date: { [Op.between]: [upcomingStartDate, endOfMonth] },
           },
           order: [["date", "ASC"]],
+          include: [
+            { model: Account, as: "fromAccount" },
+            { model: Account, as: "toAccount" },
+          ],
         });
 
     const checking = await getPrimaryCheckingAccount();
