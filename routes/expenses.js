@@ -39,6 +39,18 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
       transaction: dbTx,
     });
     if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+      const cardCreatedDate = fromAcc.createdAt
+        ? format(
+            toZonedTime(new Date(fromAcc.createdAt), TIMEZONE),
+            "yyyy-MM-dd"
+          )
+        : null;
+      if (cardCreatedDate && trx.date < cardCreatedDate) {
+        // Transaction predates the creation of the credit card account.
+        // The credit card's initial balance already reflects all pre-existing debt/spending,
+        // so adding or deleting a historical transaction must not modify the card balance.
+        return;
+      }
       const nextBal =
         parseFloat(fromAcc.initialBalance || 0) + direction * amount;
       fromAcc.initialBalance = nextBal;
@@ -282,6 +294,25 @@ router.post(
       const isCleared =
         is_paid !== undefined ? Boolean(is_paid) : expenseDate <= todayStr;
 
+      const rawAmount = parseFloat(amount);
+      const taxRateNum =
+        req.body.taxRate !== undefined && req.body.taxRate !== null
+          ? parseFloat(req.body.taxRate)
+          : null;
+      const isTaxExclusive = Boolean(
+        req.body.isTaxExclusive && taxRateNum && taxRateNum > 0
+      );
+
+      let effectiveAmount = rawAmount;
+      let taxApplied = false;
+
+      // If marked paid/cleared immediately and isTaxExclusive is true, apply tax immediately
+      if (isCleared && isTaxExclusive) {
+        effectiveAmount =
+          Math.round(rawAmount * (1 + taxRateNum / 100) * 100) / 100;
+        taxApplied = true;
+      }
+
       // If paying toward a credit card, treat as a TRANSFER so card purchases are not double-counted
       const isCreditCardPayment =
         targetAccount && targetAccount.type === "CREDIT_CARD";
@@ -294,7 +325,11 @@ router.post(
       const newExp = await Transaction.create(
         {
           title: name,
-          amount: parseFloat(amount),
+          amount: effectiveAmount,
+          baseAmount: rawAmount,
+          isTaxExclusive,
+          taxRate: taxRateNum,
+          taxApplied,
           date: expenseDate,
           type: trxType,
           category: trxCategory,
@@ -391,23 +426,79 @@ router.put(
         ? "EXPENSE"
         : trx.type;
 
+      const nextIsCleared =
+        req.body.is_paid !== undefined
+          ? Boolean(req.body.is_paid)
+          : trx.isCleared;
+
+      const nextIsTaxExclusive =
+        req.body.isTaxExclusive !== undefined
+          ? Boolean(req.body.isTaxExclusive)
+          : Boolean(trx.isTaxExclusive);
+
+      const nextTaxRate =
+        req.body.taxRate !== undefined
+          ? req.body.taxRate !== null
+            ? parseFloat(req.body.taxRate)
+            : null
+          : trx.taxRate !== null && trx.taxRate !== undefined
+          ? parseFloat(trx.taxRate)
+          : null;
+
+      let nextBaseAmount =
+        req.body.baseAmount !== undefined
+          ? parseFloat(req.body.baseAmount)
+          : req.body.amount !== undefined
+          ? parseFloat(req.body.amount)
+          : trx.baseAmount !== null && trx.baseAmount !== undefined
+          ? parseFloat(trx.baseAmount)
+          : parseFloat(trx.amount);
+
+      let nextTaxApplied = trx.taxApplied;
+      let nextAmount =
+        req.body.amount !== undefined
+          ? parseFloat(req.body.amount)
+          : parseFloat(trx.amount);
+
+      // If updating the base amount of an unpaid transaction:
+      if (req.body.amount !== undefined && !nextIsCleared) {
+        nextBaseAmount = parseFloat(req.body.amount);
+        nextTaxApplied = false;
+      }
+
+      // If transitioning to cleared / paid with tax-exclusive enabled:
+      if (
+        nextIsCleared &&
+        nextIsTaxExclusive &&
+        nextTaxRate &&
+        nextTaxRate > 0 &&
+        !nextTaxApplied
+      ) {
+        const base = nextBaseAmount || nextAmount;
+        nextAmount = Math.round(base * (1 + nextTaxRate / 100) * 100) / 100;
+        nextBaseAmount = base;
+        nextTaxApplied = true;
+      } else if (!nextIsCleared && nextTaxApplied) {
+        // Unmarking as paid reverts to base amount
+        nextAmount = nextBaseAmount || nextAmount;
+        nextTaxApplied = false;
+      }
+
       await trx.update(
         {
           title: nextTitle,
-          amount:
-            req.body.amount !== undefined
-              ? parseFloat(req.body.amount)
-              : trx.amount,
+          amount: nextAmount,
+          baseAmount: nextBaseAmount,
+          isTaxExclusive: nextIsTaxExclusive,
+          taxRate: nextTaxRate,
+          taxApplied: nextTaxApplied,
           date: req.body.due_date || req.body.payment_date || trx.date,
           type: nextType,
           category:
             isCreditCardPayment && nextCategory === "Debt"
               ? "Credit Card Payment"
               : nextCategory,
-          isCleared:
-            req.body.is_paid !== undefined
-              ? Boolean(req.body.is_paid)
-              : trx.isCleared,
+          isCleared: nextIsCleared,
           recurrence: req.body.recurrence || trx.recurrence,
           fromAccountId,
           toAccountId: nextToAccountId,

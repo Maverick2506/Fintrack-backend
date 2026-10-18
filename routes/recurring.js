@@ -92,9 +92,33 @@ const createRecurringExpenses = async () => {
           const isCleared =
             baseTrx.type === "INCOME" ? nextDateStr <= todayStr : false;
 
+          const baseAmountValue =
+            baseTrx.baseAmount !== null && baseTrx.baseAmount !== undefined
+              ? parseFloat(baseTrx.baseAmount)
+              : parseFloat(baseTrx.amount);
+
+          const isTaxExcl = Boolean(baseTrx.isTaxExclusive);
+          const taxRateVal =
+            baseTrx.taxRate !== null && baseTrx.taxRate !== undefined
+              ? parseFloat(baseTrx.taxRate)
+              : null;
+          let newAmount = baseAmountValue;
+          let taxApplied = false;
+
+          if (isCleared && isTaxExcl && taxRateVal && taxRateVal > 0) {
+            newAmount =
+              Math.round(baseAmountValue * (1 + taxRateVal / 100) * 100) / 100;
+            taxApplied = true;
+          }
+
           await Transaction.create({
             ...baseTrx.get({ plain: true }),
             id: undefined,
+            amount: newAmount,
+            baseAmount: baseAmountValue,
+            isTaxExclusive: isTaxExcl,
+            taxRate: taxRateVal,
+            taxApplied,
             isCleared,
             date: nextDateStr,
             createdAt: new Date(),

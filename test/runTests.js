@@ -237,6 +237,124 @@ async function runTestSuite() {
     method: "DELETE",
     headers: authHeaders,
   });
+
+  // 6. Historical Expense on Credit Card (Issue 1)
+  console.log("\n--- Suite 6: Historical Credit Card Expense Behavior ---");
+  const cardHistRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "POST",
+    headers: authHeaders,
+  }, { name: "Historical Test Card", creditLimit: 2000, currentBalance: 500 });
+  assert(cardHistRes.status === 201 && cardHistRes.body.id, "Creates card with $500 balance");
+  const histCardId = cardHistRes.body.id;
+
+  const pastExpRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Pre-existing Coffee",
+    amount: 75.0,
+    category: "Food & Drink",
+    due_date: "2020-01-01",
+    creditCardId: histCardId,
+  });
+  assert(pastExpRes.status === 201 && pastExpRes.body.id, "Creates historical expense dated 2020-01-01");
+  const pastExpId = pastExpRes.body.id;
+
+  const cardAfterPastExp = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const histCard = (cardAfterPastExp.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 500, "Past expense does not increase pre-existing card balance");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${pastExpId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  const cardAfterDelPast = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const histCardAfterDel = (cardAfterDelPast.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCardAfterDel.currentBalance) === 500, "Deleting past expense does not decrement card balance");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/credit-cards/${histCardId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // 7. Tax-Exclusive Recurring Payments (Issue 5)
+  console.log("\n--- Suite 7: Tax-Exclusive Recurring Payments ---");
+  const taxExpRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Fiber Internet Bill",
+    amount: 100.0,
+    category: "Subscription",
+    due_date: "2099-05-15",
+    recurrence: "monthly",
+    isTaxExclusive: true,
+    taxRate: 13.0,
+    is_paid: false,
+  });
+  assert(taxExpRes.status === 201 && taxExpRes.body.id, "Creates tax-exclusive upcoming bill");
+  assert(parseFloat(taxExpRes.body.amount) === 100.0 && taxExpRes.body.taxApplied === false, "Upcoming bill starts with base amount ($100) and taxApplied: false");
+  const taxExpId = taxExpRes.body.id;
+
+  const payTaxRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${taxExpId}`,
+    method: "PUT",
+    headers: authHeaders,
+  }, {
+    is_paid: true,
+  });
+  assert(payTaxRes.status === 200, "Marks bill as paid");
+  assert(parseFloat(payTaxRes.body.amount) === 113.0 && payTaxRes.body.taxApplied === true, "Applies 13% tax upon payment ($113.00) and sets taxApplied: true");
+
+  const unpayTaxRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${taxExpId}`,
+    method: "PUT",
+    headers: authHeaders,
+  }, {
+    is_paid: false,
+  });
+  assert(unpayTaxRes.status === 200, "Unmarks bill as paid");
+  assert(parseFloat(unpayTaxRes.body.amount) === 100.0 && unpayTaxRes.body.taxApplied === false, "Unmarking bill cleanly restores base amount ($100.00)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${taxExpId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

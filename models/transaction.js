@@ -17,6 +17,22 @@ const Transaction = sequelize.define(
       type: DataTypes.DECIMAL(10, 2),
       allowNull: false,
     },
+    baseAmount: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: true,
+    },
+    isTaxExclusive: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    taxRate: {
+      type: DataTypes.DECIMAL(5, 2),
+      allowNull: true,
+    },
+    taxApplied: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
     date: {
       type: DataTypes.DATEONLY,
       allowNull: false,

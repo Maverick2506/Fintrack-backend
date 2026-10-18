@@ -33,6 +33,10 @@ const schemas = {
       .enum(["none", "weekly", "bi-weekly", "monthly", "yearly"])
       .optional()
       .default("none"),
+    isTaxExclusive: z.boolean().optional().default(false),
+    taxRate: z.coerce.number().nonnegative().max(100).nullable().optional(),
+    baseAmount: z.coerce.number().nonnegative().nullable().optional(),
+    taxApplied: z.boolean().optional().default(false),
   }),
 
   updateExpense: z.object({
@@ -48,6 +52,10 @@ const schemas = {
     recurrence: z
       .enum(["none", "weekly", "bi-weekly", "monthly", "yearly"])
       .optional(),
+    isTaxExclusive: z.boolean().optional(),
+    taxRate: z.coerce.number().nonnegative().max(100).nullable().optional(),
+    baseAmount: z.coerce.number().nonnegative().nullable().optional(),
+    taxApplied: z.boolean().optional(),
   }),
 
   createPaycheque: z.object({

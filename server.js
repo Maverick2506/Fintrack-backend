@@ -18,6 +18,7 @@ if (fs.existsSync(envPath)) {
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
+const { DataTypes } = require("sequelize");
 const { sequelize, Account } = require("./models");
 const cron = require("node-cron");
 const { assertAuthConfiguration } = require("./config/auth");
@@ -129,8 +130,44 @@ async function initialize() {
     assertAuthConfiguration();
 
     const syncOptions =
-      process.env.DB_ALTER_SYNC === "true" ? { alter: true } : undefined;
+      process.env.DB_ALTER_SYNC === "true" ||
+      process.env.NODE_ENV !== "production"
+        ? { alter: true }
+        : undefined;
     await sequelize.sync(syncOptions);
+
+    // Safely ensure tax-related columns exist on existing databases
+    try {
+      const queryInterface = sequelize.getQueryInterface();
+      const tableDesc = await queryInterface.describeTable("Transactions");
+      if (!tableDesc.baseAmount) {
+        await queryInterface.addColumn("Transactions", "baseAmount", {
+          type: DataTypes.DECIMAL(10, 2),
+          allowNull: true,
+        });
+      }
+      if (!tableDesc.isTaxExclusive) {
+        await queryInterface.addColumn("Transactions", "isTaxExclusive", {
+          type: DataTypes.BOOLEAN,
+          defaultValue: false,
+        });
+      }
+      if (!tableDesc.taxRate) {
+        await queryInterface.addColumn("Transactions", "taxRate", {
+          type: DataTypes.DECIMAL(5, 2),
+          allowNull: true,
+        });
+      }
+      if (!tableDesc.taxApplied) {
+        await queryInterface.addColumn("Transactions", "taxApplied", {
+          type: DataTypes.BOOLEAN,
+          defaultValue: false,
+        });
+      }
+    } catch (migErr) {
+      console.warn("Transactions schema check notice:", migErr.message);
+    }
+
     await Account.findOrCreate({
       where: { name: "Primary Checking" },
       defaults: { type: "CHECKING", initialBalance: 0.0 },

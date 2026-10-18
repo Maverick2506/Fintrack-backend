@@ -32,15 +32,39 @@ const runDailySweep = async () => {
     });
 
     for (const bill of pendingBillsDue) {
-      const amt = parseFloat(bill.amount) || 0;
+      let amt = parseFloat(bill.amount) || 0;
+
+      // Apply tax on due date if bill was registered exclusive of tax
+      if (
+        bill.isTaxExclusive &&
+        bill.taxRate &&
+        parseFloat(bill.taxRate) > 0 &&
+        !bill.taxApplied
+      ) {
+        const base = parseFloat(bill.baseAmount) || amt;
+        const rate = parseFloat(bill.taxRate);
+        amt = Math.round(base * (1 + rate / 100) * 100) / 100;
+        bill.amount = amt;
+        bill.baseAmount = base;
+        bill.taxApplied = true;
+      }
+
       if (
         bill.fromAccount &&
         bill.fromAccount.type === "CREDIT_CARD" &&
         !bill.toAccountId
       ) {
-        bill.fromAccount.initialBalance =
-          parseFloat(bill.fromAccount.initialBalance || 0) + amt;
-        await bill.fromAccount.save({ transaction: dbTx });
+        const cardCreatedDate = bill.fromAccount.createdAt
+          ? format(
+              toZonedTime(new Date(bill.fromAccount.createdAt), TIMEZONE),
+              "yyyy-MM-dd"
+            )
+          : null;
+        if (!cardCreatedDate || bill.date >= cardCreatedDate) {
+          bill.fromAccount.initialBalance =
+            parseFloat(bill.fromAccount.initialBalance || 0) + amt;
+          await bill.fromAccount.save({ transaction: dbTx });
+        }
       } else if (
         bill.toAccount &&
         (bill.toAccount.type === "DEBT" ||

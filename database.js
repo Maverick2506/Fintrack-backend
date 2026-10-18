@@ -2,9 +2,14 @@ const { Sequelize } = require("sequelize");
 
 let sequelize;
 
-if (process.env.DATABASE_URL) {
-  // Production/Remote Database
-  console.log("DATABASE_URL found. Connecting to remote database...");
+const isProduction = process.env.NODE_ENV === "production";
+const shouldUseRemoteDb =
+  Boolean(process.env.DATABASE_URL) &&
+  (isProduction || process.env.USE_PRODUCTION_DB === "true");
+
+if (shouldUseRemoteDb) {
+  // Production / Remote Database (Render / Vercel)
+  console.log("Connecting to remote production database...");
   sequelize = new Sequelize(process.env.DATABASE_URL, {
     dialect: process.env.DB_DIALECT || "postgres",
     logging: process.env.DB_LOGGING === "true" ? console.log : false,
@@ -23,8 +28,8 @@ if (process.env.DATABASE_URL) {
     },
   });
 } else {
-  // Local Development Fallback
-  console.log("No DATABASE_URL found. 🛠️  Falling back to local SQLite database...");
+  // Local Development Fallback (isolated from live site data)
+  console.log("🛠️ Using local development database (isolated from live production site)...");
   sequelize = new Sequelize({
     dialect: "sqlite",
     storage: "./local-database.sqlite",
