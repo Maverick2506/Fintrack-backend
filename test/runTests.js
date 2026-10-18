@@ -355,6 +355,43 @@ async function runTestSuite() {
     method: "DELETE",
     headers: authHeaders,
   });
+
+  // 8. Upcoming Bills Scope (Only Current Month)
+  console.log("\n--- Suite 8: Upcoming Bills Scope (Month-Bounded) ---");
+  const nextMonthExpRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Far Future Bill",
+    amount: 150.0,
+    category: "Essentials",
+    due_date: "2099-12-25",
+    is_paid: false,
+  });
+  assert(nextMonthExpRes.status === 201 && nextMonthExpRes.body.id, "Creates upcoming bill in far future month");
+  const farFutureId = nextMonthExpRes.body.id;
+
+  const currentDashRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const currentUpcoming = currentDashRes.body?.upcomingBills || [];
+  const foundFarFuture = currentUpcoming.some((b) => b.id === farFutureId);
+  assert(!foundFarFuture, "Future-month expense is excluded from current month upcomingBills");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${farFutureId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

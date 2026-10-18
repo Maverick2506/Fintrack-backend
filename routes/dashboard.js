@@ -38,9 +38,23 @@ router.get(
     const startOfPreviousMonth = formatYMD(year, month - 1, 1);
     const endOfPreviousMonth = formatYMD(year, month, 0);
 
+    const isPastMonth = endOfMonth < todayStr;
     const isCurrentMonth =
       year === nowZoned.getFullYear() && month === nowZoned.getMonth();
     const cashFlowEndOfMonth = isCurrentMonth ? todayStr : endOfMonth;
+    const upcomingStartDate = isCurrentMonth ? todayStr : startOfMonth;
+
+    // Upcoming bills strictly for the active month (never leaks expenses from future months)
+    const upcomingBillsQuery = isPastMonth
+      ? Promise.resolve([])
+      : Transaction.findAll({
+          where: {
+            type: "EXPENSE",
+            isCleared: false,
+            date: { [Op.between]: [upcomingStartDate, endOfMonth] },
+          },
+          order: [["date", "ASC"]],
+        });
 
     const [checking] = await Account.findOrCreate({
       where: { name: "Primary Checking" },
@@ -90,23 +104,8 @@ router.get(
           date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] },
         },
       }),
-      Transaction.findAll({
-        where: {
-          type: "EXPENSE",
-          isCleared: false,
-          date: { [Op.gte]: todayStr },
-        },
-        order: [["date", "ASC"]],
-        limit: 5,
-      }),
-      Transaction.findAll({
-        where: {
-          type: "EXPENSE",
-          isCleared: false,
-          date: { [Op.between]: [todayStr, endOfMonth] },
-        },
-        order: [["date", "ASC"]],
-      }),
+      upcomingBillsQuery,
+      upcomingBillsQuery,
       Account.findAll({
         where: { type: "DEBT", isActive: { [Op.ne]: false } },
         order: [["createdAt", "ASC"]],
