@@ -464,7 +464,9 @@ router.get("/financial-feed.csv", async (req, res) => {
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `inline; filename="fintrack-live-${data.todayStr}.csv"`);
-    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, s-maxage=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
     res.status(200).send(csvContent);
   } catch (err) {
     console.error("CSV feed generation error:", err);
@@ -490,13 +492,53 @@ router.get("/financial-feed.md", async (req, res) => {
 
     res.setHeader("Content-Type", "text/markdown; charset=utf-8");
     res.setHeader("Content-Disposition", `inline; filename="fintrack-snapshot-${data.todayStr}.md"`);
-    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, s-maxage=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
     res.status(200).send(markdownContent);
   } catch (err) {
     console.error("Markdown feed generation error:", err);
     res.status(500).send("Error generating financial snapshot.");
   }
 });
+
+// Helper: Generate Apps Script for guaranteed real-time on-open syncing
+const generateAppsScript = (feedUrl) => {
+  return `/**
+ * FinTrack Auto-Sync Script for Google Sheets
+ * - Automatically refreshes data every time you open the sheet.
+ * - Adds a "FinTrack > 🔄 Refresh Data Now" menu for 1-click sync.
+ * - Bypasses Google formula proxy caching for 100% real-time accuracy.
+ */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("FinTrack")
+    .addItem("🔄 Refresh Data Now", "refreshFinTrack")
+    .addToUi();
+  refreshFinTrack();
+}
+
+function refreshFinTrack() {
+  const url = "${feedUrl}&t=" + new Date().getTime();
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" },
+      muteHttpExceptions: true,
+    });
+    if (response.getResponseCode() === 200) {
+      const csvData = Utilities.parseCsv(response.getContentText());
+      const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+      sheet.clearContents();
+      sheet.getRange(1, 1, csvData.length, csvData[0].length).setValues(csvData);
+      SpreadsheetApp.getActiveSpreadsheet().toast("FinTrack numbers synchronized successfully!", "Live Sync", 3);
+    } else {
+      SpreadsheetApp.getActiveSpreadsheet().toast("HTTP " + response.getResponseCode() + ": Feed fetch failed.", "Sync Warning", 5);
+    }
+  } catch (err) {
+    Logger.log("FinTrack Sync Error: " + err.message);
+  }
+}`;
+};
 
 // --- JWT-AUTHENTICATED CONFIGURATION ENDPOINT (FOR FINTRACK UI) ---
 router.get("/gemini-config", authMiddleware, async (req, res) => {
@@ -508,16 +550,18 @@ router.get("/gemini-config", authMiddleware, async (req, res) => {
     // In production on Render or custom domain, build canonical URL
     const baseUrl = process.env.PUBLIC_BACKEND_URL || `${protocol}://${host}`;
     const feedUrl = `${baseUrl}/api/export/financial-feed.csv?key=${feedKey}`;
-    const sheetFormula = `=IMPORTDATA("${feedUrl}")`;
+    const sheetFormula = `=IMPORTDATA("${feedUrl}&t=" & TEXT(NOW(), "yyyyMMddhhmm"))`;
 
     const data = await getFinancialData();
     const markdown = generateMarkdown(data);
     const instructions = generateGemInstructions();
+    const appsScript = generateAppsScript(feedUrl);
 
     res.json({
       feedKey,
       feedUrl,
       sheetFormula,
+      appsScript,
       instructions,
       markdown,
       filename: `fintrack-snapshot-${data.todayStr}.md`,
@@ -536,12 +580,14 @@ router.post("/regenerate-key", authMiddleware, async (req, res) => {
     const protocol = req.protocol === "https" || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
     const baseUrl = process.env.PUBLIC_BACKEND_URL || `${protocol}://${host}`;
     const feedUrl = `${baseUrl}/api/export/financial-feed.csv?key=${newKey}`;
-    const sheetFormula = `=IMPORTDATA("${feedUrl}")`;
+    const sheetFormula = `=IMPORTDATA("${feedUrl}&t=" & TEXT(NOW(), "yyyyMMddhhmm"))`;
+    const appsScript = generateAppsScript(feedUrl);
 
     res.json({
       feedKey: newKey,
       feedUrl,
       sheetFormula,
+      appsScript,
       message: "Secret feed key regenerated successfully.",
     });
   } catch (err) {
