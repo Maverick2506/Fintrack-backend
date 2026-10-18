@@ -83,7 +83,44 @@ const getFinancialData = async () => {
     ]);
 
   const checkingAcc = accounts.find((a) => a.type === "CHECKING");
-  const checkingBalance = parseFloat(checkingAcc?.initialBalance || 0);
+  let checkingBalance = parseFloat(checkingAcc?.initialBalance || 0);
+  if (checkingAcc) {
+    const [
+      allTimeIncome,
+      allTimeCheckingExp,
+      allTimeTransfersOut,
+      allTimeTransfersIn,
+    ] = await Promise.all([
+      Transaction.sum("amount", {
+        where: {
+          type: "INCOME",
+          isCleared: true,
+          date: { [Op.lte]: todayStr },
+          [Op.or]: [{ toAccountId: checkingAcc.id }, { toAccountId: null }],
+        },
+      }),
+      Transaction.sum("amount", {
+        where: {
+          type: "EXPENSE",
+          isCleared: true,
+          fromAccountId: checkingAcc.id,
+        },
+      }),
+      Transaction.sum("amount", {
+        where: { type: "TRANSFER", fromAccountId: checkingAcc.id },
+      }),
+      Transaction.sum("amount", {
+        where: { type: "TRANSFER", toAccountId: checkingAcc.id },
+      }),
+    ]);
+    const netCheckingActivity =
+      (parseFloat(allTimeIncome) || 0) -
+      (parseFloat(allTimeCheckingExp) || 0) -
+      (parseFloat(allTimeTransfersOut) || 0) +
+      (parseFloat(allTimeTransfersIn) || 0);
+    checkingBalance =
+      Math.round((checkingBalance + netCheckingActivity) * 100) / 100;
+  }
 
   const creditCards = accounts.filter((a) => a.type === "CREDIT_CARD");
   const debts = accounts.filter((a) => a.type === "DEBT");

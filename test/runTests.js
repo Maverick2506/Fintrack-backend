@@ -748,6 +748,52 @@ async function runTestSuite() {
   });
   assert(newKeyWorks.status === 200, "New regenerated feed key serves live CSV feed with HTTP 200");
 
+  // 11. Checking Balance Persistence & Dashboard Integration
+  console.log("\n--- Suite 11: Checking Balance Persistence & Dashboard Integration ---");
+  const updateCheckingRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/checking",
+      method: "PUT",
+      headers: authHeaders,
+    },
+    { balance: 750.50 }
+  );
+  assert(
+    updateCheckingRes.status === 200 &&
+      updateCheckingRes.body.currentBalance === 750.5,
+    "PUT /api/checking successfully updates checking currentBalance to $750.50"
+  );
+
+  const dashAfterChecking = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(
+    dashAfterChecking.status === 200 &&
+      dashAfterChecking.body.checkingAccount?.currentBalance === 750.5,
+    "GET /api/dashboard returns updated checking currentBalance of $750.50"
+  );
+
+  const invalidCheckingRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/checking",
+      method: "PUT",
+      headers: authHeaders,
+    },
+    { balance: "invalid-number" }
+  );
+  assert(
+    invalidCheckingRes.status === 400,
+    "PUT /api/checking rejects non-numeric payload with HTTP 400"
+  );
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

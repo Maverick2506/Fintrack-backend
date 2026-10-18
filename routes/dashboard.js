@@ -19,6 +19,31 @@ const formatYMD = (y, mZeroIndexed, d) => {
   return `${yr}-${mo}-${da}`;
 };
 
+const getPrimaryCheckingAccount = async (dbTx = null) => {
+  let checking = await Account.findOne({
+    where: { type: "CHECKING", isActive: { [Op.ne]: false } },
+    order: [["createdAt", "ASC"]],
+    transaction: dbTx,
+  });
+  if (!checking) {
+    checking = await Account.findOne({
+      where: { name: "Primary Checking" },
+      transaction: dbTx,
+    });
+  }
+  if (!checking) {
+    checking = await Account.create(
+      {
+        name: "Primary Checking",
+        type: "CHECKING",
+        initialBalance: 0.0,
+      },
+      { transaction: dbTx }
+    );
+  }
+  return checking;
+};
+
 router.get(
   "/dashboard",
   asyncHandler(async (req, res) => {
@@ -56,10 +81,7 @@ router.get(
           order: [["date", "ASC"]],
         });
 
-    const [checking] = await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-    });
+    const checking = await getPrimaryCheckingAccount();
 
     // Run all independent dashboard queries in parallel (including spendingByCategory) to eliminate extra HTTP round-trips
     const [
@@ -198,10 +220,7 @@ router.put(
   "/checking",
   validateBody(schemas.updateChecking),
   asyncHandler(async (req, res) => {
-    const [checking] = await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-    });
+    const checking = await getPrimaryCheckingAccount();
 
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
@@ -243,16 +262,22 @@ router.put(
 
     const desiredBalance = parseFloat(req.body.balance);
     if (!isNaN(desiredBalance)) {
-      checking.initialBalance = desiredBalance - netCheckingActivity;
-      await checking.save();
+      const calculatedInitial =
+        Math.round((desiredBalance - netCheckingActivity) * 100) / 100;
+      checking.initialBalance = calculatedInitial;
+      await checking.save({ fields: ["initialBalance", "updatedAt"] });
     }
+
+    const currentBalance =
+      Math.round(
+        ((parseFloat(checking.initialBalance) || 0) + netCheckingActivity) * 100
+      ) / 100;
 
     res.json({
       id: checking.id,
       name: checking.name,
       initialBalance: parseFloat(checking.initialBalance) || 0,
-      currentBalance:
-        (parseFloat(checking.initialBalance) || 0) + netCheckingActivity,
+      currentBalance,
     });
   })
 );
