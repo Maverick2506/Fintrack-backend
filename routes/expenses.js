@@ -33,24 +33,18 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
   // Unpaid/pending expenses have not affected account balances yet
   if (trx.type === "EXPENSE" && !trx.isCleared) return;
 
+  const todayStr = getTodayString();
+  const isPastDated = trx.date < todayStr;
+
   // 1. Cleared expense charged FROM a Credit Card (and not a paydown transfer to another account) increases card balance (+amount)
+  // Only applies for transactions dated today or later. Past-dated expenses are historical and already factored into the card's balance.
   if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
+    if (isPastDated) return;
+
     const fromAcc = await Account.findByPk(trx.fromAccountId, {
       transaction: dbTx,
     });
     if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-      const cardCreatedDate = fromAcc.createdAt
-        ? format(
-            toZonedTime(new Date(fromAcc.createdAt), TIMEZONE),
-            "yyyy-MM-dd"
-          )
-        : null;
-      if (cardCreatedDate && trx.date < cardCreatedDate) {
-        // Transaction predates the creation of the credit card account.
-        // The credit card's initial balance already reflects all pre-existing debt/spending,
-        // so adding or deleting a historical transaction must not modify the card balance.
-        return;
-      }
       const nextBal =
         parseFloat(fromAcc.initialBalance || 0) + direction * amount;
       fromAcc.initialBalance = nextBal;
@@ -68,7 +62,10 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
     });
     if (toAcc) {
       if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-        // Paydown reduces Debt / Credit Card balance when applied (direction=1), restores when reversed (direction=-1)
+        // Paydown reduces Debt / Credit Card balance only if dated today or later.
+        // Historical past-dated paydowns were already factored into the user-entered balance.
+        if (isPastDated) return;
+
         const nextBal =
           parseFloat(toAcc.initialBalance || 0) - direction * amount;
         toAcc.initialBalance = nextBal;

@@ -238,8 +238,8 @@ async function runTestSuite() {
     headers: authHeaders,
   });
 
-  // 6. Historical Expense on Credit Card (Issue 1)
-  console.log("\n--- Suite 6: Historical Credit Card Expense Behavior ---");
+  // 6. Historical vs Today Credit Card Expense & Paydown Behavior
+  console.log("\n--- Suite 6: Historical vs Today Credit Card Behavior ---");
   const cardHistRes = await request({
     hostname: "localhost",
     port: 8000,
@@ -250,6 +250,7 @@ async function runTestSuite() {
   assert(cardHistRes.status === 201 && cardHistRes.body.id, "Creates card with $500 balance");
   const histCardId = cardHistRes.body.id;
 
+  // 6a. Past-dated expense does NOT increase card balance
   const pastExpRes = await request({
     hostname: "localhost",
     port: 8000,
@@ -266,14 +267,14 @@ async function runTestSuite() {
   assert(pastExpRes.status === 201 && pastExpRes.body.id, "Creates historical expense dated 2020-01-01");
   const pastExpId = pastExpRes.body.id;
 
-  const cardAfterPastExp = await request({
+  let cardQuery = await request({
     hostname: "localhost",
     port: 8000,
     path: "/api/credit-cards",
     method: "GET",
     headers: authHeaders,
   });
-  const histCard = (cardAfterPastExp.body || []).find((c) => c.id === histCardId);
+  let histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
   assert(parseFloat(histCard.currentBalance) === 500, "Past expense does not increase pre-existing card balance");
 
   await request({
@@ -284,15 +285,148 @@ async function runTestSuite() {
     headers: authHeaders,
   });
 
-  const cardAfterDelPast = await request({
+  cardQuery = await request({
     hostname: "localhost",
     port: 8000,
     path: "/api/credit-cards",
     method: "GET",
     headers: authHeaders,
   });
-  const histCardAfterDel = (cardAfterDelPast.body || []).find((c) => c.id === histCardId);
-  assert(parseFloat(histCardAfterDel.currentBalance) === 500, "Deleting past expense does not decrement card balance");
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 500, "Deleting past expense does not decrement card balance");
+
+  // 6b. Past-dated paydown does NOT decrease card balance
+  const pastPaydownRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Past Card Paydown",
+    amount: 100.0,
+    category: "Debt",
+    due_date: "2020-01-01",
+    targetAccountId: histCardId,
+  });
+  assert(pastPaydownRes.status === 201 && pastPaydownRes.body.id, "Creates past paydown dated 2020-01-01");
+  const pastPaydownId = pastPaydownRes.body.id;
+
+  cardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 500, "Past paydown does not decrease pre-existing card balance");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${pastPaydownId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  cardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 500, "Deleting past paydown does not alter card balance");
+
+  // 6c. Today-dated paydown DOES decrease card balance
+  const todayPaydownRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Today Card Paydown",
+    amount: 100.0,
+    category: "Debt",
+    targetAccountId: histCardId,
+  });
+  assert(todayPaydownRes.status === 201 && todayPaydownRes.body.id, "Creates today paydown");
+  const todayPaydownId = todayPaydownRes.body.id;
+
+  cardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 400, "Today paydown decreases card balance to $400");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${todayPaydownId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  cardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 500, "Deleting today paydown cleanly restores balance to $500");
+
+  // 6d. Today-dated expense on card DOES increase card balance
+  const todayExpRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Today Grocery Charge",
+    amount: 60.0,
+    category: "Food & Drink",
+    creditCardId: histCardId,
+  });
+  assert(todayExpRes.status === 201 && todayExpRes.body.id, "Creates today card charge");
+  const todayExpId = todayExpRes.body.id;
+
+  cardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 560, "Today expense increases card balance to $560");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${todayExpId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  cardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  histCard = (cardQuery.body || []).find((c) => c.id === histCardId);
+  assert(parseFloat(histCard.currentBalance) === 500, "Deleting today expense cleanly restores balance to $500");
 
   await request({
     hostname: "localhost",

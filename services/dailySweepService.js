@@ -49,18 +49,13 @@ const runDailySweep = async () => {
         bill.taxApplied = true;
       }
 
+      const isPastBill = bill.date < todayString;
       if (
         bill.fromAccount &&
         bill.fromAccount.type === "CREDIT_CARD" &&
         !bill.toAccountId
       ) {
-        const cardCreatedDate = bill.fromAccount.createdAt
-          ? format(
-              toZonedTime(new Date(bill.fromAccount.createdAt), TIMEZONE),
-              "yyyy-MM-dd"
-            )
-          : null;
-        if (!cardCreatedDate || bill.date >= cardCreatedDate) {
+        if (!isPastBill) {
           bill.fromAccount.initialBalance =
             parseFloat(bill.fromAccount.initialBalance || 0) + amt;
           await bill.fromAccount.save({ transaction: dbTx });
@@ -70,11 +65,13 @@ const runDailySweep = async () => {
         (bill.toAccount.type === "DEBT" ||
           bill.toAccount.type === "CREDIT_CARD")
       ) {
-        bill.toAccount.initialBalance = Math.max(
-          0,
-          parseFloat(bill.toAccount.initialBalance || 0) - amt
-        );
-        await bill.toAccount.save({ transaction: dbTx });
+        if (!isPastBill) {
+          bill.toAccount.initialBalance = Math.max(
+            0,
+            parseFloat(bill.toAccount.initialBalance || 0) - amt
+          );
+          await bill.toAccount.save({ transaction: dbTx });
+        }
       }
       bill.isCleared = true;
       await bill.save({ transaction: dbTx });
