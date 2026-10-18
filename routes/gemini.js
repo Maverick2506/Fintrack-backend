@@ -359,6 +359,11 @@ router.post("/chat-advisor", async (req, res) => {
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
     const currentMonthPrefix = todayStr.slice(0, 7);
 
+    const [year, month] = todayStr.split("-").map(Number);
+    const startOfMonth = `${year}-${String(month).padStart(2, "0")}-01`;
+    const lastDay = new Date(year, month, 0).getDate();
+    const endOfMonth = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+
     // Fetch comprehensive live financial reality
     const [
       accounts,
@@ -379,14 +384,14 @@ router.post("/chat-advisor", async (req, res) => {
         where: {
           type: "EXPENSE",
           isCleared: true,
-          date: { [Op.startsWith]: currentMonthPrefix },
+          date: { [Op.between]: [startOfMonth, endOfMonth] },
         },
       }),
       Transaction.sum("amount", {
         where: {
           type: "INCOME",
           isCleared: true,
-          date: { [Op.startsWith]: currentMonthPrefix },
+          date: { [Op.between]: [startOfMonth, endOfMonth] },
         },
       }),
       Transaction.findAll({
