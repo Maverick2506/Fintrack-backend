@@ -88,7 +88,10 @@ const resolvePaydownTargetId = async (
 
   if (category === "Debt" && title) {
     const candidates = await Account.findAll({
-      where: { type: { [Op.in]: ["DEBT", "CREDIT_CARD"] } },
+      where: {
+        type: { [Op.in]: ["DEBT", "CREDIT_CARD"] },
+        isActive: { [Op.ne]: false },
+      },
       transaction: dbTx,
     });
     const normalizedTitle = title.toLowerCase().trim();

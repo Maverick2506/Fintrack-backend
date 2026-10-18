@@ -1,5 +1,6 @@
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
@@ -32,7 +33,7 @@ router.get(
   "/debts",
   asyncHandler(async (req, res) => {
     const debts = await Account.findAll({
-      where: { type: "DEBT" },
+      where: { type: "DEBT", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
     res.json(debts.map(formatDebtResponse));
@@ -71,6 +72,7 @@ router.post(
       autoPay: Boolean(auto_pay),
       paymentFrequency: payment_frequency || "monthly",
       interestRate: parsedRate !== null && !isNaN(parsedRate) ? parsedRate : null,
+      isActive: true,
     });
 
     res.status(201).json(formatDebtResponse(newDebt));
@@ -139,7 +141,9 @@ router.delete(
   asyncHandler(async (req, res) => {
     const debt = await Account.findByPk(req.params.id);
     if (debt && debt.type === "DEBT") {
-      await debt.destroy();
+      // Soft-delete to preserve transaction history and maintain accurate checking ledger
+      debt.isActive = false;
+      await debt.save();
       res.status(204).send();
     } else {
       res.status(404).json({ error: "Debt not found" });

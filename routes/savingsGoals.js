@@ -1,5 +1,6 @@
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
@@ -18,7 +19,7 @@ router.get(
   "/savings-goals",
   asyncHandler(async (req, res) => {
     const goals = await Account.findAll({
-      where: { type: "SAVINGS_GOAL" },
+      where: { type: "SAVINGS_GOAL", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
     const formatted = goals.map((g) => ({
@@ -50,6 +51,7 @@ router.post(
       targetAmount: parseFloat(targetAmount),
       dueDate: req.body.target_date || req.body.dueDate || null,
       initialBalance: startingAmount,
+      isActive: true,
     });
 
     res.status(201).json({
@@ -66,7 +68,9 @@ router.delete(
   asyncHandler(async (req, res) => {
     const goal = await Account.findByPk(req.params.id);
     if (goal && goal.type === "SAVINGS_GOAL") {
-      await goal.destroy();
+      // Soft-delete to preserve contribution history and checking transfer ledger
+      goal.isActive = false;
+      await goal.save();
       res.status(204).send();
     } else {
       res.status(404).json({ error: "Savings Goal not found" });

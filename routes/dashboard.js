@@ -107,13 +107,16 @@ router.get(
         },
         order: [["date", "ASC"]],
       }),
-      Account.findAll({ where: { type: "DEBT" }, order: [["createdAt", "ASC"]] }),
       Account.findAll({
-        where: { type: "SAVINGS_GOAL" },
+        where: { type: "DEBT", isActive: { [Op.ne]: false } },
         order: [["createdAt", "ASC"]],
       }),
       Account.findAll({
-        where: { type: "CREDIT_CARD" },
+        where: { type: "SAVINGS_GOAL", isActive: { [Op.ne]: false } },
+        order: [["createdAt", "ASC"]],
+      }),
+      Account.findAll({
+        where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
         order: [["createdAt", "ASC"]],
       }),
       Transaction.findAll({

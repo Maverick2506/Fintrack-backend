@@ -76,6 +76,7 @@ const runDailySweep = async () => {
       where: {
         type: "DEBT",
         autoPay: true,
+        isActive: { [Op.ne]: false },
         dueDate: { [Op.lte]: todayString },
         initialBalance: { [Op.gt]: 0 },
       },

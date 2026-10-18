@@ -1,5 +1,6 @@
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
@@ -18,7 +19,7 @@ router.get(
   "/credit-cards",
   asyncHandler(async (req, res) => {
     const cards = await Account.findAll({
-      where: { type: "CREDIT_CARD" },
+      where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
     const formatted = cards.map((c) => ({
@@ -42,6 +43,7 @@ router.post(
       initialBalance: currentBalance ?? initialBalance ?? 0.0,
       creditLimit: parseFloat(creditLimit),
       dueDate: dueDate || null,
+      isActive: true,
     });
 
     res
@@ -103,7 +105,9 @@ router.delete(
   asyncHandler(async (req, res) => {
     const card = await Account.findByPk(req.params.id);
     if (card && card.type === "CREDIT_CARD") {
-      await card.destroy();
+      // Soft-delete to preserve transaction history and maintain accurate checking ledger
+      card.isActive = false;
+      await card.save();
       res.status(204).send();
     } else {
       res.status(404).json({ error: "Credit Card not found" });
