@@ -18,10 +18,10 @@ if (fs.existsSync(envPath)) {
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
-const { sequelize, Transaction, Account } = require("./models");
-const { Op } = require("sequelize");
+const { sequelize, Account } = require("./models");
 const cron = require("node-cron");
-const { toZonedTime, format } = require("date-fns-tz");
+const { assertAuthConfiguration } = require("./config/auth");
+const { runDailySweep } = require("./services/dailySweepService");
 const authRoutes = require("./routes/auth");
 const expenseRoutes = require("./routes/expenses");
 const debtRoutes = require("./routes/debts");
@@ -30,12 +30,11 @@ const dashboardRoutes = require("./routes/dashboard");
 const geminiRoutes = require("./routes/gemini");
 const creditCardRoutes = require("./routes/creditCards");
 const paychequeRoutes = require("./routes/paycheques");
+const cronRoutes = require("./routes/cron");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
-  getNextDueDate,
 } = require("./routes/recurring");
-const authMiddleware = require("./middleware/authMiddleware");
 const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
 const {
   loginLimiter,
@@ -73,13 +72,15 @@ const port = process.env.PORT || 8000;
 
 app.use(express.json());
 
-// --- API ROUTES ---
+// --- RATE LIMITERS ---
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/financial-advice", aiLimiter);
 app.use("/api/categorize-expense", aiLimiter);
 app.use("/api", apiLimiter);
 
+// --- API ROUTES ---
 app.use("/api/auth", authRoutes);
+app.use("/api", cronRoutes);
 app.use("/api", expenseRoutes);
 app.use("/api", debtRoutes);
 app.use("/api", savingsGoalRoutes);
@@ -89,151 +90,44 @@ app.use("/api", creditCardRoutes);
 app.use("/api/recurring", recurringRoutes);
 app.use("/api", paychequeRoutes);
 
-const runDailySweep = async () => {
-  console.log("Running Daily Sweep (Credit Cards & Auto-Pay Debts)...");
-  const dbTx = await sequelize.transaction();
-  try {
-    const TIMEZONE = "America/Toronto";
-    const nowUtc = new Date();
-    const nowZoned = toZonedTime(nowUtc, TIMEZONE);
-    const todayString = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
-
-    // 1. Process Due Pending Expenses (Credit Card charges & Debt/Card paydown bills)
-    const pendingBillsDue = await Transaction.findAll({
-      where: {
-        isCleared: false,
-        type: "EXPENSE",
-        date: { [Op.lte]: todayString },
-      },
-      include: [
-        { model: Account, as: "fromAccount" },
-        { model: Account, as: "toAccount" },
-      ],
-      transaction: dbTx,
-    });
-
-    for (const bill of pendingBillsDue) {
-      const amt = parseFloat(bill.amount) || 0;
-      if (
-        bill.fromAccount &&
-        bill.fromAccount.type === "CREDIT_CARD" &&
-        !bill.toAccountId
-      ) {
-        bill.fromAccount.initialBalance =
-          parseFloat(bill.fromAccount.initialBalance || 0) + amt;
-        await bill.fromAccount.save({ transaction: dbTx });
-        bill.isCleared = true;
-        await bill.save({ transaction: dbTx });
-      } else if (
-        bill.toAccount &&
-        (bill.toAccount.type === "DEBT" ||
-          bill.toAccount.type === "CREDIT_CARD")
-      ) {
-        bill.toAccount.initialBalance = Math.max(
-          0,
-          parseFloat(bill.toAccount.initialBalance || 0) - amt
-        );
-        await bill.toAccount.save({ transaction: dbTx });
-        bill.isCleared = true;
-        await bill.save({ transaction: dbTx });
-      }
-    }
-
-    // 2. Process Due Auto-Pay Debts
-    const dueAutoPayDebts = await Account.findAll({
-      where: {
-        type: "DEBT",
-        autoPay: true,
-        dueDate: { [Op.lte]: todayString },
-        initialBalance: { [Op.gt]: 0 },
-      },
-      transaction: dbTx,
-    });
-
-    if (dueAutoPayDebts.length > 0) {
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
-
-      for (const debt of dueAutoPayDebts) {
-        const remaining = parseFloat(debt.initialBalance) || 0;
-        const minPay = parseFloat(debt.minimumPayment) || 0;
-        if (remaining <= 0 || minPay <= 0) continue;
-
-        const paymentAmount = Math.min(remaining, minPay);
-        debt.initialBalance = Math.max(0, remaining - paymentAmount);
-
-        const currentDue = toZonedTime(`${debt.dueDate}T00:00:00`, TIMEZONE);
-        const nextDue = getNextDueDate(
-          currentDue,
-          debt.paymentFrequency || "monthly"
-        );
-        if (nextDue && debt.initialBalance > 0) {
-          debt.dueDate = format(nextDue, "yyyy-MM-dd", { timeZone: TIMEZONE });
-        } else if (debt.initialBalance <= 0) {
-          debt.autoPay = false;
-        }
-
-        await debt.save({ transaction: dbTx });
-
-        await Transaction.create(
-          {
-            title: `Auto-Pay for ${debt.name}`,
-            amount: paymentAmount,
-            date: todayString,
-            type: "EXPENSE",
-            category: "Debt",
-            isCleared: true,
-            fromAccountId: checking.id,
-            toAccountId: debt.id,
-          },
-          { transaction: dbTx }
-        );
-      }
-    }
-
-    await dbTx.commit();
-    return true;
-  } catch (error) {
-    await dbTx.rollback();
-    console.error("Error running daily sweep:", error);
-    throw error;
-  }
-};
-
-app.get("/api/daily-check", authMiddleware, async (req, res) => {
-  try {
-    await runDailySweep();
-    res.status(200).send("Daily check complete.");
-  } catch (error) {
-    res.status(500).send("Error in daily check.");
-  }
-});
-
+// --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-// --- Automated Task Schedulers ---
+// --- Schedulers (Long-lived server environments) ---
 cron.schedule(
   "0 0 * * *",
   async () => {
-    await runDailySweep();
+    try {
+      await runDailySweep();
+    } catch (err) {
+      console.error("Scheduled daily sweep error:", err);
+    }
   },
   {
     timezone: "America/Toronto",
   }
 );
 
-cron.schedule("0 1 * * *", createRecurringExpenses, {
-  timezone: "America/Toronto",
-});
-// --- END Automated Task Schedulers ---
+cron.schedule(
+  "0 1 * * *",
+  async () => {
+    try {
+      await createRecurringExpenses();
+    } catch (err) {
+      console.error("Scheduled recurring generation error:", err);
+    }
+  },
+  {
+    timezone: "America/Toronto",
+  }
+);
 
 // --- Initialize Server ---
 async function initialize() {
   try {
+    assertAuthConfiguration();
+
     const syncOptions =
       process.env.DB_ALTER_SYNC === "true" ? { alter: true } : undefined;
     await sequelize.sync(syncOptions);
@@ -246,6 +140,7 @@ async function initialize() {
     });
   } catch (error) {
     console.error("❌ Unable to start the server:", error);
+    process.exit(1);
   }
 }
 

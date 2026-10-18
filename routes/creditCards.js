@@ -2,6 +2,8 @@ const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
+const { validateBody, schemas } = require("../middleware/validate");
+const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
 
 router.use(authMiddleware);
@@ -12,8 +14,9 @@ const getTodayString = () =>
     timeZone: TIMEZONE,
   });
 
-router.get("/credit-cards", async (req, res) => {
-  try {
+router.get(
+  "/credit-cards",
+  asyncHandler(async (req, res) => {
     const cards = await Account.findAll({
       where: { type: "CREDIT_CARD" },
       order: [["createdAt", "ASC"]],
@@ -23,24 +26,20 @@ router.get("/credit-cards", async (req, res) => {
       currentBalance: c.initialBalance,
     }));
     res.json(formatted);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.post("/credit-cards", async (req, res) => {
-  try {
-    const { name, creditLimit, currentBalance, dueDate } = req.body;
-    if (!name || creditLimit === undefined) {
-      return res
-        .status(400)
-        .json({ error: "Name and Credit Limit are required." });
-    }
+router.post(
+  "/credit-cards",
+  validateBody(schemas.createCreditCard),
+  asyncHandler(async (req, res) => {
+    const { name, creditLimit, currentBalance, initialBalance, dueDate } =
+      req.body;
 
     const newCard = await Account.create({
       name,
       type: "CREDIT_CARD",
-      initialBalance: currentBalance || 0.0,
+      initialBalance: currentBalance ?? initialBalance ?? 0.0,
       creditLimit: parseFloat(creditLimit),
       dueDate: dueDate || null,
     });
@@ -48,73 +47,76 @@ router.post("/credit-cards", async (req, res) => {
     res
       .status(201)
       .json({ ...newCard.toJSON(), currentBalance: newCard.initialBalance });
-  } catch (error) {
-    res.status(400).json({ error: "Failed to create credit card." });
-  }
-});
+  })
+);
 
-router.post("/credit-cards/:id/pay", async (req, res) => {
-  const dbTx = await sequelize.transaction();
-  try {
-    const card = await Account.findByPk(req.params.id, { transaction: dbTx });
-    const [checking] = await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-      transaction: dbTx,
-    });
+router.post(
+  "/credit-cards/:id/pay",
+  validateBody(schemas.paymentAmount),
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const card = await Account.findByPk(req.params.id, { transaction: dbTx });
+      const [checking] = await Account.findOrCreate({
+        where: { name: "Primary Checking" },
+        defaults: { type: "CHECKING", initialBalance: 0.0 },
+        transaction: dbTx,
+      });
 
-    if (!card || !checking) {
+      if (!card || card.type !== "CREDIT_CARD") {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Credit Card not found" });
+      }
+
+      const paymentAmount = parseFloat(req.body.amount);
+      // Unclamped arithmetic avoids drift when payments are edited or reversed
+      card.initialBalance =
+        parseFloat(card.initialBalance || 0) - paymentAmount;
+      await card.save({ transaction: dbTx });
+
+      // Record as TRANSFER (not EXPENSE) to prevent double-counting card spending
+      await Transaction.create(
+        {
+          title: `Payment for ${card.name}`,
+          amount: paymentAmount,
+          date: getTodayString(),
+          type: "TRANSFER",
+          category: "Credit Card Payment",
+          isCleared: true,
+          fromAccountId: checking.id,
+          toAccountId: card.id,
+        },
+        { transaction: dbTx }
+      );
+
+      await dbTx.commit();
+      res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
+    } catch (error) {
       await dbTx.rollback();
-      return res.status(404).send("Credit Card or Checking Account not found");
+      throw error;
     }
+  })
+);
 
-    const paymentAmount = parseFloat(req.body.amount);
-    card.initialBalance = Math.max(
-      0,
-      parseFloat(card.initialBalance) - paymentAmount
-    );
-    await card.save({ transaction: dbTx });
-
-    await Transaction.create(
-      {
-        title: `Payment for ${card.name}`,
-        amount: paymentAmount,
-        date: getTodayString(),
-        type: "EXPENSE",
-        category: "Debt",
-        isCleared: true,
-        fromAccountId: checking.id,
-        toAccountId: card.id,
-      },
-      { transaction: dbTx }
-    );
-
-    await dbTx.commit();
-    res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
-  } catch (error) {
-    await dbTx.rollback();
-    res.status(400).json({ error: error.message });
-  }
-});
-
-router.delete("/credit-cards/:id", async (req, res) => {
-  try {
+router.delete(
+  "/credit-cards/:id",
+  asyncHandler(async (req, res) => {
     const card = await Account.findByPk(req.params.id);
-    if (card) {
+    if (card && card.type === "CREDIT_CARD") {
       await card.destroy();
       res.status(204).send();
     } else {
-      res.status(404).send("Credit Card not found");
+      res.status(404).json({ error: "Credit Card not found" });
     }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.put("/credit-cards/:id", async (req, res) => {
-  try {
+router.put(
+  "/credit-cards/:id",
+  validateBody(schemas.updateCreditCard),
+  asyncHandler(async (req, res) => {
     const card = await Account.findByPk(req.params.id);
-    if (card) {
+    if (card && card.type === "CREDIT_CARD") {
       const { name, creditLimit, currentBalance, initialBalance, dueDate } =
         req.body;
       await card.update({
@@ -133,11 +135,9 @@ router.put("/credit-cards/:id", async (req, res) => {
       });
       res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
     } else {
-      res.status(404).send("Credit Card not found");
+      res.status(404).json({ error: "Credit Card not found" });
     }
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
+  })
+);
 
 module.exports = router;

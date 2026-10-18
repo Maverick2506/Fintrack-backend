@@ -3,6 +3,8 @@ const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
+const { validateBody, schemas } = require("../middleware/validate");
+const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
 
 router.use(authMiddleware);
@@ -17,8 +19,9 @@ const formatYMD = (y, mZeroIndexed, d) => {
   return `${yr}-${mo}-${da}`;
 };
 
-router.get("/dashboard", async (req, res) => {
-  try {
+router.get(
+  "/dashboard",
+  asyncHandler(async (req, res) => {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
@@ -76,6 +79,7 @@ router.get("/dashboard", async (req, res) => {
       Transaction.sum("amount", {
         where: {
           type: "INCOME",
+          ...(isCurrentMonth ? { isCleared: true } : {}),
           date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] },
         },
       }),
@@ -124,7 +128,15 @@ router.get("/dashboard", async (req, res) => {
         group: ["category"],
         raw: true,
       }),
-      Transaction.sum("amount", { where: { type: "INCOME" } }),
+      // Only include cleared income dated on or before today into current checking balance calculation
+      Transaction.sum("amount", {
+        where: {
+          type: "INCOME",
+          isCleared: true,
+          date: { [Op.lte]: todayStr },
+          [Op.or]: [{ toAccountId: checking.id }, { toAccountId: null }],
+        },
+      }),
       Transaction.sum("amount", {
         where: {
           type: "EXPENSE",
@@ -177,18 +189,20 @@ router.get("/dashboard", async (req, res) => {
       creditCardSummary,
       spendingSummary,
     });
-  } catch (error) {
-    console.error("Dashboard Error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.put("/checking", async (req, res) => {
-  try {
+router.put(
+  "/checking",
+  validateBody(schemas.updateChecking),
+  asyncHandler(async (req, res) => {
     const [checking] = await Account.findOrCreate({
       where: { name: "Primary Checking" },
       defaults: { type: "CHECKING", initialBalance: 0.0 },
     });
+
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
     const [
       allTimeIncome,
@@ -196,7 +210,14 @@ router.put("/checking", async (req, res) => {
       allTimeTransfersOut,
       allTimeTransfersIn,
     ] = await Promise.all([
-      Transaction.sum("amount", { where: { type: "INCOME" } }),
+      Transaction.sum("amount", {
+        where: {
+          type: "INCOME",
+          isCleared: true,
+          date: { [Op.lte]: todayStr },
+          [Op.or]: [{ toAccountId: checking.id }, { toAccountId: null }],
+        },
+      }),
       Transaction.sum("amount", {
         where: {
           type: "EXPENSE",
@@ -231,13 +252,12 @@ router.put("/checking", async (req, res) => {
       currentBalance:
         (parseFloat(checking.initialBalance) || 0) + netCheckingActivity,
     });
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.get("/spending-summary", async (req, res) => {
-  try {
+router.get(
+  "/spending-summary",
+  asyncHandler(async (req, res) => {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const year = req.query.year
       ? parseInt(req.query.year)
@@ -266,13 +286,12 @@ router.get("/spending-summary", async (req, res) => {
       value: parseFloat(item.total_amount),
     }));
     res.json(formattedData);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch spending summary." });
-  }
-});
+  })
+);
 
-router.get("/trends", async (req, res) => {
-  try {
+router.get(
+  "/trends",
+  asyncHandler(async (req, res) => {
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const baseYear = req.query.year
       ? parseInt(req.query.year)
@@ -327,10 +346,7 @@ router.get("/trends", async (req, res) => {
         spending: Number(spending.toFixed(2)),
       }))
     );
-  } catch (error) {
-    console.error("Error fetching trends:", error);
-    res.status(500).json({ error: "Failed to fetch trends data." });
-  }
-});
+  })
+);
 
 module.exports = router;

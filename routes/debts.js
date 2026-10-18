@@ -2,6 +2,8 @@ const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
+const { validateBody, schemas } = require("../middleware/validate");
+const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
 
 router.use(authMiddleware);
@@ -26,20 +28,21 @@ const formatDebtResponse = (d) => {
   };
 };
 
-router.get("/debts", async (req, res) => {
-  try {
+router.get(
+  "/debts",
+  asyncHandler(async (req, res) => {
     const debts = await Account.findAll({
       where: { type: "DEBT" },
       order: [["createdAt", "ASC"]],
     });
     res.json(debts.map(formatDebtResponse));
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.post("/debts", async (req, res) => {
-  try {
+router.post(
+  "/debts",
+  validateBody(schemas.createDebt),
+  asyncHandler(async (req, res) => {
     const {
       name,
       total_amount,
@@ -52,9 +55,9 @@ router.post("/debts", async (req, res) => {
     } = req.body;
 
     const parsedRate =
-      interest_rate !== undefined && interest_rate !== ""
+      interest_rate !== undefined && interest_rate !== null
         ? parseFloat(interest_rate)
-        : interestRate !== undefined && interestRate !== ""
+        : interestRate !== undefined && interestRate !== null
         ? parseFloat(interestRate)
         : null;
 
@@ -67,79 +70,89 @@ router.post("/debts", async (req, res) => {
       dueDate: next_due_date || null,
       autoPay: Boolean(auto_pay),
       paymentFrequency: payment_frequency || "monthly",
-      interestRate: !isNaN(parsedRate) ? parsedRate : null,
+      interestRate: parsedRate !== null && !isNaN(parsedRate) ? parsedRate : null,
     });
 
     res.status(201).json(formatDebtResponse(newDebt));
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.post("/debts/:id/pay", async (req, res) => {
-  const dbTx = await sequelize.transaction();
-  try {
-    const debt = await Account.findByPk(req.params.id, { transaction: dbTx });
-    const [checking] = await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-      transaction: dbTx,
-    });
+router.post(
+  "/debts/:id/pay",
+  validateBody(schemas.paymentAmount),
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const debt = await Account.findByPk(req.params.id, { transaction: dbTx });
+      const [checking] = await Account.findOrCreate({
+        where: { name: "Primary Checking" },
+        defaults: { type: "CHECKING", initialBalance: 0.0 },
+        transaction: dbTx,
+      });
 
-    if (!debt || !checking) {
+      if (!debt || debt.type !== "DEBT") {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Debt not found" });
+      }
+
+      const paymentAmount = parseFloat(req.body.amount);
+      const remainingDebt = parseFloat(debt.initialBalance || 0);
+
+      if (paymentAmount > remainingDebt) {
+        await dbTx.rollback();
+        return res.status(400).json({
+          error: `Payment amount ($${paymentAmount.toFixed(
+            2
+          )}) cannot exceed remaining debt balance ($${remainingDebt.toFixed(2)}).`,
+        });
+      }
+
+      debt.initialBalance = remainingDebt - paymentAmount;
+      await debt.save({ transaction: dbTx });
+
+      // Record as EXPENSE under "Debt" category so it registers in both Monthly Expenses/Analytics AND Debt paydown
+      await Transaction.create(
+        {
+          title: `Payment for ${debt.name}`,
+          amount: paymentAmount,
+          date: getTodayString(),
+          type: "EXPENSE",
+          category: "Debt",
+          isCleared: true,
+          fromAccountId: checking.id,
+          toAccountId: debt.id,
+        },
+        { transaction: dbTx }
+      );
+
+      await dbTx.commit();
+      res.json(formatDebtResponse(debt));
+    } catch (error) {
       await dbTx.rollback();
-      return res.status(404).send("Debt or Checking Account not found");
+      throw error;
     }
+  })
+);
 
-    const paymentAmount = parseFloat(req.body.amount);
-    debt.initialBalance = Math.max(
-      0,
-      parseFloat(debt.initialBalance) - paymentAmount
-    );
-    await debt.save({ transaction: dbTx });
-
-    // Record as EXPENSE under "Debt" category so it registers in both Monthly Expenses/Analytics AND Debt paydown
-    await Transaction.create(
-      {
-        title: `Payment for ${debt.name}`,
-        amount: paymentAmount,
-        date: getTodayString(),
-        type: "EXPENSE",
-        category: "Debt",
-        isCleared: true,
-        fromAccountId: checking.id,
-        toAccountId: debt.id,
-      },
-      { transaction: dbTx }
-    );
-
-    await dbTx.commit();
-    res.json(formatDebtResponse(debt));
-  } catch (error) {
-    await dbTx.rollback();
-    res.status(400).json({ error: error.message });
-  }
-});
-
-router.delete("/debts/:id", async (req, res) => {
-  try {
+router.delete(
+  "/debts/:id",
+  asyncHandler(async (req, res) => {
     const debt = await Account.findByPk(req.params.id);
-    if (debt) {
+    if (debt && debt.type === "DEBT") {
       await debt.destroy();
       res.status(204).send();
     } else {
-      res.status(404).send("Debt not found");
+      res.status(404).json({ error: "Debt not found" });
     }
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.put("/debts/:id", async (req, res) => {
-  try {
+router.put(
+  "/debts/:id",
+  asyncHandler(async (req, res) => {
     const debt = await Account.findByPk(req.params.id);
-    if (!debt) {
-      return res.status(404).send("Debt not found");
+    if (!debt || debt.type !== "DEBT") {
+      return res.status(404).json({ error: "Debt not found" });
     }
 
     const {
@@ -157,9 +170,11 @@ router.put("/debts/:id", async (req, res) => {
     const updates = {
       name: name ?? debt.name,
       targetAmount:
-        total_amount !== undefined ? total_amount : debt.targetAmount,
+        total_amount !== undefined ? parseFloat(total_amount) : debt.targetAmount,
       minimumPayment:
-        monthly_payment !== undefined ? monthly_payment : debt.minimumPayment,
+        monthly_payment !== undefined
+          ? parseFloat(monthly_payment)
+          : debt.minimumPayment,
       dueDate:
         next_due_date !== undefined ? next_due_date || null : debt.dueDate,
     };
@@ -182,9 +197,7 @@ router.put("/debts/:id", async (req, res) => {
 
     await debt.update(updates);
     res.json(formatDebtResponse(debt));
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
+  })
+);
 
 module.exports = router;

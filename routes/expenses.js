@@ -3,6 +3,8 @@ const { sequelize, Transaction, Account } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
+const { validateBody, schemas } = require("../middleware/validate");
+const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
 
 router.use(authMiddleware);
@@ -37,10 +39,8 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
       transaction: dbTx,
     });
     if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-      const nextBal = Math.max(
-        0,
-        parseFloat(fromAcc.initialBalance || 0) + direction * amount
-      );
+      const nextBal =
+        parseFloat(fromAcc.initialBalance || 0) + direction * amount;
       fromAcc.initialBalance = nextBal;
       await fromAcc.save({ transaction: dbTx });
     }
@@ -57,18 +57,14 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
     if (toAcc) {
       if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
         // Paydown reduces Debt / Credit Card balance when applied (direction=1), restores when reversed (direction=-1)
-        const nextBal = Math.max(
-          0,
-          parseFloat(toAcc.initialBalance || 0) - direction * amount
-        );
+        const nextBal =
+          parseFloat(toAcc.initialBalance || 0) - direction * amount;
         toAcc.initialBalance = nextBal;
         await toAcc.save({ transaction: dbTx });
       } else if (toAcc.type === "SAVINGS_GOAL") {
         // Contribution increases Savings Goal balance when applied (direction=1), reduces when reversed (direction=-1)
-        const nextBal = Math.max(
-          0,
-          parseFloat(toAcc.initialBalance || 0) + direction * amount
-        );
+        const nextBal =
+          parseFloat(toAcc.initialBalance || 0) + direction * amount;
         toAcc.initialBalance = nextBal;
         await toAcc.save({ transaction: dbTx });
       }
@@ -112,8 +108,9 @@ const resolvePaydownTargetId = async (
 };
 
 // Map old "monthly expenses" API shape
-router.get("/expenses/monthly", async (req, res) => {
-  try {
+router.get(
+  "/expenses/monthly",
+  asyncHandler(async (req, res) => {
     const { year, month, sortBy = "date", sortOrder = "ASC" } = req.query;
     const { startDate, endDate } = getMonthDateRange(year, month);
 
@@ -145,47 +142,54 @@ router.get("/expenses/monthly", async (req, res) => {
       targetAccountId: e.toAccountId || null,
     }));
     res.json(formatted);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
 // Category drill-down endpoint for ReportsPage pie chart
-router.get("/expenses/category", async (req, res) => {
-  try {
+router.get(
+  "/expenses/category",
+  asyncHandler(async (req, res) => {
     const { year, month, category } = req.query;
     if (!year || !month || !category) {
       return res
         .status(400)
         .json({ error: "year, month, and category are required." });
     }
+
     const { startDate, endDate } = getMonthDateRange(year, month);
 
-    const expenses = await Transaction.findAll({
+    const transactions = await Transaction.findAll({
       where: {
         type: "EXPENSE",
         category,
         date: { [Op.between]: [startDate, endDate] },
       },
-      order: [["date", "ASC"]],
+      order: [["date", "DESC"]],
+      include: [
+        { model: Account, as: "fromAccount" },
+        { model: Account, as: "toAccount" },
+      ],
     });
 
-    const formatted = expenses.map((e) => ({
-      ...e.toJSON(),
-      due_date: e.date,
-      name: e.title,
-      is_paid: e.isCleared,
-      targetAccountId: e.toAccountId || null,
+    const formatted = transactions.map((t) => ({
+      id: t.id,
+      name: t.title,
+      amount: parseFloat(t.amount),
+      date: t.date,
+      category: t.category,
+      is_paid: t.isCleared,
+      fromAccount: t.fromAccount ? t.fromAccount.name : null,
+      toAccount: t.toAccount ? t.toAccount.name : null,
     }));
+
     res.json(formatted);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
 // Full ledger: Transactions of ALL types combined natively
-router.get("/expenses/all", async (req, res) => {
-  try {
+router.get(
+  "/expenses/all",
+  asyncHandler(async (req, res) => {
     const all = await Transaction.findAll({
       order: [
         ["date", "DESC"],
@@ -218,218 +222,265 @@ router.get("/expenses/all", async (req, res) => {
     }));
 
     res.json(rows);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+  })
+);
 
-router.post("/expenses", async (req, res) => {
-  const dbTx = await sequelize.transaction();
-  try {
-    const {
-      name,
-      amount,
-      due_date,
-      category,
-      is_paid,
-      creditCardId,
-      targetAccountId,
-      toAccountId,
-      recurrence,
-    } = req.body;
+router.post(
+  "/expenses",
+  validateBody(schemas.createExpense),
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const {
+        name,
+        amount,
+        due_date,
+        category,
+        is_paid,
+        creditCardId,
+        targetAccountId,
+        toAccountId,
+        recurrence,
+      } = req.body;
 
-    const todayStr = getTodayString();
-    const expenseDate = due_date || todayStr;
-    const finalCategory = category || "Other";
+      const todayStr = getTodayString();
+      const expenseDate = due_date || todayStr;
+      const finalCategory = category || "Other";
 
-    let [fromAccount] = await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-      transaction: dbTx,
-    });
-
-    // Resolve whether this expense pays down a specific Debt or Credit Card
-    const resolvedToAccountId = await resolvePaydownTargetId(
-      targetAccountId || toAccountId,
-      finalCategory,
-      name,
-      dbTx
-    );
-
-    if (creditCardId && !resolvedToAccountId) {
-      const cardAccount = await Account.findByPk(creditCardId, {
+      let [fromAccount] = await Account.findOrCreate({
+        where: { name: "Primary Checking" },
+        defaults: { type: "CHECKING", initialBalance: 0.0 },
         transaction: dbTx,
       });
-      if (cardAccount) fromAccount = cardAccount;
-    }
 
-    // Default to cleared (paid) if expense date is today or in the past, unless explicitly specified
-    const isCleared =
-      is_paid !== undefined ? Boolean(is_paid) : expenseDate <= todayStr;
+      // Resolve whether this expense pays down a specific Debt or Credit Card
+      const resolvedToAccountId = await resolvePaydownTargetId(
+        targetAccountId || toAccountId,
+        finalCategory,
+        name,
+        dbTx
+      );
 
-    const newExp = await Transaction.create(
-      {
-        title: name,
-        amount: parseFloat(amount),
-        date: expenseDate,
-        type: "EXPENSE",
-        category: finalCategory,
-        isCleared,
-        recurrence: recurrence || "none",
-        fromAccountId: fromAccount.id,
-        toAccountId: resolvedToAccountId,
-      },
-      { transaction: dbTx }
-    );
-
-    // Apply balance change on Credit Card (charge) or Debt/Credit Card (paydown) if cleared
-    await adjustAccountForTransaction(newExp, 1, dbTx);
-
-    await dbTx.commit();
-    res.status(201).json(newExp);
-  } catch (error) {
-    await dbTx.rollback();
-    res.status(400).json({ error: error.message });
-  }
-});
-
-router.put("/expenses/:id", async (req, res) => {
-  const dbTx = await sequelize.transaction();
-  try {
-    const trx = await Transaction.findByPk(req.params.id, {
-      transaction: dbTx,
-    });
-    if (!trx) {
-      await dbTx.rollback();
-      return res.status(404).send("Transaction not found");
-    }
-
-    // Reverse old transaction's effect on any linked credit card / debt / savings account
-    await adjustAccountForTransaction(trx, -1, dbTx);
-
-    let fromAccountId = trx.fromAccountId;
-    if (req.body.creditCardId !== undefined) {
-      if (req.body.creditCardId) {
-        fromAccountId = req.body.creditCardId;
-      } else {
-        const [checking] = await Account.findOrCreate({
-          where: { name: "Primary Checking" },
-          defaults: { type: "CHECKING", initialBalance: 0.0 },
+      let targetAccount = null;
+      if (resolvedToAccountId) {
+        targetAccount = await Account.findByPk(resolvedToAccountId, {
           transaction: dbTx,
         });
-        fromAccountId = checking.id;
       }
-    }
 
-    const nextTitle = req.body.name || trx.title;
-    const nextCategory = req.body.category || trx.category;
+      if (creditCardId && !resolvedToAccountId) {
+        const cardAccount = await Account.findByPk(creditCardId, {
+          transaction: dbTx,
+        });
+        if (cardAccount) fromAccount = cardAccount;
+      }
 
-    let nextToAccountId = trx.toAccountId;
-    if (
-      req.body.targetAccountId !== undefined ||
-      req.body.toAccountId !== undefined
-    ) {
-      const explicitTarget =
-        req.body.targetAccountId !== undefined
-          ? req.body.targetAccountId
-          : req.body.toAccountId;
-      nextToAccountId = await resolvePaydownTargetId(
-        explicitTarget,
-        nextCategory,
-        nextTitle,
-        dbTx
+      // Default to cleared (paid) if expense date is today or in the past, unless explicitly specified
+      const isCleared =
+        is_paid !== undefined ? Boolean(is_paid) : expenseDate <= todayStr;
+
+      // If paying toward a credit card, treat as a TRANSFER so card purchases are not double-counted
+      const isCreditCardPayment =
+        targetAccount && targetAccount.type === "CREDIT_CARD";
+      const trxType = isCreditCardPayment ? "TRANSFER" : "EXPENSE";
+      const trxCategory =
+        isCreditCardPayment && finalCategory === "Debt"
+          ? "Credit Card Payment"
+          : finalCategory;
+
+      const newExp = await Transaction.create(
+        {
+          title: name,
+          amount: parseFloat(amount),
+          date: expenseDate,
+          type: trxType,
+          category: trxCategory,
+          isCleared,
+          recurrence: recurrence || "none",
+          fromAccountId: fromAccount.id,
+          toAccountId: resolvedToAccountId,
+        },
+        { transaction: dbTx }
       );
-    } else if (nextCategory === "Debt" && !nextToAccountId) {
-      nextToAccountId = await resolvePaydownTargetId(
-        null,
-        nextCategory,
-        nextTitle,
-        dbTx
-      );
-    }
 
-    await trx.update(
-      {
-        title: nextTitle,
-        amount:
-          req.body.amount !== undefined
-            ? parseFloat(req.body.amount)
-            : trx.amount,
-        date: req.body.due_date || req.body.payment_date || trx.date,
-        category: nextCategory,
-        isCleared:
-          req.body.is_paid !== undefined
-            ? Boolean(req.body.is_paid)
-            : trx.isCleared,
-        recurrence: req.body.recurrence || trx.recurrence,
-        fromAccountId,
-        toAccountId: nextToAccountId,
-      },
-      { transaction: dbTx }
-    );
+      // Apply balance change on Credit Card (charge) or Debt/Credit Card (paydown) if cleared
+      await adjustAccountForTransaction(newExp, 1, dbTx);
 
-    // Apply updated transaction's effect on linked account
-    await adjustAccountForTransaction(trx, 1, dbTx);
-
-    await dbTx.commit();
-    res.json(trx);
-  } catch (error) {
-    await dbTx.rollback();
-    res.status(400).json({ error: error.message });
-  }
-});
-
-router.post("/expenses/bulk-delete", async (req, res) => {
-  const dbTx = await sequelize.transaction();
-  try {
-    const { ids } = req.body;
-    if (!Array.isArray(ids) || ids.length === 0) {
+      await dbTx.commit();
+      res.status(201).json(newExp);
+    } catch (error) {
       await dbTx.rollback();
-      return res.status(400).json({ error: "No transaction IDs provided." });
+      throw error;
     }
+  })
+);
 
-    const toDelete = await Transaction.findAll({
-      where: { id: { [Op.in]: ids } },
-      transaction: dbTx,
-    });
+router.put(
+  "/expenses/:id",
+  validateBody(schemas.updateExpense),
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const trx = await Transaction.findByPk(req.params.id, {
+        transaction: dbTx,
+      });
+      if (!trx) {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Transaction not found" });
+      }
 
-    for (const trx of toDelete) {
+      // Reverse old transaction's effect on any linked credit card / debt / savings account
       await adjustAccountForTransaction(trx, -1, dbTx);
-    }
 
-    const deletedCount = await Transaction.destroy({
-      where: { id: { [Op.in]: ids } },
-      transaction: dbTx,
-    });
+      let fromAccountId = trx.fromAccountId;
+      if (req.body.creditCardId !== undefined) {
+        if (req.body.creditCardId) {
+          fromAccountId = req.body.creditCardId;
+        } else {
+          const [checking] = await Account.findOrCreate({
+            where: { name: "Primary Checking" },
+            defaults: { type: "CHECKING", initialBalance: 0.0 },
+            transaction: dbTx,
+          });
+          fromAccountId = checking.id;
+        }
+      }
 
-    await dbTx.commit();
-    res.json({ deletedCount });
-  } catch (error) {
-    await dbTx.rollback();
-    res.status(500).json({ error: error.message });
-  }
-});
+      const nextTitle = req.body.name || trx.title;
+      const nextCategory = req.body.category || trx.category;
 
-router.delete("/expenses/:id", async (req, res) => {
-  const dbTx = await sequelize.transaction();
-  try {
-    const trx = await Transaction.findByPk(req.params.id, {
-      transaction: dbTx,
-    });
-    if (!trx) {
+      let nextToAccountId = trx.toAccountId;
+      if (
+        req.body.targetAccountId !== undefined ||
+        req.body.toAccountId !== undefined
+      ) {
+        const explicitTarget =
+          req.body.targetAccountId !== undefined
+            ? req.body.targetAccountId
+            : req.body.toAccountId;
+        nextToAccountId = await resolvePaydownTargetId(
+          explicitTarget,
+          nextCategory,
+          nextTitle,
+          dbTx
+        );
+      } else if (nextCategory === "Debt" && !nextToAccountId) {
+        nextToAccountId = await resolvePaydownTargetId(
+          null,
+          nextCategory,
+          nextTitle,
+          dbTx
+        );
+      }
+
+      let targetAccount = null;
+      if (nextToAccountId) {
+        targetAccount = await Account.findByPk(nextToAccountId, {
+          transaction: dbTx,
+        });
+      }
+
+      const isCreditCardPayment =
+        targetAccount && targetAccount.type === "CREDIT_CARD";
+      const nextType = isCreditCardPayment
+        ? "TRANSFER"
+        : trx.type === "TRANSFER" && !isCreditCardPayment
+        ? "EXPENSE"
+        : trx.type;
+
+      await trx.update(
+        {
+          title: nextTitle,
+          amount:
+            req.body.amount !== undefined
+              ? parseFloat(req.body.amount)
+              : trx.amount,
+          date: req.body.due_date || req.body.payment_date || trx.date,
+          type: nextType,
+          category:
+            isCreditCardPayment && nextCategory === "Debt"
+              ? "Credit Card Payment"
+              : nextCategory,
+          isCleared:
+            req.body.is_paid !== undefined
+              ? Boolean(req.body.is_paid)
+              : trx.isCleared,
+          recurrence: req.body.recurrence || trx.recurrence,
+          fromAccountId,
+          toAccountId: nextToAccountId,
+        },
+        { transaction: dbTx }
+      );
+
+      // Apply updated transaction's effect on linked account
+      await adjustAccountForTransaction(trx, 1, dbTx);
+
+      await dbTx.commit();
+      res.json(trx);
+    } catch (error) {
       await dbTx.rollback();
-      return res.status(404).send("Not found");
+      throw error;
     }
+  })
+);
 
-    await adjustAccountForTransaction(trx, -1, dbTx);
-    await trx.destroy({ transaction: dbTx });
+router.post(
+  "/expenses/bulk-delete",
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const { ids } = req.body;
+      if (!Array.isArray(ids) || ids.length === 0) {
+        await dbTx.rollback();
+        return res.status(400).json({ error: "No transaction IDs provided." });
+      }
 
-    await dbTx.commit();
-    res.status(204).send();
-  } catch (error) {
-    await dbTx.rollback();
-    res.status(500).json({ error: error.message });
-  }
-});
+      const toDelete = await Transaction.findAll({
+        where: { id: { [Op.in]: ids } },
+        transaction: dbTx,
+      });
+
+      for (const trx of toDelete) {
+        await adjustAccountForTransaction(trx, -1, dbTx);
+      }
+
+      const deletedCount = await Transaction.destroy({
+        where: { id: { [Op.in]: ids } },
+        transaction: dbTx,
+      });
+
+      await dbTx.commit();
+      res.json({ deletedCount });
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
+    }
+  })
+);
+
+router.delete(
+  "/expenses/:id",
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const trx = await Transaction.findByPk(req.params.id, {
+        transaction: dbTx,
+      });
+      if (!trx) {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Transaction not found" });
+      }
+
+      await adjustAccountForTransaction(trx, -1, dbTx);
+      await trx.destroy({ transaction: dbTx });
+
+      await dbTx.commit();
+      res.status(204).send();
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
+    }
+  })
+);
 
 module.exports = router;
