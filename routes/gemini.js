@@ -1,10 +1,13 @@
 const express = require("express");
 const { GoogleGenAI } = require("@google/genai");
-const { Transaction } = require("../models");
-const { addDays, isSameMonth, isAfter, format } = require("date-fns");
+const { sequelize, Transaction, Account } = require("../models");
+const { Op } = require("sequelize");
+const { toZonedTime, format } = require("date-fns-tz");
+const { getNextOccurrenceDate } = require("./recurring");
 const authMiddleware = require("../middleware/authMiddleware");
 const router = express.Router();
 
+const TIMEZONE = "America/Toronto";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-2.5-flash";
 
@@ -17,6 +20,7 @@ if (GEMINI_API_KEY) {
 
 router.use(authMiddleware);
 
+// --- 1. STRUCTURED FINANCIAL ADVICE ---
 router.post("/financial-advice", async (req, res) => {
   if (!ai) {
     return res.status(500).json({ error: "AI service is not configured." });
@@ -42,7 +46,11 @@ router.post("/financial-advice", async (req, res) => {
         .json({ error: "Incomplete financial data provided." });
     }
 
-    // Mathematical Paycheque Projection Engine
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const currentMonthPrefix = todayStr.slice(0, 7);
+
+    // Dynamic Mathematical Paycheque Projection Engine
     let projectedIncomeText =
       "No future income accurately projected for the rest of this month.";
     let totalProjectedAmount = 0;
@@ -50,7 +58,7 @@ router.post("/financial-advice", async (req, res) => {
       const recentPaycheques = await Transaction.findAll({
         where: { type: "INCOME" },
         order: [["date", "DESC"]],
-        limit: 3,
+        limit: 5,
       });
 
       if (recentPaycheques.length > 0) {
@@ -60,21 +68,50 @@ router.post("/financial-advice", async (req, res) => {
         );
         const averageAmount = totalAmount / recentPaycheques.length;
 
-        let lastDate = new Date(`${recentPaycheques[0].date}T12:00:00`);
-        const today = new Date();
-        let nextDate = addDays(lastDate, 14);
-
-        let totalProjectedInLoop = 0;
-        let upcomingDates = [];
-
-        while (!isAfter(nextDate, today)) {
-          nextDate = addDays(nextDate, 14);
+        // Detect recurrence cadence dynamically
+        let cadence = "bi-weekly";
+        if (
+          recentPaycheques[0].recurrence &&
+          ["weekly", "bi-weekly", "monthly"].includes(
+            recentPaycheques[0].recurrence
+          )
+        ) {
+          cadence = recentPaycheques[0].recurrence;
+        } else if (recentPaycheques.length >= 2) {
+          const [y1, m1, d1] = recentPaycheques[0].date.split("-").map(Number);
+          const [y2, m2, d2] = recentPaycheques[1].date.split("-").map(Number);
+          const diffDays = Math.round(
+            Math.abs(Date.UTC(y1, m1 - 1, d1) - Date.UTC(y2, m2 - 1, d2)) /
+              (1000 * 60 * 60 * 24)
+          );
+          if (diffDays >= 6 && diffDays <= 8) cadence = "weekly";
+          else if (diffDays >= 12 && diffDays <= 17) cadence = "bi-weekly";
+          else if (diffDays >= 27) cadence = "monthly";
         }
 
-        while (isSameMonth(nextDate, today)) {
-          upcomingDates.push(format(nextDate, "MMM do"));
-          totalProjectedInLoop += averageAmount;
-          nextDate = addDays(nextDate, 14);
+        let upcomingDates = [];
+        let totalProjectedInLoop = 0;
+        let step = 1;
+
+        while (step <= 10) {
+          const nextDateStr = getNextOccurrenceDate(
+            recentPaycheques[0].date,
+            cadence,
+            step
+          );
+          if (!nextDateStr) break;
+
+          // Only project dates falling strictly within the remainder of the current month
+          if (nextDateStr.startsWith(currentMonthPrefix)) {
+            if (nextDateStr > todayStr) {
+              upcomingDates.push(nextDateStr);
+              totalProjectedInLoop += averageAmount;
+            }
+          } else if (nextDateStr > todayStr) {
+            // Crossed into next month
+            break;
+          }
+          step++;
         }
 
         if (upcomingDates.length > 0) {
@@ -83,7 +120,7 @@ router.post("/financial-advice", async (req, res) => {
             2
           )} total, arriving across ${
             upcomingDates.length
-          } upcoming paychecks (${upcomingDates.join(" and ")}).`;
+          } upcoming paycheque(s) (${upcomingDates.join(", ")}).`;
         }
       }
     } catch (err) {
@@ -98,77 +135,172 @@ router.post("/financial-advice", async (req, res) => {
       monthlySummary.netFlow + totalProjectedAmount - upcomingBillsTotal;
 
     const prompt = `
-      As a financial advisor for a user named Maverick, provide a short, actionable financial tip based on the following data for the current month.
+You are a premier personal financial strategist for Maverick.
+Analyze this financial snapshot for the current month:
 
-      1.  **Current Cash Snapshot:**
-          * Total Income Received: $${monthlySummary.totalIncome.toFixed(2)}
-          * Total Past Spending: $${monthlySummary.totalSpending.toFixed(2)}
-          * Current Live Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}
+1. Current Cash Snapshot:
+- Total Income Received So Far: $${monthlySummary.totalIncome.toFixed(2)}
+- Total Spending So Far: $${monthlySummary.totalSpending.toFixed(2)}
+- Current Live Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}
 
-      2.  **Required Upcoming Bill Deductions:**
-          * You have the following unpaid bills due: ${
-            allUpcomingBills.length > 0
-              ? allUpcomingBills
-                  .map(
-                    (bill) =>
-                      `${bill.title || bill.name} ($${bill.amount}) on ${
-                        bill.date || bill.due_date
-                      }`
-                  )
-                  .join(", ")
-              : "None"
-          }.
-          * Total Upcoming Bill Burden: $${upcomingBillsTotal.toFixed(2)}
+2. Upcoming Bills Due Before Month End:
+${
+  allUpcomingBills.length > 0
+    ? allUpcomingBills
+        .map(
+          (b) =>
+            `- ${b.title || b.name}: $${parseFloat(b.amount).toFixed(2)} on ${
+              b.date || b.due_date
+            }`
+        )
+        .join("\n")
+    : "- None"
+}
+- Total Upcoming Bill Burden: $${upcomingBillsTotal.toFixed(2)}
 
-      3.  **Projected Upcoming Paycheques (Rest of Month):**
-          * ${projectedIncomeText}
+3. Projected Upcoming Income:
+- ${projectedIncomeText}
 
-      4.  **Mathematically Verified End-of-Month Float:**
-          * Guaranteed Remaining Cash (Net Flow + Projected Income - Upcoming Bills): $${finalProjectedCashflow.toFixed(
-            2
-          )}
+4. Mathematically Verified End-of-Month Float:
+- Guaranteed Remaining Cash (Net Flow + Projected Income - Upcoming Bills): $${finalProjectedCashflow.toFixed(
+      2
+    )}
 
-      5.  **Active Savings Goals:**
-          * ${
-            savingsSummary.length > 0
-              ? savingsSummary
-                  .map(
-                    (goal) =>
-                      `${goal.name}: $${parseFloat(
-                        goal.initialBalance ?? goal.current_amount ?? 0
-                      ).toFixed(2)} saved out of $${parseFloat(
-                        goal.targetAmount ?? goal.goal_amount ?? 0
-                      ).toFixed(2)} goal.`
-                  )
-                  .join("\n          * ")
-              : "No active savings goals."
-          }
+5. Debts & Credit Cards:
+${
+  debtSummary.length > 0
+    ? debtSummary
+        .map(
+          (d) =>
+            `- Debt: ${d.name}, Balance: $${parseFloat(
+              d.initialBalance || 0
+            ).toFixed(2)}, Min Pay: $${parseFloat(
+              d.minimumPayment || 0
+            ).toFixed(2)}`
+        )
+        .join("\n")
+    : "- No debts."
+}
+${
+  creditCardSummary.length > 0
+    ? creditCardSummary
+        .map(
+          (c) =>
+            `- Credit Card: ${c.name}, Balance: $${parseFloat(
+              c.currentBalance || c.initialBalance || 0
+            ).toFixed(2)}, Limit: $${parseFloat(c.creditLimit || 0).toFixed(2)}`
+        )
+        .join("\n")
+    : "- No credit cards."
+}
 
-      Based on this absolute picture: 
-      The most important number is the **End-of-Month Float** ($${finalProjectedCashflow.toFixed(
-        2
-      )}). 
-      If it is negative, tell them immediately to stop non-essential spending.
-      If it is highly positive, advise them specifically on which exact "Active Savings Goal" they should allocate their leftover surplus into!
-      Keep the final response short and human-readable, and specifically call out the End-of-Month float number.
-    `;
+6. Active Savings Goals:
+${
+  savingsSummary.length > 0
+    ? savingsSummary
+        .map(
+          (g) =>
+            `- Goal: ${g.name}, Saved: $${parseFloat(
+              g.initialBalance || g.current_amount || 0
+            ).toFixed(2)} / Target: $${parseFloat(
+              g.targetAmount || g.goal_amount || 0
+            ).toFixed(2)}`
+        )
+        .join("\n")
+    : "- No active goals."
+}
+
+CRITICAL INSTRUCTIONS:
+Respond with ONLY a valid raw JSON object (no markdown code blocks, no backticks, no extra text) matching this schema:
+{
+  "healthStatus": "${
+    finalProjectedCashflow < 0
+      ? "warning"
+      : finalProjectedCashflow < 200
+      ? "caution"
+      : "healthy"
+  }",
+  "headline": "Short punchy status (e.g., Safe Float: +$450 projected or Tight Margin ahead)",
+  "floatAmount": ${finalProjectedCashflow.toFixed(2)},
+  "summary": "2-3 concise, encouraging sentences directly addressing Maverick.",
+  "tacticalActions": [
+    "Specific action #1 with exact dollar amounts or accounts",
+    "Specific action #2"
+  ],
+  "spendingAlert": "1-sentence note on an area to monitor (or null if all balanced)"
+}
+`;
 
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
       contents: prompt,
     });
-    res.json({ advice: response.text || "" });
+
+    const rawText = (response.text || "").trim();
+    let structured = null;
+
+    try {
+      const cleanJson = rawText
+        .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/, "")
+        .replace(/\s*```$/, "")
+        .trim();
+      structured = JSON.parse(cleanJson);
+    } catch {
+      structured = {
+        healthStatus:
+          finalProjectedCashflow < 0
+            ? "warning"
+            : finalProjectedCashflow < 200
+            ? "caution"
+            : "healthy",
+        headline: `End-of-Month Float: $${finalProjectedCashflow.toFixed(2)}`,
+        floatAmount: finalProjectedCashflow,
+        summary: rawText,
+        tacticalActions: [
+          finalProjectedCashflow < 0
+            ? "Pause discretionary spending to protect upcoming bills."
+            : "Allocate leftover float towards high-priority debt or emergency fund.",
+        ],
+        spendingAlert: null,
+      };
+    }
+
+    res.json({
+      advice: structured.summary || rawText,
+      structured,
+    });
   } catch (error) {
     console.error("Gemini financial advice error:", error);
     res.status(500).json({ error: "Failed to generate financial advice." });
   }
 });
 
+// --- 2. SMART AUTO-CATEGORIZATION (History First + Gemini Fallback) ---
 router.post("/categorize-expense", async (req, res) => {
-  if (!ai) {
-    return res.status(500).json({ error: "AI service is not configured." });
+  const expenseName = (req.body.name || "").trim();
+  if (!expenseName) {
+    return res.json({ category: "Other", source: "default" });
   }
+
   try {
+    // 1. Check user's own past transaction history (0ms latency, zero API cost, 100% personalized)
+    const pastTx = await Transaction.findOne({
+      where: sequelize.where(
+        sequelize.fn("LOWER", sequelize.col("title")),
+        expenseName.toLowerCase()
+      ),
+      order: [["createdAt", "DESC"]],
+    });
+
+    if (pastTx && pastTx.category && pastTx.category !== "Other") {
+      return res.json({ category: pastTx.category, source: "history" });
+    }
+
+    if (!ai) {
+      return res.json({ category: "Other", source: "default" });
+    }
+
     const validCategories = [
       "Essentials",
       "Subscription",
@@ -182,9 +314,9 @@ router.post("/categorize-expense", async (req, res) => {
 
     const prompt = `Categorize the following expense into exactly one of these categories: ${validCategories.join(
       ", "
-    )}. 
-    Return ONLY the exact category name and absolutely nothing else. Do not include any explanations, asterisks, or markdown formatting.
-    Expense: "${req.body.name}"`;
+    )}.
+Return ONLY the exact category name and absolutely nothing else.
+Expense: "${expenseName}"`;
 
     const response = await ai.models.generateContent({
       model: GEMINI_MODEL,
@@ -200,11 +332,204 @@ router.post("/categorize-expense", async (req, res) => {
       }
     }
 
-    res.json({ category: finalCategory });
+    res.json({ category: finalCategory, source: "ai" });
   } catch (error) {
     console.error("Gemini categorization error:", error);
-    res.status(500).json({ error: "Failed to categorize expense." });
+    res.json({ category: "Other", source: "fallback" });
+  }
+});
+
+// --- 3. INTERACTIVE FINANCIAL CHAT ASSISTANT ("Chat with your Money") ---
+router.post("/chat-advisor", async (req, res) => {
+  if (!ai) {
+    return res.status(500).json({ error: "AI service is not configured." });
+  }
+
+  const userMessage = (req.body.message || "").trim();
+  if (!userMessage) {
+    return res.status(400).json({ error: "Message is required." });
+  }
+
+  const conversationHistory = Array.isArray(req.body.history)
+    ? req.body.history
+    : [];
+
+  try {
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const currentMonthPrefix = todayStr.slice(0, 7);
+
+    // Fetch comprehensive live financial reality
+    const [
+      accounts,
+      recentTransactions,
+      monthExpenses,
+      monthIncome,
+      upcomingBills,
+    ] = await Promise.all([
+      Account.findAll({ order: [["type", "ASC"], ["name", "ASC"]] }),
+      Transaction.findAll({
+        order: [
+          ["date", "DESC"],
+          ["createdAt", "DESC"],
+        ],
+        limit: 30,
+      }),
+      Transaction.sum("amount", {
+        where: {
+          type: "EXPENSE",
+          isCleared: true,
+          date: { [Op.startsWith]: currentMonthPrefix },
+        },
+      }),
+      Transaction.sum("amount", {
+        where: {
+          type: "INCOME",
+          isCleared: true,
+          date: { [Op.startsWith]: currentMonthPrefix },
+        },
+      }),
+      Transaction.findAll({
+        where: {
+          type: "EXPENSE",
+          isCleared: false,
+          date: { [Op.gte]: todayStr },
+        },
+        order: [["date", "ASC"]],
+        limit: 10,
+      }),
+    ]);
+
+    const checking = accounts.find((a) => a.type === "CHECKING");
+    const cards = accounts.filter((a) => a.type === "CREDIT_CARD");
+    const debts = accounts.filter((a) => a.type === "DEBT");
+    const goals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
+
+    const systemPrompt = `
+You are Maverick's elite personal financial advisor and money strategist inside the FinTrack application.
+Today's date is ${todayStr}.
+
+LIVE FINANCIAL REALITY FOR MAVERICK:
+- Checking Account: ${
+      checking
+        ? `${checking.name} (Current Balance: $${parseFloat(
+            checking.initialBalance || 0
+          ).toFixed(2)})`
+        : "Primary Checking ($0.00)"
+    }
+- Current Month Cash Flow: Total Cleared Income: $${(
+      parseFloat(monthIncome) || 0
+    ).toFixed(2)} | Total Cleared Spending: $${(
+      parseFloat(monthExpenses) || 0
+    ).toFixed(2)} | Net Cash Flow: $${(
+      (parseFloat(monthIncome) || 0) - (parseFloat(monthExpenses) || 0)
+    ).toFixed(2)}
+- Credit Cards:
+${
+  cards
+    .map(
+      (c) =>
+        `  * ${c.name}: Balance $${parseFloat(c.initialBalance || 0).toFixed(
+          2
+        )} / Limit $${parseFloat(c.creditLimit || 0).toFixed(2)}`
+    )
+    .join("\n") || "  None"
+}
+- Debts:
+${
+  debts
+    .map(
+      (d) =>
+        `  * ${d.name}: Balance $${parseFloat(d.initialBalance || 0).toFixed(
+          2
+        )}, Min Pay $${parseFloat(d.minimumPayment || 0).toFixed(
+          2
+        )}, Interest: ${d.interestRate ? `${d.interestRate}%` : "N/A"}`
+    )
+    .join("\n") || "  None"
+}
+- Savings Goals:
+${
+  goals
+    .map(
+      (g) =>
+        `  * ${g.name}: $${parseFloat(g.initialBalance || 0).toFixed(
+          2
+        )} saved / Target $${parseFloat(g.targetAmount || 0).toFixed(2)}`
+    )
+    .join("\n") || "  None"
+}
+- Upcoming Unpaid Bills:
+${
+  upcomingBills
+    .map(
+      (b) =>
+        `  * ${b.title}: $${parseFloat(b.amount).toFixed(2)} due on ${b.date}`
+    )
+    .join("\n") || "  None"
+}
+- Recent Transactions (Past 30):
+${recentTransactions
+  .map(
+    (t) =>
+      `  * ${t.date} | ${t.type} | ${t.title} | $${parseFloat(t.amount).toFixed(
+        2
+      )} | Category: ${t.category} | Cleared: ${t.isCleared}`
+  )
+  .join("\n")}
+
+BEHAVIOR GUIDELINES:
+1. Address Maverick personally, warmly, and directly.
+2. Be mathematically precise, concise, and pragmatic.
+3. If Maverick asks "Can I afford X?", calculate the impact on their checking balance, upcoming bills, and remaining float. Provide a direct, actionable answer.
+4. Format responses using clean GitHub markdown (bold key amounts, use concise bullet points).
+5. Never output generic boilerplate or disclaimers; speak as a trusted, highly capable personal financial co-pilot.
+`;
+
+    const contents = [
+      {
+        role: "user",
+        parts: [
+          { text: systemPrompt + "\n\nPlease confirm you understand your role." },
+        ],
+      },
+      {
+        role: "model",
+        parts: [
+          {
+            text: "Understood! I'm ready with Maverick's complete financial snapshot. How can I help you optimize your money today?",
+          },
+        ],
+      },
+    ];
+
+    for (const msg of conversationHistory.slice(-8)) {
+      if (msg.role === "user" || msg.role === "model") {
+        contents.push({
+          role: msg.role,
+          parts: [{ text: msg.text || msg.content || "" }],
+        });
+      }
+    }
+
+    contents.push({
+      role: "user",
+      parts: [{ text: userMessage }],
+    });
+
+    const response = await ai.models.generateContent({
+      model: GEMINI_MODEL,
+      contents,
+    });
+
+    res.json({ reply: response.text || "" });
+  } catch (error) {
+    console.error("Gemini chat advisor error:", error);
+    res
+      .status(500)
+      .json({ error: "Failed to generate response from AI advisor." });
   }
 });
 
 module.exports = router;
+

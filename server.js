@@ -77,6 +77,7 @@ app.use(express.json());
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/financial-advice", aiLimiter);
 app.use("/api/categorize-expense", aiLimiter);
+app.use("/api/chat-advisor", aiLimiter);
 app.use("/api", apiLimiter);
 
 // --- API ROUTES ---
@@ -131,7 +132,8 @@ async function initialize() {
 
     const syncOptions =
       process.env.DB_ALTER_SYNC === "true" ||
-      process.env.NODE_ENV !== "production"
+      (process.env.NODE_ENV !== "production" &&
+        sequelize.getDialect() !== "sqlite")
         ? { alter: true }
         : undefined;
     await sequelize.sync(syncOptions);
