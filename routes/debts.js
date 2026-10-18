@@ -139,14 +139,32 @@ router.post(
 router.delete(
   "/debts/:id",
   asyncHandler(async (req, res) => {
-    const debt = await Account.findByPk(req.params.id);
-    if (debt && debt.type === "DEBT") {
-      // Soft-delete to preserve transaction history and maintain accurate checking ledger
-      debt.isActive = false;
-      await debt.save();
+    const dbTx = await sequelize.transaction();
+    try {
+      const debt = await Account.findByPk(req.params.id, { transaction: dbTx });
+      if (!debt || debt.type !== "DEBT") {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Debt not found" });
+      }
+
+      // Unlink any transactions referencing this debt so transaction history is preserved
+      await Transaction.update(
+        { fromAccountId: null },
+        { where: { fromAccountId: debt.id }, transaction: dbTx }
+      );
+      await Transaction.update(
+        { toAccountId: null },
+        { where: { toAccountId: debt.id }, transaction: dbTx }
+      );
+
+      // Truly delete the debt record from the database
+      await debt.destroy({ transaction: dbTx });
+
+      await dbTx.commit();
       res.status(204).send();
-    } else {
-      res.status(404).json({ error: "Debt not found" });
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
     }
   })
 );

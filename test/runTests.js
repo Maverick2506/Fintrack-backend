@@ -176,8 +176,8 @@ async function runTestSuite() {
     assert(restoredCard && parseFloat(restoredCard.currentBalance) === 400, "Deleting payment cleanly restores balance to $400 without clamping loss");
   }
 
-  // 5. Soft-Delete & Data Preservation Tests
-  console.log("\n--- Suite 5: Soft-Delete & CASCADE Protection ---");
+  // 5. Permanent Deletion & CASCADE Protection Tests
+  console.log("\n--- Suite 5: Hard-Delete & CASCADE Protection ---");
   const testExp = await request({
     hostname: "localhost",
     port: 8000,
@@ -200,7 +200,7 @@ async function runTestSuite() {
     method: "DELETE",
     headers: authHeaders,
   });
-  assert(delCard.status === 204, "Card soft-deleted with HTTP 204");
+  assert(delCard.status === 204, "Card deleted with HTTP 204");
 
   const activeCards = await request({
     hostname: "localhost",
@@ -210,7 +210,67 @@ async function runTestSuite() {
     headers: authHeaders,
   });
   const activeMatch = (activeCards.body || []).find((c) => c.id === cardId);
-  assert(!activeMatch, "Soft-deleted card omitted from active cards query");
+  assert(!activeMatch, "Deleted card omitted from active cards query");
+
+  // Deleting debt permanently removes debt
+  const testDebt = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Test Delete Debt",
+    total_amount: 500,
+    monthly_payment: 50,
+  });
+  assert(testDebt.status === 201 && testDebt.body.id, "Created test debt for deletion");
+  const delDebt = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/debts/${testDebt.body.id}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(delDebt.status === 204, "Debt deleted with HTTP 204");
+  const activeDebts = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(!(activeDebts.body || []).find((d) => d.id === testDebt.body.id), "Deleted debt omitted from debts query");
+
+  // Deleting savings goal permanently removes goal
+  const testGoal = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Test Delete Goal",
+    target_amount: 1000,
+    current_amount: 100,
+  });
+  assert(testGoal.status === 201 && testGoal.body.id, "Created test savings goal for deletion");
+  const delGoal = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/savings-goals/${testGoal.body.id}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(delGoal.status === 204, "Savings goal deleted with HTTP 204");
+  const activeGoals = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(!(activeGoals.body || []).find((g) => g.id === testGoal.body.id), "Deleted savings goal omitted from savings goals query");
 
   const ledgerAfterDel = await request({
     hostname: "localhost",

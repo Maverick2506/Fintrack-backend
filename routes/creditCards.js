@@ -103,14 +103,32 @@ router.post(
 router.delete(
   "/credit-cards/:id",
   asyncHandler(async (req, res) => {
-    const card = await Account.findByPk(req.params.id);
-    if (card && card.type === "CREDIT_CARD") {
-      // Soft-delete to preserve transaction history and maintain accurate checking ledger
-      card.isActive = false;
-      await card.save();
+    const dbTx = await sequelize.transaction();
+    try {
+      const card = await Account.findByPk(req.params.id, { transaction: dbTx });
+      if (!card || card.type !== "CREDIT_CARD") {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Credit Card not found" });
+      }
+
+      // Unlink any transactions referencing this card so transaction history is preserved
+      await Transaction.update(
+        { fromAccountId: null },
+        { where: { fromAccountId: card.id }, transaction: dbTx }
+      );
+      await Transaction.update(
+        { toAccountId: null },
+        { where: { toAccountId: card.id }, transaction: dbTx }
+      );
+
+      // Truly delete the credit card record from the database
+      await card.destroy({ transaction: dbTx });
+
+      await dbTx.commit();
       res.status(204).send();
-    } else {
-      res.status(404).json({ error: "Credit Card not found" });
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
     }
   })
 );

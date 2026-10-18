@@ -66,14 +66,32 @@ router.post(
 router.delete(
   "/savings-goals/:id",
   asyncHandler(async (req, res) => {
-    const goal = await Account.findByPk(req.params.id);
-    if (goal && goal.type === "SAVINGS_GOAL") {
-      // Soft-delete to preserve contribution history and checking transfer ledger
-      goal.isActive = false;
-      await goal.save();
+    const dbTx = await sequelize.transaction();
+    try {
+      const goal = await Account.findByPk(req.params.id, { transaction: dbTx });
+      if (!goal || goal.type !== "SAVINGS_GOAL") {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Savings Goal not found" });
+      }
+
+      // Unlink any transactions referencing this savings goal so contribution history is preserved
+      await Transaction.update(
+        { fromAccountId: null },
+        { where: { fromAccountId: goal.id }, transaction: dbTx }
+      );
+      await Transaction.update(
+        { toAccountId: null },
+        { where: { toAccountId: goal.id }, transaction: dbTx }
+      );
+
+      // Truly delete the savings goal record from the database
+      await goal.destroy({ transaction: dbTx });
+
+      await dbTx.commit();
       res.status(204).send();
-    } else {
-      res.status(404).json({ error: "Savings Goal not found" });
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
     }
   })
 );
