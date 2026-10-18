@@ -32,6 +32,7 @@ const geminiRoutes = require("./routes/gemini");
 const creditCardRoutes = require("./routes/creditCards");
 const paychequeRoutes = require("./routes/paycheques");
 const cronRoutes = require("./routes/cron");
+const exportRoutes = require("./routes/export");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -82,6 +83,7 @@ app.use("/api", apiLimiter);
 
 // --- API ROUTES ---
 app.use("/api/auth", authRoutes);
+app.use("/api/export", exportRoutes);
 app.use("/api", cronRoutes);
 app.use("/api", expenseRoutes);
 app.use("/api", debtRoutes);

@@ -638,7 +638,7 @@ async function runTestSuite() {
   const nov1stRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === "2026-11-01");
   assert(nov1stRent, "Next recurring rent instance generated on exactly November 1st (2026-11-01)");
 
-  // Clean up
+  // Clean up recurring rent test transactions
   await request({
     hostname: "localhost",
     port: 8000,
@@ -655,6 +655,98 @@ async function runTestSuite() {
       headers: authHeaders,
     });
   }
+
+  // 10. Gemini Gem & Live Feed Export
+  console.log("\n--- Suite 10: Gemini Gem & Live Feed Export ---");
+  const missingKeyRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/financial-feed.csv",
+    method: "GET",
+  });
+  assert(missingKeyRes.status === 401, "Rejects feed request without key with HTTP 401");
+
+  const invalidKeyRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/financial-feed.csv?key=invalid-secret-key-12345",
+    method: "GET",
+  });
+  assert(invalidKeyRes.status === 401, "Rejects feed request with invalid key with HTTP 401");
+
+  const geminiConfigRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/gemini-config",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(
+    geminiConfigRes.status === 200 &&
+      geminiConfigRes.body.feedKey &&
+      geminiConfigRes.body.sheetFormula &&
+      geminiConfigRes.body.instructions,
+    "GET /api/export/gemini-config returns valid feedKey, sheetFormula, and instructions"
+  );
+  const activeFeedKey = geminiConfigRes.body.feedKey;
+
+  const validCsvRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/export/financial-feed.csv?key=${activeFeedKey}`,
+    method: "GET",
+  });
+  assert(
+    validCsvRes.status === 200 &&
+      validCsvRes.headers["content-type"].includes("text/csv") &&
+      validCsvRes.raw.includes("OVERVIEW") &&
+      validCsvRes.raw.includes("ACCOUNTS"),
+    "Returns formatted CSV feed containing OVERVIEW and ACCOUNTS sections"
+  );
+
+  const validMdRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/export/financial-feed.md?key=${activeFeedKey}`,
+    method: "GET",
+  });
+  assert(
+    validMdRes.status === 200 &&
+      validMdRes.headers["content-type"].includes("text/markdown") &&
+      validMdRes.raw.includes("# FINTRACK FINANCIAL SNAPSHOT"),
+    "Returns formatted Markdown snapshot with executive summary"
+  );
+
+  const regenRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/regenerate-key",
+    method: "POST",
+    headers: authHeaders,
+  });
+  assert(
+    regenRes.status === 200 &&
+      regenRes.body.feedKey &&
+      regenRes.body.feedKey !== activeFeedKey,
+    "Regenerates new secret feed token"
+  );
+  const newFeedKey = regenRes.body.feedKey;
+
+  const oldKeyRevoked = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/export/financial-feed.csv?key=${activeFeedKey}`,
+    method: "GET",
+  });
+  assert(oldKeyRevoked.status === 401, "Revoked feed key is immediately rejected with HTTP 401");
+
+  const newKeyWorks = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/export/financial-feed.csv?key=${newFeedKey}`,
+    method: "GET",
+  });
+  assert(newKeyWorks.status === 200, "New regenerated feed key serves live CSV feed with HTTP 200");
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
