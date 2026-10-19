@@ -127,7 +127,9 @@ const getFinancialData = async () => {
   }
 
   const creditCards = accounts.filter((a) => a.type === "CREDIT_CARD");
-  const debts = accounts.filter((a) => a.type === "DEBT");
+  const debts = accounts.filter(
+    (a) => a.type === "DEBT" && parseFloat(a.initialBalance || 0) > 0 && a.isActive !== false
+  );
   const savingsGoals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
 
   const totalCC = creditCards.reduce((s, c) => s + parseFloat(c.initialBalance || 0), 0);

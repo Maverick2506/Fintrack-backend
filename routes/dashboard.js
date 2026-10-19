@@ -133,7 +133,11 @@ router.get(
       upcomingBillsQuery,
       upcomingBillsQuery,
       Account.findAll({
-        where: { type: "DEBT", isActive: { [Op.ne]: false } },
+        where: {
+          type: "DEBT",
+          isActive: { [Op.ne]: false },
+          initialBalance: { [Op.gt]: 0 },
+        },
         order: [["createdAt", "ASC"]],
       }),
       Account.findAll({
@@ -187,7 +191,9 @@ router.get(
       (parseFloat(allTimeTransfersIn) || 0);
 
     const checkingCurrentBalance =
-      (parseFloat(checking.initialBalance) || 0) + netCheckingActivity;
+      Math.round(
+        ((parseFloat(checking.initialBalance) || 0) + netCheckingActivity) * 100
+      ) / 100;
 
     const spendingSummary = (spendingByCategoryRaw || []).map((item) => ({
       name: item.category,

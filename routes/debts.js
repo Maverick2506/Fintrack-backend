@@ -17,6 +17,7 @@ const getTodayString = () =>
 
 const formatDebtResponse = (d) => {
   const json = d.toJSON ? d.toJSON() : d;
+  const isPaidDown = parseFloat(json.initialBalance || 0) <= 0;
   return {
     ...json,
     total_amount: json.targetAmount ?? json.initialBalance,
@@ -26,6 +27,8 @@ const formatDebtResponse = (d) => {
     auto_pay: Boolean(json.autoPay),
     payment_frequency: json.paymentFrequency || "monthly",
     interest_rate: json.interestRate,
+    is_paid_down: isPaidDown,
+    is_archived: isPaidDown || json.isActive === false,
   };
 };
 
@@ -109,7 +112,10 @@ router.post(
         });
       }
 
-      debt.initialBalance = remainingDebt - paymentAmount;
+      debt.initialBalance = Math.max(
+        0,
+        Math.round((remainingDebt - paymentAmount) * 100) / 100
+      );
       await debt.save({ transaction: dbTx });
 
       // Record as EXPENSE under "Debt" category so it registers in both Monthly Expenses/Analytics AND Debt paydown
