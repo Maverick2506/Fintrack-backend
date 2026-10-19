@@ -4,7 +4,8 @@ const { toZonedTime, format } = require("date-fns-tz");
 const { Op } = require("sequelize");
 const { sequelize, Account, Transaction, Setting } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
-const { getNextOccurrenceDate } = require("./recurring");
+const { getCalculatedCheckingBalance } = require("../services/checkingService");
+const { getPaychequeProjection } = require("../services/projectionService");
 
 const router = express.Router();
 const TIMEZONE = "America/Toronto";
@@ -87,44 +88,7 @@ const getFinancialData = async () => {
     ]);
 
   const checkingAcc = accounts.find((a) => a.type === "CHECKING");
-  let checkingBalance = parseFloat(checkingAcc?.initialBalance || 0);
-  if (checkingAcc) {
-    const [
-      allTimeIncome,
-      allTimeCheckingExp,
-      allTimeTransfersOut,
-      allTimeTransfersIn,
-    ] = await Promise.all([
-      Transaction.sum("amount", {
-        where: {
-          type: "INCOME",
-          isCleared: true,
-          date: { [Op.lte]: todayStr },
-          [Op.or]: [{ toAccountId: checkingAcc.id }, { toAccountId: null }],
-        },
-      }),
-      Transaction.sum("amount", {
-        where: {
-          type: "EXPENSE",
-          isCleared: true,
-          fromAccountId: checkingAcc.id,
-        },
-      }),
-      Transaction.sum("amount", {
-        where: { type: "TRANSFER", fromAccountId: checkingAcc.id },
-      }),
-      Transaction.sum("amount", {
-        where: { type: "TRANSFER", toAccountId: checkingAcc.id },
-      }),
-    ]);
-    const netCheckingActivity =
-      (parseFloat(allTimeIncome) || 0) -
-      (parseFloat(allTimeCheckingExp) || 0) -
-      (parseFloat(allTimeTransfersOut) || 0) +
-      (parseFloat(allTimeTransfersIn) || 0);
-    checkingBalance =
-      Math.round((checkingBalance + netCheckingActivity) * 100) / 100;
-  }
+  const checkingBalance = await getCalculatedCheckingBalance(checkingAcc, todayStr);
 
   const creditCards = accounts.filter((a) => a.type === "CREDIT_CARD");
   const allDebts = accounts.filter((a) => a.type === "DEBT");
@@ -149,50 +113,9 @@ const getFinancialData = async () => {
   let totalProjectedIncome = 0;
   let projectedPaychequeDates = [];
   try {
-    const recentPaycheques = await Transaction.findAll({
-      where: { type: "INCOME" },
-      order: [["date", "DESC"]],
-      limit: 5,
-    });
-
-    if (recentPaycheques.length > 0) {
-      const avgAmt =
-        recentPaycheques.reduce((sum, p) => sum + parseFloat(p.amount), 0) /
-        recentPaycheques.length;
-
-      let cadence = "bi-weekly";
-      if (
-        recentPaycheques[0].recurrence &&
-        ["weekly", "bi-weekly", "monthly"].includes(recentPaycheques[0].recurrence)
-      ) {
-        cadence = recentPaycheques[0].recurrence;
-      } else if (recentPaycheques.length >= 2) {
-        const [y1, m1, d1] = recentPaycheques[0].date.split("-").map(Number);
-        const [y2, m2, d2] = recentPaycheques[1].date.split("-").map(Number);
-        const diffDays = Math.round(
-          Math.abs(Date.UTC(y1, m1 - 1, d1) - Date.UTC(y2, m2 - 1, d2)) /
-            (1000 * 60 * 60 * 24)
-        );
-        if (diffDays >= 6 && diffDays <= 8) cadence = "weekly";
-        else if (diffDays >= 12 && diffDays <= 17) cadence = "bi-weekly";
-        else if (diffDays >= 27) cadence = "monthly";
-      }
-
-      let step = 1;
-      while (step <= 10) {
-        const nextDateStr = getNextOccurrenceDate(recentPaycheques[0].date, cadence, step);
-        if (!nextDateStr) break;
-        if (nextDateStr.startsWith(currentMonthPrefix)) {
-          if (nextDateStr > todayStr) {
-            projectedPaychequeDates.push(nextDateStr);
-            totalProjectedIncome += avgAmt;
-          }
-        } else if (nextDateStr > todayStr) {
-          break;
-        }
-        step++;
-      }
-    }
+    const projection = await getPaychequeProjection(todayStr, currentMonthPrefix);
+    totalProjectedIncome = projection.totalProjectedIncome;
+    projectedPaychequeDates = projection.projectedPaychequeDates;
   } catch (err) {
     console.error("Paycheque projection error in export:", err);
   }

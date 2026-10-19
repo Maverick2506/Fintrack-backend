@@ -127,6 +127,7 @@ router.post(
           type: "EXPENSE",
           category: "Debt",
           isCleared: true,
+          balanceApplied: true,
           fromAccountId: checking.id,
           toAccountId: debt.id,
         },

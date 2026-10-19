@@ -5,8 +5,6 @@ const { createRecurringExpenses } = require("./recurring");
 
 const router = express.Router();
 
-router.use(cronAuthMiddleware);
-
 const handleDailyCheck = async (req, res) => {
   try {
     const result = await runDailySweep();
@@ -30,17 +28,12 @@ const handleTriggerRecurring = async (req, res) => {
   }
 };
 
-// Support both GET (for Vercel Cron and webhooks) and POST (for manual/programmatic triggers)
-router.get("/daily-check", handleDailyCheck);
-router.post("/daily-check", handleDailyCheck);
+// Support both GET and POST for cron jobs and external webhooks with explicit cron auth
+router.all("/daily-check", cronAuthMiddleware, handleDailyCheck);
+router.all("/trigger-recurring", cronAuthMiddleware, handleTriggerRecurring);
 
-router.get("/cron/daily-check", handleDailyCheck);
-router.post("/cron/daily-check", handleDailyCheck);
-
-router.get("/recurring/trigger-recurring", handleTriggerRecurring);
-router.post("/recurring/trigger-recurring", handleTriggerRecurring);
-
-router.get("/cron/trigger-recurring", handleTriggerRecurring);
-router.post("/cron/trigger-recurring", handleTriggerRecurring);
+// Backwards-compatible aliases
+router.all("/cron/daily-check", cronAuthMiddleware, handleDailyCheck);
+router.all("/cron/trigger-recurring", cronAuthMiddleware, handleTriggerRecurring);
 
 module.exports = router;

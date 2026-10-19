@@ -1,9 +1,10 @@
 const express = require("express");
+const crypto = require("crypto");
 const { Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
 const { toZonedTime, format } = require("date-fns-tz");
-const authMiddleware = require("../middleware/authMiddleware");
+const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
@@ -92,7 +93,9 @@ const createRecurringExpenses = async () => {
 
     const latestOccurrences = {};
     for (const trx of allTransactions) {
-      const key = `${trx.type}:${trx.title.toLowerCase().trim()}`;
+      const key = trx.recurringGroupId
+        ? `series:${trx.recurringGroupId}`
+        : `${trx.type}:${trx.title.toLowerCase().trim()}`;
       if (!latestOccurrences[key]) {
         latestOccurrences[key] = trx;
       }
@@ -121,9 +124,11 @@ const createRecurringExpenses = async () => {
 
         const existing = await Transaction.findOne({
           where: {
-            type: baseTrx.type,
-            title: baseTrx.title,
             date: nextDateStr,
+            [Op.or]: [
+              baseTrx.recurringGroupId ? { recurringGroupId: baseTrx.recurringGroupId } : null,
+              { type: baseTrx.type, title: baseTrx.title },
+            ].filter(Boolean),
           },
         });
 
@@ -151,6 +156,15 @@ const createRecurringExpenses = async () => {
             taxApplied = true;
           }
 
+          let seriesId = baseTrx.recurringGroupId;
+          if (!seriesId) {
+            seriesId = baseTrx.id || crypto.randomUUID();
+            baseTrx.recurringGroupId = seriesId;
+            await baseTrx.save().catch((err) =>
+              console.error("Could not backfill recurringGroupId on baseTrx:", err)
+            );
+          }
+
           await Transaction.create({
             ...baseTrx.get({ plain: true }),
             id: undefined,
@@ -161,6 +175,7 @@ const createRecurringExpenses = async () => {
             taxApplied,
             isCleared,
             date: nextDateStr,
+            recurringGroupId: seriesId,
             createdAt: new Date(),
             updatedAt: new Date(),
           });
@@ -180,9 +195,9 @@ const createRecurringExpenses = async () => {
   }
 };
 
-router.post("/trigger-recurring", authMiddleware, async (req, res) => {
+router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
   await createRecurringExpenses();
-  res.status(200).send("Advanced recurring job triggered successfully.");
+  res.status(200).json({ message: "Advanced recurring job triggered successfully." });
 });
 
 module.exports = {

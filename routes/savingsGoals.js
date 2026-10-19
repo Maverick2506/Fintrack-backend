@@ -128,6 +128,7 @@ router.post(
           fromAccountId: checking.id,
           toAccountId: goal.id,
           isCleared: true,
+          balanceApplied: true,
         },
         { transaction: dbTx }
       );

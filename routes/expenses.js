@@ -1,4 +1,5 @@
 const express = require("express");
+const crypto = require("crypto");
 const { sequelize, Transaction, Account } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
@@ -31,54 +32,83 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
   const amount = parseFloat(trx.amount) || 0;
   if (amount === 0) return;
 
-  // Unpaid/pending expenses have not affected account balances yet
-  if (trx.type === "EXPENSE" && !trx.isCleared) return;
-
   const todayStr = getTodayString();
   const isPastDated = trx.date < todayStr;
 
-  // 1. Cleared expense charged FROM a Credit Card (and not a paydown transfer to another account) increases card balance (+amount)
-  // Only applies for transactions dated today or later. Past-dated expenses are historical and already factored into the card's balance.
-  if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
-    if (isPastDated) return;
+  if (direction === 1) {
+    // Already applied? Skip to prevent double counting
+    if (trx.balanceApplied) return;
 
-    const fromAcc = await Account.findByPk(trx.fromAccountId, {
-      transaction: dbTx,
-    });
-    if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-      const nextBal =
-        parseFloat(fromAcc.initialBalance || 0) + direction * amount;
-      fromAcc.initialBalance = nextBal;
-      await fromAcc.save({ transaction: dbTx });
+    // Unpaid/pending expenses have not affected account balances yet
+    if (trx.type === "EXPENSE" && !trx.isCleared) return;
+
+    // Historical past-dated transactions (created with a past date) were already in the account's opening balance
+    if (isPastDated && !trx.balanceApplied) {
+      trx.balanceApplied = false;
+      await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
+      return;
     }
-  }
 
-  // 2. Cleared EXPENSE (e.g. category: "Debt") or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
-  if (
-    (trx.type === "EXPENSE" || trx.type === "TRANSFER") &&
-    trx.toAccountId
-  ) {
-    const toAcc = await Account.findByPk(trx.toAccountId, {
-      transaction: dbTx,
-    });
-    if (toAcc) {
-      if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-        // Paydown reduces Debt / Credit Card balance only if dated today or later.
-        // Historical past-dated paydowns were already factored into the user-entered balance.
-        if (isPastDated) return;
-
-        const nextBal =
-          parseFloat(toAcc.initialBalance || 0) - direction * amount;
-        toAcc.initialBalance = nextBal;
-        await toAcc.save({ transaction: dbTx });
-      } else if (toAcc.type === "SAVINGS_GOAL") {
-        // Contribution increases Savings Goal balance when applied (direction=1), reduces when reversed (direction=-1)
-        const nextBal =
-          parseFloat(toAcc.initialBalance || 0) + direction * amount;
-        toAcc.initialBalance = nextBal;
-        await toAcc.save({ transaction: dbTx });
+    let applied = false;
+    // 1. Cleared expense charged FROM a Credit Card
+    if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
+      const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
+      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+        fromAcc.initialBalance = parseFloat(fromAcc.initialBalance || 0) + amount;
+        await fromAcc.save({ transaction: dbTx });
+        applied = true;
       }
     }
+
+    // 2. Cleared EXPENSE or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
+    if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.toAccountId) {
+      const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
+      if (toAcc) {
+        if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
+          toAcc.initialBalance = Math.max(0, parseFloat(toAcc.initialBalance || 0) - amount);
+          await toAcc.save({ transaction: dbTx });
+          applied = true;
+        } else if (toAcc.type === "SAVINGS_GOAL") {
+          toAcc.initialBalance = parseFloat(toAcc.initialBalance || 0) + amount;
+          await toAcc.save({ transaction: dbTx });
+          applied = true;
+        }
+      }
+    }
+
+    if (applied) {
+      trx.balanceApplied = true;
+      await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
+    }
+  } else if (direction === -1) {
+    // Only reverse if balance was actually applied!
+    if (!trx.balanceApplied) return;
+
+    // 1. Reverse expense charged FROM a Credit Card
+    if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
+      const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
+      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+        fromAcc.initialBalance = Math.max(0, parseFloat(fromAcc.initialBalance || 0) - amount);
+        await fromAcc.save({ transaction: dbTx });
+      }
+    }
+
+    // 2. Reverse EXPENSE or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
+    if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.toAccountId) {
+      const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
+      if (toAcc) {
+        if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
+          toAcc.initialBalance = parseFloat(toAcc.initialBalance || 0) + amount;
+          await toAcc.save({ transaction: dbTx });
+        } else if (toAcc.type === "SAVINGS_GOAL") {
+          toAcc.initialBalance = Math.max(0, parseFloat(toAcc.initialBalance || 0) - amount);
+          await toAcc.save({ transaction: dbTx });
+        }
+      }
+    }
+
+    trx.balanceApplied = false;
+    await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
   }
 };
 
@@ -320,6 +350,10 @@ router.post(
           ? "Credit Card Payment"
           : finalCategory;
 
+      const isRecurring = recurrence && recurrence !== "none";
+      const finalRecurringGroupId =
+        req.body.recurringGroupId || (isRecurring ? crypto.randomUUID() : null);
+
       const newExp = await Transaction.create(
         {
           title: name,
@@ -333,6 +367,7 @@ router.post(
           category: trxCategory,
           isCleared,
           recurrence: recurrence || "none",
+          recurringGroupId: finalRecurringGroupId,
           fromAccountId: fromAccount.id,
           toAccountId: resolvedToAccountId,
         },
@@ -426,8 +461,8 @@ router.put(
         targetAccount && targetAccount.type === "CREDIT_CARD";
       const nextType = isCreditCardPayment
         ? "TRANSFER"
-        : trx.type === "TRANSFER" && !isCreditCardPayment
-        ? "EXPENSE"
+        : req.body.type
+        ? String(req.body.type).toUpperCase()
         : trx.type;
 
       const nextIsCleared =
@@ -450,42 +485,46 @@ router.put(
           : null;
 
       let nextBaseAmount =
-        req.body.baseAmount !== undefined
+        req.body.baseAmount !== undefined && req.body.baseAmount !== null
           ? parseFloat(req.body.baseAmount)
-          : req.body.amount !== undefined
+          : req.body.amount !== undefined && req.body.amount !== null
           ? parseFloat(req.body.amount)
           : trx.baseAmount !== null && trx.baseAmount !== undefined
           ? parseFloat(trx.baseAmount)
           : parseFloat(trx.amount);
 
-      let nextTaxApplied = trx.taxApplied;
-      let nextAmount =
-        req.body.amount !== undefined
-          ? parseFloat(req.body.amount)
-          : parseFloat(trx.amount);
+      let nextTaxApplied = false;
+      let nextAmount = nextBaseAmount;
 
-      // If updating the base amount of an unpaid transaction:
-      if (req.body.amount !== undefined && !nextIsCleared) {
-        nextBaseAmount = parseFloat(req.body.amount);
+      if (nextIsTaxExclusive && nextTaxRate && nextTaxRate > 0) {
+        if (nextIsCleared) {
+          nextAmount =
+            Math.round(nextBaseAmount * (1 + nextTaxRate / 100) * 100) / 100;
+          nextTaxApplied = true;
+        } else {
+          nextAmount = nextBaseAmount;
+          nextTaxApplied = false;
+        }
+      } else {
+        nextAmount =
+          req.body.amount !== undefined && req.body.amount !== null
+            ? parseFloat(req.body.amount)
+            : parseFloat(trx.amount);
+        nextBaseAmount = null;
         nextTaxApplied = false;
       }
 
-      // If transitioning to cleared / paid with tax-exclusive enabled:
-      if (
-        nextIsCleared &&
-        nextIsTaxExclusive &&
-        nextTaxRate &&
-        nextTaxRate > 0 &&
-        !nextTaxApplied
-      ) {
-        const base = nextBaseAmount || nextAmount;
-        nextAmount = Math.round(base * (1 + nextTaxRate / 100) * 100) / 100;
-        nextBaseAmount = base;
-        nextTaxApplied = true;
-      } else if (!nextIsCleared && nextTaxApplied) {
-        // Unmarking as paid reverts to base amount
-        nextAmount = nextBaseAmount || nextAmount;
-        nextTaxApplied = false;
+      const nextRecurrence =
+        req.body.recurrence !== undefined ? req.body.recurrence : trx.recurrence;
+      let nextRecurringGroupId = trx.recurringGroupId;
+      if (req.body.recurringGroupId !== undefined) {
+        nextRecurringGroupId = req.body.recurringGroupId;
+      } else if (nextRecurrence && nextRecurrence !== "none") {
+        if (!nextRecurringGroupId) {
+          nextRecurringGroupId = crypto.randomUUID();
+        }
+      } else {
+        nextRecurringGroupId = null;
       }
 
       await trx.update(
@@ -503,7 +542,8 @@ router.put(
               ? "Credit Card Payment"
               : nextCategory,
           isCleared: nextIsCleared,
-          recurrence: req.body.recurrence || trx.recurrence,
+          recurrence: nextRecurrence,
+          recurringGroupId: nextRecurringGroupId,
           fromAccountId,
           toAccountId: nextToAccountId,
         },

@@ -3,7 +3,10 @@ const { Sequelize } = require("sequelize");
 let sequelize;
 
 const isProduction = process.env.NODE_ENV === "production";
+const isTest = process.env.NODE_ENV === "test";
+
 const shouldUseRemoteDb =
+  !isTest &&
   Boolean(process.env.DATABASE_URL) &&
   (isProduction || process.env.USE_PRODUCTION_DB === "true");
 
@@ -36,5 +39,7 @@ if (shouldUseRemoteDb) {
     logging: false,
   });
 }
+
+sequelize.isProductionDb = shouldUseRemoteDb;
 
 module.exports = sequelize;

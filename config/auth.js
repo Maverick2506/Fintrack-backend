@@ -17,11 +17,7 @@ const JWT_SECRET =
 
 const isDevBypassAllowed = () => {
   if (isProd) return false;
-  return (
-    process.env.ALLOW_DEV_BYPASS === "true" ||
-    !process.env.NODE_ENV ||
-    process.env.NODE_ENV === "development"
-  );
+  return process.env.ALLOW_DEV_BYPASS === "true";
 };
 
 const verifyPassword = (inputPassword) => {

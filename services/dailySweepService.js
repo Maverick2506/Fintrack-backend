@@ -4,8 +4,15 @@ const { toZonedTime, format } = require("date-fns-tz");
 const { getNextDueDate } = require("../routes/recurring");
 
 const TIMEZONE = "America/Toronto";
+let isLocalSweepRunning = false;
 
 const runDailySweep = async () => {
+  if (isLocalSweepRunning) {
+    console.log("Daily sweep already executing in-process. Skipping.");
+    return { skipped: true, reason: "in_process_lock" };
+  }
+
+  isLocalSweepRunning = true;
   console.log("Running Daily Sweep (Credit Cards, Bills, & Auto-Pay Debts)...");
   const dbTx = await sequelize.transaction();
   try {
@@ -33,6 +40,8 @@ const runDailySweep = async () => {
 
     for (const bill of pendingBillsDue) {
       let amt = parseFloat(bill.amount) || 0;
+      let baseAmount = bill.baseAmount;
+      let taxApplied = Boolean(bill.taxApplied);
 
       // Apply tax on due date if bill was registered exclusive of tax
       if (
@@ -44,38 +53,51 @@ const runDailySweep = async () => {
         const base = parseFloat(bill.baseAmount) || amt;
         const rate = parseFloat(bill.taxRate);
         amt = Math.round(base * (1 + rate / 100) * 100) / 100;
-        bill.amount = amt;
-        bill.baseAmount = base;
-        bill.taxApplied = true;
+        baseAmount = base;
+        taxApplied = true;
       }
 
-      const isPastBill = bill.date < todayString;
-      if (
-        bill.fromAccount &&
-        bill.fromAccount.type === "CREDIT_CARD" &&
-        !bill.toAccountId
-      ) {
-        if (!isPastBill) {
+      // ATOMIC UPDATE: Only adjust balance if THIS execution flipped isCleared from false to true
+      const [affectedRows] = await Transaction.update(
+        {
+          isCleared: true,
+          balanceApplied: true,
+          amount: amt,
+          baseAmount,
+          taxApplied,
+        },
+        {
+          where: {
+            id: bill.id,
+            isCleared: false,
+          },
+          transaction: dbTx,
+        }
+      );
+
+      // Only adjust account balance if this worker actually won the race and transitioned the bill
+      if (affectedRows === 1) {
+        if (
+          bill.fromAccount &&
+          bill.fromAccount.type === "CREDIT_CARD" &&
+          !bill.toAccountId
+        ) {
           bill.fromAccount.initialBalance =
             parseFloat(bill.fromAccount.initialBalance || 0) + amt;
           await bill.fromAccount.save({ transaction: dbTx });
-        }
-      } else if (
-        bill.toAccount &&
-        (bill.toAccount.type === "DEBT" ||
-          bill.toAccount.type === "CREDIT_CARD")
-      ) {
-        if (!isPastBill) {
+        } else if (
+          bill.toAccount &&
+          (bill.toAccount.type === "DEBT" ||
+            bill.toAccount.type === "CREDIT_CARD")
+        ) {
           bill.toAccount.initialBalance = Math.max(
             0,
             parseFloat(bill.toAccount.initialBalance || 0) - amt
           );
           await bill.toAccount.save({ transaction: dbTx });
         }
+        clearedExpenseCount++;
       }
-      bill.isCleared = true;
-      await bill.save({ transaction: dbTx });
-      clearedExpenseCount++;
     }
 
     // 2. Clear Pending Income whose date has arrived
@@ -116,6 +138,18 @@ const runDailySweep = async () => {
         const minPay = parseFloat(debt.minimumPayment) || 0;
         if (remaining <= 0 || minPay <= 0) continue;
 
+        // Idempotency guard: prevent duplicate auto-pay transaction for the same debt on the same day
+        const existingAutoPay = await Transaction.findOne({
+          where: {
+            toAccountId: debt.id,
+            date: todayString,
+            type: "EXPENSE",
+            category: "Debt",
+          },
+          transaction: dbTx,
+        });
+        if (existingAutoPay) continue;
+
         const paymentAmount = Math.min(remaining, minPay);
         debt.initialBalance = Math.max(0, remaining - paymentAmount);
 
@@ -139,6 +173,7 @@ const runDailySweep = async () => {
             type: "EXPENSE",
             category: "Debt",
             isCleared: true,
+            balanceApplied: true,
             fromAccountId: checking.id,
             toAccountId: debt.id,
           },
@@ -162,6 +197,8 @@ const runDailySweep = async () => {
     await dbTx.rollback();
     console.error("Error running daily sweep:", error);
     throw error;
+  } finally {
+    isLocalSweepRunning = false;
   }
 };
 

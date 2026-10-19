@@ -53,6 +53,14 @@ const Transaction = sequelize.define(
       type: DataTypes.ENUM("none", "weekly", "bi-weekly", "monthly", "yearly"),
       defaultValue: "none",
     },
+    balanceApplied: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
+    recurringGroupId: {
+      type: DataTypes.UUID,
+      allowNull: true,
+    },
   },
   {
     indexes: [

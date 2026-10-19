@@ -18,8 +18,9 @@ if (fs.existsSync(envPath)) {
 const express = require("express");
 const cors = require("cors");
 const compression = require("compression");
-const { DataTypes } = require("sequelize");
-const { sequelize, Account } = require("./models");
+const crypto = require("crypto");
+const { DataTypes, Op } = require("sequelize");
+const { sequelize, Account, Transaction } = require("./models");
 const cron = require("node-cron");
 const { assertAuthConfiguration } = require("./config/auth");
 const { runDailySweep } = require("./services/dailySweepService");
@@ -81,17 +82,32 @@ app.use("/api/categorize-expense", aiLimiter);
 app.use("/api/chat-advisor", aiLimiter);
 app.use("/api", apiLimiter);
 
+// --- HEALTH CHECK ---
+app.get("/api/health", (req, res) => {
+  const isProd = process.env.NODE_ENV === "production";
+  if (isProd) {
+    return res.json({ status: "ok" });
+  }
+  res.json({
+    status: "ok",
+    environment: process.env.NODE_ENV || "development",
+    dialect: sequelize.getDialect(),
+    isProductionDb: Boolean(sequelize.isProductionDb),
+  });
+});
+
 // --- API ROUTES ---
 app.use("/api/auth", authRoutes);
 app.use("/api/export", exportRoutes);
+app.use("/api/cron", cronRoutes);
 app.use("/api", cronRoutes);
+app.use("/api/recurring", recurringRoutes);
 app.use("/api", expenseRoutes);
 app.use("/api", debtRoutes);
 app.use("/api", savingsGoalRoutes);
 app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
-app.use("/api/recurring", recurringRoutes);
 app.use("/api", paychequeRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
@@ -168,8 +184,104 @@ async function initialize() {
           defaultValue: false,
         });
       }
+      if (!tableDesc.balanceApplied) {
+        await queryInterface.addColumn("Transactions", "balanceApplied", {
+          type: DataTypes.BOOLEAN,
+          defaultValue: false,
+        });
+      }
+      if (!tableDesc.recurringGroupId) {
+        await queryInterface.addColumn("Transactions", "recurringGroupId", {
+          type: DataTypes.UUID,
+          allowNull: true,
+        });
+      }
+
+      // Deliberate Backfill 1: balanceApplied
+      // Existing cleared paydowns (to DEBT, CREDIT_CARD, SAVINGS_GOAL) and non-historical card expenses
+      const candidateTransactions = await Transaction.findAll({
+        where: {
+          isCleared: true,
+          balanceApplied: false,
+          [Op.or]: [
+            { toAccountId: { [Op.ne]: null } },
+            { fromAccountId: { [Op.ne]: null } },
+          ],
+        },
+        include: [
+          { model: Account, as: "fromAccount" },
+          { model: Account, as: "toAccount" },
+        ],
+      });
+
+      const balanceAppliedIds = [];
+      for (const trx of candidateTransactions) {
+        const isPaydownOrSavings =
+          trx.toAccount &&
+          ["CREDIT_CARD", "DEBT", "SAVINGS_GOAL"].includes(trx.toAccount.type);
+
+        const isCardExpense =
+          trx.fromAccount && trx.fromAccount.type === "CREDIT_CARD";
+
+        if (isPaydownOrSavings) {
+          balanceAppliedIds.push(trx.id);
+        } else if (isCardExpense) {
+          const createdDateStr = trx.createdAt
+            ? new Date(trx.createdAt).toISOString().slice(0, 10)
+            : null;
+          // Apply if transaction date was not older than creation date (i.e. not a historical import)
+          if (!createdDateStr || trx.date >= createdDateStr) {
+            balanceAppliedIds.push(trx.id);
+          }
+        }
+      }
+
+      if (balanceAppliedIds.length > 0) {
+        await Transaction.update(
+          { balanceApplied: true },
+          { where: { id: { [Op.in]: balanceAppliedIds } } }
+        );
+        console.log(`✅ Backfilled balanceApplied = true for ${balanceAppliedIds.length} legacy transactions.`);
+      }
+
+      // Deliberate Backfill 2: recurringGroupId
+      // Link existing recurring series by title, type, and recurrence so old rows share series identity
+      const recurringRows = await Transaction.findAll({
+        where: {
+          recurrence: { [Op.in]: ["weekly", "bi-weekly", "monthly", "yearly"] },
+        },
+        order: [["date", "ASC"]],
+      });
+
+      if (recurringRows.length > 0) {
+        const seriesMap = new Map();
+        for (const trx of recurringRows) {
+          const key = `${trx.type}:${(trx.title || "").toLowerCase().trim()}`;
+          if (trx.recurringGroupId && !seriesMap.has(key)) {
+            seriesMap.set(key, trx.recurringGroupId);
+          }
+        }
+        for (const trx of recurringRows) {
+          const key = `${trx.type}:${(trx.title || "").toLowerCase().trim()}`;
+          if (!seriesMap.has(key)) {
+            seriesMap.set(key, crypto.randomUUID());
+          }
+        }
+        let backfilledSeriesCount = 0;
+        for (const trx of recurringRows) {
+          if (!trx.recurringGroupId) {
+            const key = `${trx.type}:${(trx.title || "").toLowerCase().trim()}`;
+            trx.recurringGroupId = seriesMap.get(key);
+            await trx.save();
+            backfilledSeriesCount++;
+          }
+        }
+        if (backfilledSeriesCount > 0) {
+          console.log(`✅ Backfilled recurringGroupId for ${backfilledSeriesCount} legacy recurring transactions.`);
+        }
+      }
     } catch (migErr) {
-      console.warn("Transactions schema check notice:", migErr.message);
+      console.warn("Transactions schema/backfill notice:", migErr.message);
     }
 
     await Account.findOrCreate({

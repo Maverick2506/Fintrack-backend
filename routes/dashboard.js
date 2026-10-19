@@ -19,30 +19,11 @@ const formatYMD = (y, mZeroIndexed, d) => {
   return `${yr}-${mo}-${da}`;
 };
 
-const getPrimaryCheckingAccount = async (dbTx = null) => {
-  let checking = await Account.findOne({
-    where: { type: "CHECKING", isActive: { [Op.ne]: false } },
-    order: [["createdAt", "ASC"]],
-    transaction: dbTx,
-  });
-  if (!checking) {
-    checking = await Account.findOne({
-      where: { name: "Primary Checking" },
-      transaction: dbTx,
-    });
-  }
-  if (!checking) {
-    checking = await Account.create(
-      {
-        name: "Primary Checking",
-        type: "CHECKING",
-        initialBalance: 0.0,
-      },
-      { transaction: dbTx }
-    );
-  }
-  return checking;
-};
+const {
+  getPrimaryCheckingAccount,
+  getCheckingActivity,
+  getCalculatedCheckingBalance,
+} = require("../services/checkingService");
 
 router.get(
   "/dashboard",
@@ -160,40 +141,12 @@ router.get(
         group: ["category"],
         raw: true,
       }),
-      // Only include cleared income dated on or before today into current checking balance calculation
-      Transaction.sum("amount", {
-        where: {
-          type: "INCOME",
-          isCleared: true,
-          date: { [Op.lte]: todayStr },
-          [Op.or]: [{ toAccountId: checking.id }, { toAccountId: null }],
-        },
-      }),
-      Transaction.sum("amount", {
-        where: {
-          type: "EXPENSE",
-          isCleared: true,
-          fromAccountId: checking.id,
-        },
-      }),
-      Transaction.sum("amount", {
-        where: { type: "TRANSFER", fromAccountId: checking.id },
-      }),
-      Transaction.sum("amount", {
-        where: { type: "TRANSFER", toAccountId: checking.id },
-      }),
     ]);
 
-    const netCheckingActivity =
-      (parseFloat(allTimeIncome) || 0) -
-      (parseFloat(allTimeCheckingExp) || 0) -
-      (parseFloat(allTimeTransfersOut) || 0) +
-      (parseFloat(allTimeTransfersIn) || 0);
-
-    const checkingCurrentBalance =
-      Math.round(
-        ((parseFloat(checking.initialBalance) || 0) + netCheckingActivity) * 100
-      ) / 100;
+    const checkingCurrentBalance = await getCalculatedCheckingBalance(
+      checking,
+      todayStr
+    );
 
     const spendingSummary = (spendingByCategoryRaw || []).map((item) => ({
       name: item.category,
@@ -235,40 +188,10 @@ router.put(
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
-    const [
-      allTimeIncome,
-      allTimeCheckingExp,
-      allTimeTransfersOut,
-      allTimeTransfersIn,
-    ] = await Promise.all([
-      Transaction.sum("amount", {
-        where: {
-          type: "INCOME",
-          isCleared: true,
-          date: { [Op.lte]: todayStr },
-          [Op.or]: [{ toAccountId: checking.id }, { toAccountId: null }],
-        },
-      }),
-      Transaction.sum("amount", {
-        where: {
-          type: "EXPENSE",
-          isCleared: true,
-          fromAccountId: checking.id,
-        },
-      }),
-      Transaction.sum("amount", {
-        where: { type: "TRANSFER", fromAccountId: checking.id },
-      }),
-      Transaction.sum("amount", {
-        where: { type: "TRANSFER", toAccountId: checking.id },
-      }),
-    ]);
-
-    const netCheckingActivity =
-      (parseFloat(allTimeIncome) || 0) -
-      (parseFloat(allTimeCheckingExp) || 0) -
-      (parseFloat(allTimeTransfersOut) || 0) +
-      (parseFloat(allTimeTransfersIn) || 0);
+    const netCheckingActivity = await getCheckingActivity(
+      checking.id,
+      todayStr
+    );
 
     const desiredBalance = parseFloat(req.body.balance);
     if (!isNaN(desiredBalance)) {

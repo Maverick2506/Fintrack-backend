@@ -85,6 +85,7 @@ router.post(
           type: "TRANSFER",
           category: "Credit Card Payment",
           isCleared: true,
+          balanceApplied: true,
           fromAccountId: checking.id,
           toAccountId: card.id,
         },

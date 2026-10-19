@@ -37,6 +37,7 @@ const schemas = {
     taxRate: z.coerce.number().nonnegative().max(100).nullable().optional(),
     baseAmount: z.coerce.number().nonnegative().nullable().optional(),
     taxApplied: z.boolean().optional().default(false),
+    recurringGroupId: z.string().uuid().nullable().optional(),
   }),
 
   updateExpense: z.object({
@@ -56,6 +57,7 @@ const schemas = {
     taxRate: z.coerce.number().nonnegative().max(100).nullable().optional(),
     baseAmount: z.coerce.number().nonnegative().nullable().optional(),
     taxApplied: z.boolean().optional(),
+    recurringGroupId: z.string().uuid().nullable().optional(),
   }),
 
   createPaycheque: z.object({

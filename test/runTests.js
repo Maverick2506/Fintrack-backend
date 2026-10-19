@@ -41,6 +41,23 @@ async function runTestSuite() {
     }
   }
 
+  // 0. Pre-Flight Safety Verification: Refuse to run against production database
+  const healthRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/health",
+    method: "GET",
+  });
+  if (healthRes.body?.isProductionDb === true) {
+    console.error("\n❌ CRITICAL SAFETY ERROR: Target backend on localhost:8000 is connected to the PRODUCTION database!");
+    console.error("Test execution aborted immediately to protect live production financial records.\n");
+    process.exit(1);
+  }
+  assert(
+    healthRes.status === 200 && healthRes.body.isProductionDb === false,
+    "Target server verified running on safe local development database (isolated from live site)"
+  );
+
   // 1. Auth & Security Tests
   console.log("\n--- Suite 1: Authentication & Security ---");
   const badLogin = await request({
