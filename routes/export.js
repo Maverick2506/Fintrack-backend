@@ -127,8 +127,12 @@ const getFinancialData = async () => {
   }
 
   const creditCards = accounts.filter((a) => a.type === "CREDIT_CARD");
-  const debts = accounts.filter(
-    (a) => a.type === "DEBT" && parseFloat(a.initialBalance || 0) > 0 && a.isActive !== false
+  const allDebts = accounts.filter((a) => a.type === "DEBT");
+  const debts = allDebts.filter(
+    (a) => parseFloat(a.initialBalance || 0) > 0 && a.isActive !== false
+  );
+  const paidOffDebts = allDebts.filter(
+    (a) => parseFloat(a.initialBalance || 0) <= 0 || a.isActive === false
   );
   const savingsGoals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
 
@@ -237,6 +241,7 @@ const getFinancialData = async () => {
     checkingAcc,
     creditCards,
     debts,
+    paidOffDebts,
     savingsGoals,
     upcomingBills,
     recentTransactions,
@@ -273,18 +278,21 @@ const generateCSV = (d) => {
 
   // 2. ACCOUNTS & LIABILITIES
   rows.push([]);
-  rows.push(["SECTION", "TYPE", "ACCOUNT_NAME", "CURRENT_BALANCE", "LIMIT_OR_TARGET", "INTEREST_RATE_PCT", "MIN_PAYMENT"].map(csvEscape).join(","));
+  rows.push(["SECTION", "TYPE", "ACCOUNT_NAME", "CURRENT_BALANCE", "LIMIT_OR_TARGET", "INTEREST_RATE_PCT", "MIN_PAYMENT", "STATUS"].map(csvEscape).join(","));
   if (d.checkingAcc) {
-    rows.push(["ACCOUNTS", "CHECKING", d.checkingAcc.name, d.checkingBalance.toFixed(2), "", "", ""].map(csvEscape).join(","));
+    rows.push(["ACCOUNTS", "CHECKING", d.checkingAcc.name, d.checkingBalance.toFixed(2), "", "", "", "ACTIVE"].map(csvEscape).join(","));
   }
   for (const c of d.creditCards) {
-    rows.push(["ACCOUNTS", "CREDIT_CARD", c.name, parseFloat(c.initialBalance || 0).toFixed(2), parseFloat(c.creditLimit || 0).toFixed(2), c.interestRate ? `${c.interestRate}%` : "", c.minimumPayment ? parseFloat(c.minimumPayment).toFixed(2) : ""].map(csvEscape).join(","));
+    rows.push(["ACCOUNTS", "CREDIT_CARD", c.name, parseFloat(c.initialBalance || 0).toFixed(2), parseFloat(c.creditLimit || 0).toFixed(2), c.interestRate ? `${c.interestRate}%` : "", c.minimumPayment ? parseFloat(c.minimumPayment).toFixed(2) : "", "ACTIVE"].map(csvEscape).join(","));
   }
   for (const debt of d.debts) {
-    rows.push(["ACCOUNTS", "DEBT", debt.name, parseFloat(debt.initialBalance || 0).toFixed(2), "", debt.interestRate ? `${debt.interestRate}%` : "", debt.minimumPayment ? parseFloat(debt.minimumPayment).toFixed(2) : ""].map(csvEscape).join(","));
+    rows.push(["ACCOUNTS", "DEBT", debt.name, parseFloat(debt.initialBalance || 0).toFixed(2), parseFloat(debt.targetAmount || debt.initialBalance || 0).toFixed(2), debt.interestRate ? `${debt.interestRate}%` : "", debt.minimumPayment ? parseFloat(debt.minimumPayment).toFixed(2) : "", "ACTIVE"].map(csvEscape).join(","));
+  }
+  for (const debt of d.paidOffDebts || []) {
+    rows.push(["ACCOUNTS", "DEBT", debt.name, "0.00", parseFloat(debt.targetAmount || debt.initialBalance || 0).toFixed(2), debt.interestRate ? `${debt.interestRate}%` : "", "0.00", "PAID_OFF"].map(csvEscape).join(","));
   }
   for (const g of d.savingsGoals) {
-    rows.push(["ACCOUNTS", "SAVINGS_GOAL", g.name, parseFloat(g.initialBalance || 0).toFixed(2), parseFloat(g.targetAmount || 0).toFixed(2), "", ""].map(csvEscape).join(","));
+    rows.push(["ACCOUNTS", "SAVINGS_GOAL", g.name, parseFloat(g.initialBalance || 0).toFixed(2), parseFloat(g.targetAmount || 0).toFixed(2), "", "", "ACTIVE"].map(csvEscape).join(","));
   }
 
   // 3. UPCOMING UNPAID BILLS
@@ -355,9 +363,11 @@ ${
 }
 
 ### Debts
+
+#### Active Debts
 ${
   d.debts.length === 0
-    ? "_No outstanding debts._"
+    ? "_No active debts._"
     : d.debts
         .map(
           (debt) =>
@@ -366,6 +376,20 @@ ${
             ).toFixed(2)} | Min Payment: $${parseFloat(
               debt.minimumPayment || 0
             ).toFixed(2)} ${debt.interestRate ? `(Interest: ${debt.interestRate}%)` : ""}`
+        )
+        .join("\n")
+}
+
+#### Paid Off & Cleared Debts
+${
+  (d.paidOffDebts || []).length === 0
+    ? "_No paid-off debts._"
+    : d.paidOffDebts
+        .map(
+          (debt) =>
+            `- **${debt.name}:** Balance $0.00 (✓ Paid in Full — $${parseFloat(
+              debt.targetAmount || debt.initialBalance || 0
+            ).toFixed(2)} total cleared, $0.00 payment due)`
         )
         .join("\n")
 }
@@ -438,9 +462,12 @@ You have continuous access to Maverick's live FinTrack financial data connected 
      - Bills with ACCOUNT_TYPE "CREDIT_CARD" increase credit card balance instead of immediately reducing checking cash.
    - Step 3: Determine the remaining Safe Liquid Float (Primary Checking + Projected Income - Upcoming Checking Bills).
    - Step 4: Deliver a direct verdict: **Yes / Caution / No**, with the exact resulting checking balance, float impact, and any credit card utilization impact.
-3. **Debt Strategy:**
-   - Recommend the Avalanche method (highest interest APR first) for maximum interest savings, or Snowball for quick psychological wins if requested.
-   - Ensure minimum payments on all debts are protected first before allocating surplus float.
+3. **Debt Strategy & Paid-Off Debts:**
+   - Only consider debts with STATUS "ACTIVE" as active liabilities requiring payment.
+   - Debts with STATUS "PAID_OFF" or listed under "Paid Off & Cleared Debts" (e.g. Old Navy Paypal) are 100% paid off ($0 balance, $0 payment due).
+   - NEVER suggest or calculate payments for paid-off debts. Congratulate Maverick for having eliminated them!
+   - For active debts, recommend the Avalanche method (highest interest APR first) for maximum interest savings, or Snowball for quick psychological wins if requested.
+   - Ensure minimum payments on active debts are protected first before allocating surplus float.
 4. **Tone & Style:**
    - Address Maverick directly and warmly.
    - Concise, actionable, and structured with clean markdown (bold key dollar figures, bullet points).
