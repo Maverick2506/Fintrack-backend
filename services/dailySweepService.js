@@ -90,10 +90,10 @@ const runDailySweep = async () => {
           (bill.toAccount.type === "DEBT" ||
             bill.toAccount.type === "CREDIT_CARD")
         ) {
-          bill.toAccount.initialBalance = Math.max(
-            0,
-            parseFloat(bill.toAccount.initialBalance || 0) - amt
-          );
+          bill.toAccount.initialBalance =
+            Math.round(
+              (parseFloat(bill.toAccount.initialBalance || 0) - amt) * 100
+            ) / 100;
           await bill.toAccount.save({ transaction: dbTx });
         }
         clearedExpenseCount++;
@@ -151,19 +151,37 @@ const runDailySweep = async () => {
         if (existingAutoPay) continue;
 
         const paymentAmount = Math.min(remaining, minPay);
-        debt.initialBalance = Math.max(0, remaining - paymentAmount);
+        const newBal =
+          Math.round(Math.max(0, remaining - paymentAmount) * 100) / 100;
 
         const nextDueStr = getNextDueDate(
           debt.dueDate,
           debt.paymentFrequency || "monthly"
         );
-        if (nextDueStr && debt.initialBalance > 0) {
-          debt.dueDate = nextDueStr;
-        } else if (debt.initialBalance <= 0) {
-          debt.autoPay = false;
+
+        const updatePayload = {
+          initialBalance: newBal,
+        };
+        if (nextDueStr && newBal > 0) {
+          updatePayload.dueDate = nextDueStr;
+        } else if (newBal <= 0) {
+          updatePayload.autoPay = false;
         }
 
-        await debt.save({ transaction: dbTx });
+        // Atomic Compare-And-Swap: Only adjust account and create payment if this instance successfully claimed the due payment
+        const [affectedDebtCount] = await Account.update(updatePayload, {
+          where: {
+            id: debt.id,
+            dueDate: debt.dueDate,
+            autoPay: true,
+          },
+          transaction: dbTx,
+        });
+
+        if (affectedDebtCount !== 1) {
+          // Another concurrent sweep instance already updated this debt
+          continue;
+        }
 
         await Transaction.create(
           {

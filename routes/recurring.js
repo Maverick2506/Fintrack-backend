@@ -174,6 +174,7 @@ const createRecurringExpenses = async () => {
             taxRate: taxRateVal,
             taxApplied,
             isCleared,
+            balanceApplied: false,
             date: nextDateStr,
             recurringGroupId: seriesId,
             createdAt: new Date(),

@@ -28,7 +28,12 @@ const getMonthDateRange = (year, month) => {
 };
 
 // Apply or reverse balance effect of a cleared transaction on linked non-checking accounts
-const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
+const adjustAccountForTransaction = async (
+  trx,
+  direction = 1,
+  dbTx = null,
+  forceApply = false
+) => {
   const amount = parseFloat(trx.amount) || 0;
   if (amount === 0) return;
 
@@ -42,8 +47,9 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
     // Unpaid/pending expenses have not affected account balances yet
     if (trx.type === "EXPENSE" && !trx.isCleared) return;
 
-    // Historical past-dated transactions (created with a past date) were already in the account's opening balance
-    if (isPastDated && !trx.balanceApplied) {
+    // Historical past-dated transactions (created with a past date) were already in the account's opening balance.
+    // If forceApply is true (e.g. editing an already-applied transaction), re-apply regardless of date.
+    if (isPastDated && !trx.balanceApplied && !forceApply) {
       trx.balanceApplied = false;
       await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
       return;
@@ -54,7 +60,8 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
       if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-        fromAcc.initialBalance = parseFloat(fromAcc.initialBalance || 0) + amount;
+        fromAcc.initialBalance =
+          Math.round((parseFloat(fromAcc.initialBalance || 0) + amount) * 100) / 100;
         await fromAcc.save({ transaction: dbTx });
         applied = true;
       }
@@ -65,11 +72,13 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
       const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
       if (toAcc) {
         if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-          toAcc.initialBalance = Math.max(0, parseFloat(toAcc.initialBalance || 0) - amount);
+          toAcc.initialBalance =
+            Math.round((parseFloat(toAcc.initialBalance || 0) - amount) * 100) / 100;
           await toAcc.save({ transaction: dbTx });
           applied = true;
         } else if (toAcc.type === "SAVINGS_GOAL") {
-          toAcc.initialBalance = parseFloat(toAcc.initialBalance || 0) + amount;
+          toAcc.initialBalance =
+            Math.round((parseFloat(toAcc.initialBalance || 0) + amount) * 100) / 100;
           await toAcc.save({ transaction: dbTx });
           applied = true;
         }
@@ -88,7 +97,8 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
       if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-        fromAcc.initialBalance = Math.max(0, parseFloat(fromAcc.initialBalance || 0) - amount);
+        fromAcc.initialBalance =
+          Math.round((parseFloat(fromAcc.initialBalance || 0) - amount) * 100) / 100;
         await fromAcc.save({ transaction: dbTx });
       }
     }
@@ -98,10 +108,12 @@ const adjustAccountForTransaction = async (trx, direction = 1, dbTx = null) => {
       const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
       if (toAcc) {
         if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-          toAcc.initialBalance = parseFloat(toAcc.initialBalance || 0) + amount;
+          toAcc.initialBalance =
+            Math.round((parseFloat(toAcc.initialBalance || 0) + amount) * 100) / 100;
           await toAcc.save({ transaction: dbTx });
         } else if (toAcc.type === "SAVINGS_GOAL") {
-          toAcc.initialBalance = Math.max(0, parseFloat(toAcc.initialBalance || 0) - amount);
+          toAcc.initialBalance =
+            Math.round((parseFloat(toAcc.initialBalance || 0) - amount) * 100) / 100;
           await toAcc.save({ transaction: dbTx });
         }
       }
@@ -406,6 +418,7 @@ router.put(
         return res.status(404).json({ error: "Transaction not found" });
       }
 
+      const wasBalanceApplied = Boolean(trx.balanceApplied);
       // Reverse old transaction's effect on any linked credit card / debt / savings account
       await adjustAccountForTransaction(trx, -1, dbTx);
 
@@ -484,14 +497,16 @@ router.put(
           ? parseFloat(trx.taxRate)
           : null;
 
-      let nextBaseAmount =
-        req.body.baseAmount !== undefined && req.body.baseAmount !== null
-          ? parseFloat(req.body.baseAmount)
-          : req.body.amount !== undefined && req.body.amount !== null
-          ? parseFloat(req.body.amount)
-          : trx.baseAmount !== null && trx.baseAmount !== undefined
-          ? parseFloat(trx.baseAmount)
-          : parseFloat(trx.amount);
+      let nextBaseAmount;
+      if (req.body.baseAmount !== undefined && req.body.baseAmount !== null) {
+        nextBaseAmount = parseFloat(req.body.baseAmount);
+      } else if (trx.baseAmount !== null && trx.baseAmount !== undefined) {
+        nextBaseAmount = parseFloat(trx.baseAmount);
+      } else if (req.body.amount !== undefined && req.body.amount !== null) {
+        nextBaseAmount = parseFloat(req.body.amount);
+      } else {
+        nextBaseAmount = parseFloat(trx.amount);
+      }
 
       let nextTaxApplied = false;
       let nextAmount = nextBaseAmount;
@@ -550,8 +565,8 @@ router.put(
         { transaction: dbTx }
       );
 
-      // Apply updated transaction's effect on linked account
-      await adjustAccountForTransaction(trx, 1, dbTx);
+      // Apply updated transaction's effect on linked account, preserving applied status if it had already been applied
+      await adjustAccountForTransaction(trx, 1, dbTx, wasBalanceApplied);
 
       await dbTx.commit();
       res.json(trx);

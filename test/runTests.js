@@ -812,6 +812,246 @@ async function runTestSuite() {
     "PUT /api/checking rejects non-numeric payload with HTTP 400"
   );
 
+  // --- Suite 12: Financial Symmetry, Backfills & Compounding Tax Edge Cases ---
+  console.log("\n--- Suite 12: Financial Symmetry & Tax Compounding Edge Cases ---");
+
+  // 12a. Overpaying debt and deleting payment restores balance with 100% symmetry (no inflation)
+  const debtRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/debts",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Symmetry Test Debt",
+      total_amount: 30.0,
+      monthly_payment: 10.0,
+    }
+  );
+  assert(debtRes.status === 201 && debtRes.body.id, "Creates test debt with balance $30");
+  const symDebtId = debtRes.body.id;
+
+  const overpayRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Overpayment $50",
+      amount: 50.0,
+      category: "Debt",
+      targetAccountId: symDebtId,
+    }
+  );
+  assert(overpayRes.status === 201 && overpayRes.body.id, "Creates $50 paydown on $30 debt");
+  const overpayExpId = overpayRes.body.id;
+
+  let debtCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  let foundDebt = (debtCheck.body || []).find((d) => d.id === symDebtId);
+  assert(parseFloat(foundDebt.total_remaining) === -20, "Debt balance is -$20 without asymmetric clamping floor");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${overpayExpId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  debtCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  foundDebt = (debtCheck.body || []).find((d) => d.id === symDebtId);
+  assert(parseFloat(foundDebt.total_remaining) === 30, "Deleting overpayment cleanly restores debt to $30 (NOT inflated to $50)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/debts/${symDebtId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // 12b. Editing expense the day after entry preserves card balance
+  const cardSymRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/credit-cards",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Symmetry Card",
+      creditLimit: 1000,
+      currentBalance: 100,
+    }
+  );
+  assert(cardSymRes.status === 201 && cardSymRes.body.id, "Creates test card with balance $100");
+  const cardSymId = cardSymRes.body.id;
+
+  const cardChargeRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Card Charge $50",
+      amount: 50.0,
+      category: "Food & Drink",
+      creditCardId: cardSymId,
+    }
+  );
+  assert(cardChargeRes.status === 201 && cardChargeRes.body.id, "Creates $50 charge on card");
+  const cardChargeId = cardChargeRes.body.id;
+
+  // Simulate backdating / editing the day after entry: change date to a past date and rename
+  const editPastRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${cardChargeId}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    {
+      name: "Renamed Card Charge $50",
+      amount: 50.0,
+      date: "2020-01-01",
+    }
+  );
+  assert(editPastRes.status === 200, "Successfully edits already-applied expense with past date");
+
+  let cardSymCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  let foundCardSym = (cardSymCheck.body || []).find((c) => c.id === cardSymId);
+  assert(parseFloat(foundCardSym.currentBalance) === 150, "Card balance remains $150 after editing previously-applied expense (does NOT drop to 100)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${cardChargeId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  cardSymCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  foundCardSym = (cardSymCheck.body || []).find((c) => c.id === cardSymId);
+  assert(parseFloat(foundCardSym.currentBalance) === 100, "Deleting card charge restores balance to $100");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/credit-cards/${cardSymId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // 12c. Tax compounding prevention: editing tax-exclusive expense without baseAmount
+  const taxCompExp = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Compounding Tax Test",
+      amount: 100.0,
+      category: "Utilities",
+      isTaxExclusive: true,
+      taxRate: 13,
+      date: "2099-12-01",
+    }
+  );
+  assert(taxCompExp.status === 201 && taxCompExp.body.id, "Creates tax-exclusive upcoming bill");
+  const taxCompId = taxCompExp.body.id;
+
+  // Pay the bill -> amount becomes 113.00, taxApplied: true
+  const payTaxCompRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${taxCompId}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    {
+      isCleared: true,
+    }
+  );
+  assert(payTaxCompRes.status === 200 && parseFloat(payTaxCompRes.body.amount) === 113.0, "Bill paid with 13% tax applied ($113.00)");
+
+  // Edit sending only amount (113.00) without baseAmount
+  const edit1Res = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${taxCompId}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    {
+      name: "Compounding Tax Test - First Edit",
+      amount: 113.0,
+    }
+  );
+  assert(edit1Res.status === 200 && parseFloat(edit1Res.body.amount) === 113.0, "First edit without baseAmount maintains $113.00 (NOT $127.69)");
+
+  // Edit a second time sending only amount (113.00)
+  const edit2Res = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${taxCompId}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    {
+      name: "Compounding Tax Test - Second Edit",
+      amount: 113.0,
+    }
+  );
+  assert(edit2Res.status === 200 && parseFloat(edit2Res.body.amount) === 113.0, "Second edit without baseAmount maintains $113.00 (NOT $144.29)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${taxCompId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
