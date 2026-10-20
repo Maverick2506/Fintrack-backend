@@ -308,6 +308,62 @@ async function initialize() {
           value: "true",
         });
       }
+
+      // Deliberate One-Off Correction: Fix historical rows erroneously marked balanceApplied: true by early un-guarded backfill
+      const fixedCorrection = await Setting.findByPk(
+        "balance_applied_correction_v1"
+      );
+      if (!fixedCorrection || fixedCorrection.value !== "true") {
+        const rows = await Transaction.findAll({
+          where: {
+            isCleared: true,
+            balanceApplied: true,
+            [Op.or]: [
+              { toAccountId: { [Op.ne]: null } },
+              { fromAccountId: { [Op.ne]: null } },
+            ],
+          },
+          include: [
+            { model: Account, as: "fromAccount" },
+            { model: Account, as: "toAccount" },
+          ],
+        });
+
+        const correctionIds = [];
+        for (const t of rows) {
+          const isTargeted =
+            (t.toAccount &&
+              ["DEBT", "CREDIT_CARD", "SAVINGS_GOAL"].includes(
+                t.toAccount.type
+              )) ||
+            (t.fromAccount && t.fromAccount.type === "CREDIT_CARD");
+
+          if (isTargeted && t.createdAt) {
+            const createdDateStr = format(
+              toZonedTime(t.createdAt, "America/Toronto"),
+              "yyyy-MM-dd"
+            );
+            if (t.date < createdDateStr) {
+              correctionIds.push(t.id);
+            }
+          }
+        }
+
+        if (correctionIds.length > 0) {
+          await Transaction.update(
+            { balanceApplied: false },
+            { where: { id: { [Op.in]: correctionIds } } }
+          );
+          console.log(
+            `✅ Corrected balanceApplied = false for ${correctionIds.length} erroneously backfilled historical transactions.`
+          );
+        }
+
+        await Setting.upsert({
+          key: "balance_applied_correction_v1",
+          value: "true",
+        });
+      }
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
     }

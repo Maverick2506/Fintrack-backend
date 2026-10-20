@@ -1,5 +1,6 @@
 const http = require("http");
 const { getNextOccurrenceDate, getNextDueDate } = require("../routes/recurring");
+const { toZonedTime, format } = require("date-fns-tz");
 
 function request(options, body = null) {
   return new Promise((resolve, reject) => {
@@ -1048,6 +1049,238 @@ async function runTestSuite() {
     hostname: "localhost",
     port: 8000,
     path: `/api/expenses/${taxCompId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // --- Suite 13: Sweep Atomicity, Multi-Bill Charges & Unblocked Auto-Pay ---
+  console.log("\n--- Suite 13: Sweep Atomicity & Multi-Bill Charges ---");
+
+  const todayStr = format(toZonedTime(new Date(), "America/Toronto"), "yyyy-MM-dd");
+
+  // 13a. Daily sweep with multiple bills due on same day to same card accumulates all charges (no lost updates)
+  const sweepCardRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/credit-cards",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Multi-Bill Sweep Card",
+      creditLimit: 1000,
+      currentBalance: 0,
+    }
+  );
+  assert(sweepCardRes.status === 201 && sweepCardRes.body.id, "Creates test card with balance $0");
+  const sweepCardId = sweepCardRes.body.id;
+
+  const bill1 = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Due Bill 1",
+      amount: 10.0,
+      category: "Bills & Utilities",
+      creditCardId: sweepCardId,
+      due_date: todayStr,
+      is_paid: false,
+    }
+  );
+  const bill2 = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Due Bill 2",
+      amount: 15.0,
+      category: "Bills & Utilities",
+      creditCardId: sweepCardId,
+      due_date: todayStr,
+      is_paid: false,
+    }
+  );
+  assert(bill1.status === 201 && bill2.status === 201, "Creates two unpaid bills ($10 & $15) due today on same card");
+
+  const sweepCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/daily-check",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(sweepCheck.status === 200, "Executes daily sweep on due bills");
+
+  let sweepCardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  let foundSweepCard = (sweepCardQuery.body || []).find((c) => c.id === sweepCardId);
+  assert(parseFloat(foundSweepCard.currentBalance) === 25.0, "Card balance is exactly $25.00 (accumulated both $10 and $15 without lost update)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${bill1.body.id}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${bill2.body.id}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  sweepCardQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  foundSweepCard = (sweepCardQuery.body || []).find((c) => c.id === sweepCardId);
+  assert(parseFloat(foundSweepCard.currentBalance) === 0.0, "Deleting both swept bills cleanly returns card balance to $0");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/credit-cards/${sweepCardId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // 13b. Updating tax-exclusive expense with a new amount without baseAmount updates amount cleanly
+  const taxNewAmtExp = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Tax New Amount Test",
+      amount: 100.0,
+      category: "Utilities",
+      isTaxExclusive: true,
+      taxRate: 13,
+      date: "2099-12-01",
+    }
+  );
+  assert(taxNewAmtExp.status === 201 && taxNewAmtExp.body.id, "Creates tax-exclusive bill $100");
+
+  // Pay bill -> 113.00
+  await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${taxNewAmtExp.body.id}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    { isCleared: true }
+  );
+
+  // Edit with a brand new amount (200.00) without baseAmount
+  const editNewAmtRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${taxNewAmtExp.body.id}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    {
+      amount: 200.0,
+    }
+  );
+  assert(
+    editNewAmtRes.status === 200 && parseFloat(editNewAmtRes.body.amount) === 226.0,
+    "Editing tax-exclusive expense with new amount 200.00 applies tax to yield $226.00 (not silently ignored)"
+  );
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${taxNewAmtExp.body.id}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // 13c. Manual debt payment on due date does NOT block scheduled auto-pay
+  const autoPayDebtRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/debts",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Unblocked AutoPay Debt",
+      total_amount: 100.0,
+      monthly_payment: 25.0,
+      auto_pay: true,
+      next_due_date: todayStr,
+    }
+  );
+  assert(autoPayDebtRes.status === 201 && autoPayDebtRes.body.id, "Creates auto-pay debt due today with balance $100");
+  const autoPayDebtId = autoPayDebtRes.body.id;
+
+  // Make manual payment of $10 today
+  const manualPayRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/debts/${autoPayDebtId}/pay`,
+      method: "POST",
+      headers: authHeaders,
+    },
+    { amount: 10.0 }
+  );
+  assert(manualPayRes.status === 200 && parseFloat(manualPayRes.body.total_remaining) === 90.0, "Manual payment of $10 reduces debt to $90");
+
+  // Run daily sweep: auto-pay should NOT be blocked by manual payment
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/daily-check",
+    method: "GET",
+    headers: authHeaders,
+  });
+
+  const debtAfterSweep = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const foundDebtAfterSweep = (debtAfterSweep.body || []).find((d) => d.id === autoPayDebtId);
+  assert(
+    parseFloat(foundDebtAfterSweep.total_remaining) === 65.0,
+    "Scheduled auto-pay ($25) executes successfully despite earlier manual payment ($90 - $25 = $65)"
+  );
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/debts/${autoPayDebtId}`,
     method: "DELETE",
     headers: authHeaders,
   });

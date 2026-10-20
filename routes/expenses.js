@@ -60,9 +60,11 @@ const adjustAccountForTransaction = async (
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
       if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-        fromAcc.initialBalance =
-          Math.round((parseFloat(fromAcc.initialBalance || 0) + amount) * 100) / 100;
-        await fromAcc.save({ transaction: dbTx });
+        await Account.increment("initialBalance", {
+          by: amount,
+          where: { id: trx.fromAccountId },
+          transaction: dbTx,
+        });
         applied = true;
       }
     }
@@ -72,14 +74,18 @@ const adjustAccountForTransaction = async (
       const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
       if (toAcc) {
         if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-          toAcc.initialBalance =
-            Math.round((parseFloat(toAcc.initialBalance || 0) - amount) * 100) / 100;
-          await toAcc.save({ transaction: dbTx });
+          await Account.increment("initialBalance", {
+            by: -amount,
+            where: { id: trx.toAccountId },
+            transaction: dbTx,
+          });
           applied = true;
         } else if (toAcc.type === "SAVINGS_GOAL") {
-          toAcc.initialBalance =
-            Math.round((parseFloat(toAcc.initialBalance || 0) + amount) * 100) / 100;
-          await toAcc.save({ transaction: dbTx });
+          await Account.increment("initialBalance", {
+            by: amount,
+            where: { id: trx.toAccountId },
+            transaction: dbTx,
+          });
           applied = true;
         }
       }
@@ -97,9 +103,11 @@ const adjustAccountForTransaction = async (
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
       if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-        fromAcc.initialBalance =
-          Math.round((parseFloat(fromAcc.initialBalance || 0) - amount) * 100) / 100;
-        await fromAcc.save({ transaction: dbTx });
+        await Account.increment("initialBalance", {
+          by: -amount,
+          where: { id: trx.fromAccountId },
+          transaction: dbTx,
+        });
       }
     }
 
@@ -108,13 +116,17 @@ const adjustAccountForTransaction = async (
       const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
       if (toAcc) {
         if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-          toAcc.initialBalance =
-            Math.round((parseFloat(toAcc.initialBalance || 0) + amount) * 100) / 100;
-          await toAcc.save({ transaction: dbTx });
+          await Account.increment("initialBalance", {
+            by: amount,
+            where: { id: trx.toAccountId },
+            transaction: dbTx,
+          });
         } else if (toAcc.type === "SAVINGS_GOAL") {
-          toAcc.initialBalance =
-            Math.round((parseFloat(toAcc.initialBalance || 0) - amount) * 100) / 100;
-          await toAcc.save({ transaction: dbTx });
+          await Account.increment("initialBalance", {
+            by: -amount,
+            where: { id: trx.toAccountId },
+            transaction: dbTx,
+          });
         }
       }
     }
@@ -500,10 +512,22 @@ router.put(
       let nextBaseAmount;
       if (req.body.baseAmount !== undefined && req.body.baseAmount !== null) {
         nextBaseAmount = parseFloat(req.body.baseAmount);
+      } else if (req.body.amount !== undefined && req.body.amount !== null) {
+        if (
+          trx.isTaxExclusive &&
+          trx.taxApplied &&
+          parseFloat(req.body.amount) === parseFloat(trx.amount) &&
+          trx.baseAmount !== null &&
+          trx.baseAmount !== undefined
+        ) {
+          // Caller passed the existing tax-inclusive total amount without intending to compound tax
+          nextBaseAmount = parseFloat(trx.baseAmount);
+        } else {
+          // Caller explicitly supplied a new amount for this tax-exclusive expense; treat it as the new pre-tax baseAmount
+          nextBaseAmount = parseFloat(req.body.amount);
+        }
       } else if (trx.baseAmount !== null && trx.baseAmount !== undefined) {
         nextBaseAmount = parseFloat(trx.baseAmount);
-      } else if (req.body.amount !== undefined && req.body.amount !== null) {
-        nextBaseAmount = parseFloat(req.body.amount);
       } else {
         nextBaseAmount = parseFloat(trx.amount);
       }

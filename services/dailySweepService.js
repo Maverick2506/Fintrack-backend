@@ -82,19 +82,21 @@ const runDailySweep = async () => {
           bill.fromAccount.type === "CREDIT_CARD" &&
           !bill.toAccountId
         ) {
-          bill.fromAccount.initialBalance =
-            parseFloat(bill.fromAccount.initialBalance || 0) + amt;
-          await bill.fromAccount.save({ transaction: dbTx });
+          await Account.increment("initialBalance", {
+            by: amt,
+            where: { id: bill.fromAccountId },
+            transaction: dbTx,
+          });
         } else if (
           bill.toAccount &&
           (bill.toAccount.type === "DEBT" ||
             bill.toAccount.type === "CREDIT_CARD")
         ) {
-          bill.toAccount.initialBalance =
-            Math.round(
-              (parseFloat(bill.toAccount.initialBalance || 0) - amt) * 100
-            ) / 100;
-          await bill.toAccount.save({ transaction: dbTx });
+          await Account.increment("initialBalance", {
+            by: -amt,
+            where: { id: bill.toAccountId },
+            transaction: dbTx,
+          });
         }
         clearedExpenseCount++;
       }
@@ -143,8 +145,7 @@ const runDailySweep = async () => {
           where: {
             toAccountId: debt.id,
             date: todayString,
-            type: "EXPENSE",
-            category: "Debt",
+            title: `Auto-Pay for ${debt.name}`,
           },
           transaction: dbTx,
         });
