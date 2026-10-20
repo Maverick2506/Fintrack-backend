@@ -14,7 +14,7 @@ const {
 } = require("../services/accountBalanceService");
 const router = express.Router();
 
-router.use(authMiddleware);
+router.use("/expenses", authMiddleware);
 
 // Helper to format YYYY-MM-DD month boundaries cleanly
 const getMonthDateRange = (year, month) => {
@@ -507,7 +507,7 @@ router.put(
         if (!nextRecurringGroupId) {
           nextRecurringGroupId = crypto.randomUUID();
         }
-      } else {
+      } else if (!trx.recurringGroupId) {
         nextRecurringGroupId = null;
       }
 

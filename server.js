@@ -120,7 +120,7 @@ app.use("/api/budgets", budgetRoutes);
 app.use("/api/forecast", forecastRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/net-worth-history", netWorthHistoryRoutes);
-app.use("/api", subscriptionRoutes);
+app.use("/api/subscriptions", subscriptionRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);

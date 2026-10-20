@@ -1,3 +1,4 @@
+process.env.RELAX_RATE_LIMIT = "true";
 const { Sequelize } = require("sequelize");
 const { Account, Transaction, Setting, Budget, NetWorthSnapshot } = require("../models");
 const { restoreBackup } = require("../scripts/restore");
@@ -3308,6 +3309,35 @@ async function runTestSuite() {
   // safeToSpend = 2100 - buffer(200) = 1900.
   assert(forecast.safeToSpend === 1900, "safeToSpend correctly calculated as $1900.00 (minBeforePayday 2100 - buffer 200)");
 
+  // Test Fix #4: Bill marked paid before its due date must not be deducted twice
+  const day5Str = getOffsetDate(5);
+  const paidEarlyBillRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Early Paid Bill",
+    amount: 100,
+    due_date: day5Str,
+    is_paid: true,
+  });
+  assert(paidEarlyBillRes.status === 201, "Creates bill due on Day 5 marked paid today");
+
+  const forecastAfterEarlyPaid = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/forecast?days=60",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const day5Entry = forecastAfterEarlyPaid.body.days.find((d) => d.date === day5Str);
+  const day5Titles = day5Entry ? day5Entry.items.map((it) => it.title) : [];
+  assert(!day5Titles.includes("Suite 25 Early Paid Bill"), "Forecast does NOT count early-paid bill again on Day 5 due date");
+
+  await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + paidEarlyBillRes.body.id, method: "DELETE", headers: authHeaders });
+
   // Clean up Suite 25 records
   await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + checkingBillRes.body.id, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + suite25CardChargeRes.body.id, method: "DELETE", headers: authHeaders });
@@ -3956,6 +3986,70 @@ async function runTestSuite() {
   assert(subRes.body.totalMonthly === expectedTotalMonthly, "totalMonthly accurately reflects sum of active subscriptions");
   const expectedTotalAnnual = Math.round((netflixSub.annualCost + gymSub.annualCost + primeSub.annualCost) * 100) / 100;
   assert(subRes.body.totalAnnual === expectedTotalAnnual, "totalAnnual accurately reflects sum of active subscriptions");
+
+  // Test Fix #5: Unknown /api/* paths return 404 without authorization token
+  const unauthUnknownRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/does-not-exist-xyz",
+    method: "GET",
+  });
+  assert(unauthUnknownRes.status === 404, "GET /api/does-not-exist-xyz without token returns HTTP 404 (not 401)");
+
+  // Test Fix #2: Dedicated POST /api/subscriptions/:recurringGroupId/cancel
+  const cancelTestGroupId = crypto.randomUUID();
+  const subCancelPast = await Transaction.create({
+    title: "Spotify Family",
+    amount: 18.99,
+    date: "2026-01-10",
+    type: "EXPENSE",
+    category: "Entertainment",
+    recurrence: "monthly",
+    isCleared: true,
+    recurringGroupId: cancelTestGroupId,
+    fromAccountId: subCardId,
+  });
+  const subCancelFutureUnpaid = await Transaction.create({
+    title: "Spotify Family",
+    amount: 18.99,
+    date: "2026-11-10",
+    type: "EXPENSE",
+    category: "Entertainment",
+    recurrence: "monthly",
+    isCleared: false,
+    recurringGroupId: cancelTestGroupId,
+    fromAccountId: subCardId,
+  });
+
+  // Verify cancel endpoint
+  const cancelRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/subscriptions/" + cancelTestGroupId + "/cancel",
+    method: "POST",
+    headers: authHeaders,
+  });
+  assert(cancelRes.status === 200 && cancelRes.body.success === true, "POST /api/subscriptions/:id/cancel returns HTTP 200 with success: true");
+  assert(cancelRes.body.deletedRows >= 1, "Cancelling subscription deletes future unpaid occurrences");
+
+  // Verify future unpaid was destroyed
+  const checkFuture = await Transaction.findByPk(subCancelFutureUnpaid.id);
+  assert(checkFuture === null, "Future unpaid occurrence successfully deleted from DB");
+
+  // Verify historical occurrence kept recurringGroupId but recurrence is 'none'
+  const checkPast = await Transaction.findByPk(subCancelPast.id);
+  assert(checkPast.recurrence === "none", "Past occurrence recurrence updated to 'none'");
+  assert(checkPast.recurringGroupId === cancelTestGroupId, "Past occurrence keeps its recurringGroupId intact");
+
+  // Verify createRecurringExpenses generates no duplicate rows
+  await createRecurringExpenses();
+  const afterSweepOccurrences = await Transaction.findAll({
+    where: { recurringGroupId: cancelTestGroupId },
+  });
+  assert(afterSweepOccurrences.length === 1, "Sweep does not resurrect cancelled subscription or create duplicate charges");
+
+  // Cleanup cancel test records
+  await subCancelPast.destroy();
 
   // Cleanup Suite 30
   await netflix1.destroy();

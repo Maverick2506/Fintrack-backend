@@ -7,7 +7,7 @@ const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
 
-router.use(authMiddleware);
+router.use("/debts", authMiddleware);
 
 const TIMEZONE = "America/Toronto";
 const getTodayString = () =>

@@ -7,7 +7,7 @@ const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
 const router = express.Router();
 
-router.use(authMiddleware);
+router.use("/paycheques", authMiddleware);
 
 const TIMEZONE = "America/Toronto";
 const getTodayString = () =>

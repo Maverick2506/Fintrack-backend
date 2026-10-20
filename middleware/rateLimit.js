@@ -1,7 +1,6 @@
 const rateLimit = require("express-rate-limit");
 
 const isRelaxed =
-  process.env.NODE_ENV !== "production" ||
   process.env.NODE_ENV === "test" ||
   process.env.RELAX_RATE_LIMIT === "true";
 

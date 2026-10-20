@@ -1,9 +1,12 @@
 const express = require("express");
 const { Op } = require("sequelize");
-const { Transaction, Account } = require("../models");
+const { toZonedTime, format } = require("date-fns-tz");
+const { Transaction, Account, sequelize } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
 const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
+
+const TIMEZONE = "America/Toronto";
 
 router.use(authMiddleware);
 
@@ -47,8 +50,9 @@ const getComparableAmount = (t) => {
   return parseFloat(t.amount);
 };
 
+// GET /api/subscriptions
 router.get(
-  "/subscriptions",
+  "/",
   asyncHandler(async (req, res) => {
     // 1. Fetch expense transactions that are part of a recurring series
     const recurringTrxs = await Transaction.findAll({
@@ -81,7 +85,9 @@ router.get(
       groups.get(key).push(trx);
     }
 
-    const todayStr = new Date().toISOString().slice(0, 10);
+    // Use America/Toronto timezone for current date comparison (m3)
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
     const subscriptions = [];
 
     for (const [, occurrences] of groups.entries()) {
@@ -96,8 +102,9 @@ router.get(
       }
 
       const cadence = latestTrx.recurrence;
-      const latestAmount = getComparableAmount(latestTrx);
-      const { monthlyCost, annualCost } = normalizeCadence(latestAmount, cadence);
+      // Use taxed total amount for monthly and annual costs (m2)
+      const chargedAmount = parseFloat(latestTrx.amount) || 0;
+      const { monthlyCost, annualCost } = normalizeCadence(chargedAmount, cadence);
 
       // Paying account
       let payingAccountName = "Primary Checking";
@@ -116,6 +123,16 @@ router.get(
         unpaidOccurrences[0] ||
         null;
 
+      // Future unpaid occurrences (for cancel confirmation and count)
+      const futureUnpaidOccurrences = occurrences.filter(
+        (t) => !t.isCleared && t.date > todayStr
+      );
+      const unpaidUpcomingCount = futureUnpaidOccurrences.length;
+      const unpaidUpcomingTotal =
+        Math.round(
+          futureUnpaidOccurrences.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0) * 100
+        ) / 100;
+
       // Cleared occurrences
       const clearedOccurrences = occurrences.filter((t) => t.isCleared);
       const latestCleared =
@@ -125,7 +142,7 @@ router.get(
 
       // Price change detection:
       // Compare the latest cleared amount with the previous cleared amount in the same series.
-      // If they differ by > $0.01 -> priceChange: { from, to, date, percent, difference }
+      // If baseAmount is specified for tax-exclusive expenses, compare baseAmount.
       let priceChange = null;
       if (clearedOccurrences.length >= 2) {
         const prevCleared = clearedOccurrences[clearedOccurrences.length - 2];
@@ -153,7 +170,7 @@ router.get(
         name: latestTrx.title,
         category: latestTrx.category || "Subscriptions",
         cadence,
-        latestAmount,
+        latestAmount: chargedAmount,
         baseAmount:
           latestTrx.baseAmount !== null && latestTrx.baseAmount !== undefined
             ? parseFloat(latestTrx.baseAmount)
@@ -168,6 +185,8 @@ router.get(
         isCreditCard,
         accountId,
         priceChange,
+        unpaidUpcomingCount,
+        unpaidUpcomingTotal,
       });
     }
 
@@ -185,6 +204,86 @@ router.get(
       totalAnnual,
       count: subscriptions.length,
     });
+  })
+);
+
+// POST /api/subscriptions/:recurringGroupId/cancel (Fix #2)
+router.post(
+  "/:recurringGroupId/cancel",
+  asyncHandler(async (req, res) => {
+    const { recurringGroupId } = req.params;
+    if (!recurringGroupId) {
+      return res.status(400).json({ error: "Missing subscription identifier." });
+    }
+
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
+
+    const dbTx = await sequelize.transaction();
+    try {
+      // Find all transactions matching recurringGroupId
+      let seriesTrxs = await Transaction.findAll({
+        where: { recurringGroupId },
+        transaction: dbTx,
+      });
+
+      // Fallback: if not found by recurringGroupId, check if ID matches a single transaction
+      if (seriesTrxs.length === 0) {
+        const single = await Transaction.findByPk(recurringGroupId, { transaction: dbTx });
+        if (single) {
+          if (single.recurringGroupId) {
+            seriesTrxs = await Transaction.findAll({
+              where: { recurringGroupId: single.recurringGroupId },
+              transaction: dbTx,
+            });
+          } else {
+            seriesTrxs = [single];
+          }
+        }
+      }
+
+      if (seriesTrxs.length === 0) {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Subscription series not found." });
+      }
+
+      // Delete unpaid occurrences dated strictly after today
+      const toDelete = seriesTrxs.filter(
+        (t) => !t.isCleared && t.date > todayStr
+      );
+      const toDeleteIds = toDelete.map((t) => t.id);
+
+      if (toDeleteIds.length > 0) {
+        await Transaction.destroy({
+          where: { id: { [Op.in]: toDeleteIds } },
+          transaction: dbTx,
+        });
+      }
+
+      // Update remaining transactions in series to recurrence = "none" (keeping recurringGroupId)
+      const remaining = seriesTrxs.filter((t) => !toDeleteIds.includes(t.id));
+      const remainingIds = remaining.map((t) => t.id);
+
+      if (remainingIds.length > 0) {
+        await Transaction.update(
+          { recurrence: "none" },
+          {
+            where: { id: { [Op.in]: remainingIds } },
+            transaction: dbTx,
+          }
+        );
+      }
+
+      await dbTx.commit();
+      res.json({
+        success: true,
+        cancelledRows: remainingIds.length,
+        deletedRows: toDeleteIds.length,
+      });
+    } catch (err) {
+      await dbTx.rollback();
+      throw err;
+    }
   })
 );
 

@@ -20,7 +20,7 @@ if (GEMINI_API_KEY) {
   console.error("GEMINI_API_KEY is not set. AI features will be disabled.");
 }
 
-router.use(authMiddleware);
+router.use(["/financial-advice", "/categorize-expense", "/chat-advisor"], authMiddleware);
 
 // --- 1. STRUCTURED FINANCIAL ADVICE ---
 router.post("/financial-advice", async (req, res) => {

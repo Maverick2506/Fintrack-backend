@@ -9,7 +9,7 @@ const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
 
-router.use(authMiddleware);
+router.use(["/dashboard", "/spending-summary", "/trends", "/checking"], authMiddleware);
 
 const TIMEZONE = "America/Toronto";
 

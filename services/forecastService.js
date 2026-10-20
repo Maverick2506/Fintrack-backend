@@ -113,6 +113,11 @@ const getForecast = async (daysCount = 60, dbTx = null) => {
       continue;
     }
 
+    // Cleared expenses or transfers: already deducted from startBalance regardless of date (Fix #4)
+    if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.isCleared) {
+      continue;
+    }
+
     // Today items: if already cleared today, they are already baked into startBalance
     if (isToday && trx.isCleared) {
       continue;

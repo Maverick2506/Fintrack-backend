@@ -27,14 +27,12 @@ jobs:
             cat d.json
             exit 1
           fi
-          AUTH_HEADER=""
-          if [ -n "$NTFY_TOKEN" ]; then
-            AUTH_HEADER="-H \"Authorization: Bearer $NTFY_TOKEN\""
-          fi
-          eval curl -fsS $AUTH_HEADER \
-            -H "\"Title: $(jq -r .title d.json)\"" \
-            -H "\"Priority: $(jq -r .priority d.json)\"" \
-            -H "\"Tags: $(jq -r .tags d.json)\"" \
-            -d "\"$(jq -r .message d.json)\"" \
-            "https://ntfy.sh/$NTFY_TOPIC"
+          jq --arg t "$NTFY_TOPIC" '{
+            topic: $t,
+            title,
+            message,
+            priority: (if .priority == "high" then 4 else 3 end),
+            tags: (.tags | split(","))
+          }' d.json \
+          | curl -fsS ${NTFY_TOKEN:+-H "Authorization: Bearer $NTFY_TOKEN"} -H "Content-Type: application/json" -d @- "https://ntfy.sh/"
           echo "Morning digest successfully delivered to ntfy topic."
