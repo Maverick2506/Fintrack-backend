@@ -1285,6 +1285,176 @@ async function runTestSuite() {
     headers: authHeaders,
   });
 
+  // --- Suite 14: Overdue Manual Bill Payment & Savings Goal Balance Preservation ---
+  console.log("\n--- Suite 14: Overdue Manual Bill Payment & Savings Goal Balance ---");
+
+  // 14a. Overdue bill marked paid by hand reduces the debt balance (not ignored)
+  const overdueDebtRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/debts",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Overdue Loan",
+      total_amount: 100.0,
+      monthly_payment: 10.0,
+    }
+  );
+  assert(overdueDebtRes.status === 201 && overdueDebtRes.body.id, "Creates test debt $100");
+  const overdueDebtId = overdueDebtRes.body.id;
+
+  // Unpaid bill due in past
+  const overdueBillRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Overdue Bill",
+      amount: 10.0,
+      category: "Debt",
+      targetAccountId: overdueDebtId,
+      due_date: "2020-01-01",
+      is_paid: false,
+    }
+  );
+  assert(overdueBillRes.status === 201 && overdueBillRes.body.id, "Creates unpaid bill dated in past on debt");
+  const overdueBillId = overdueBillRes.body.id;
+
+  // Verify debt balance is still 100 before payment
+  let debtQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  let foundOverdueDebt = (debtQuery.body || []).find((d) => d.id === overdueDebtId);
+  assert(parseFloat(foundOverdueDebt.total_remaining) === 100.0, "Debt balance is $100 before marking bill paid");
+
+  // Mark bill paid by hand via PUT /expenses/:id
+  const markPaidRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${overdueBillId}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    { is_paid: true }
+  );
+  assert(markPaidRes.status === 200, "Marks overdue bill paid by hand with HTTP 200");
+
+  debtQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  foundOverdueDebt = (debtQuery.body || []).find((d) => d.id === overdueDebtId);
+  assert(parseFloat(foundOverdueDebt.total_remaining) === 90.0, "Overdue bill marked paid by hand reduces debt balance to $90.00 (not ignored)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${overdueBillId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  debtQuery = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "GET",
+    headers: authHeaders,
+  });
+  foundOverdueDebt = (debtQuery.body || []).find((d) => d.id === overdueDebtId);
+  assert(parseFloat(foundOverdueDebt.total_remaining) === 100.0, "Deleting paid overdue bill cleanly restores debt balance to $100.00");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/debts/${overdueDebtId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // 14b. Savings goal contributions always preserve balanceApplied and cleanly reverse on delete
+  const savingsGoalRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/savings-goals",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Vacation Fund",
+      target_amount: 1000,
+      current_amount: 100,
+    }
+  );
+  assert(savingsGoalRes.status === 201 && savingsGoalRes.body.id, "Creates test savings goal with $100");
+  const savingsGoalId = savingsGoalRes.body.id;
+
+  const contribRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/savings-goals/${savingsGoalId}/contribute`,
+      method: "POST",
+      headers: authHeaders,
+    },
+    { amount: 50.0 }
+  );
+  assert(contribRes.status === 200 && parseFloat(contribRes.body.current_amount) === 150.0, "Contribution of $50 increases savings goal to $150");
+
+  // Query transactions from full ledger to find the contribution
+  const trxList = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses/all",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const allTrx = Array.isArray(trxList.body) ? trxList.body : [];
+  const contribTrx = allTrx.find((t) => t.targetAccountId === savingsGoalId);
+  assert(contribTrx && contribTrx.balanceApplied === true, "Savings contribution has balanceApplied: true");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${contribTrx.id}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  const goalsList = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const foundGoal = (goalsList.body || []).find((g) => g.id === savingsGoalId);
+  assert(parseFloat(foundGoal.current_amount) === 100.0, "Deleting savings contribution cleanly reduces savings goal to $100");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/savings-goals/${savingsGoalId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

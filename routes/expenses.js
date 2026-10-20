@@ -278,6 +278,7 @@ router.get(
       payment_date: t.type === "INCOME" ? t.date : undefined,
       category: t.category,
       is_paid: t.isCleared,
+      balanceApplied: Boolean(t.balanceApplied),
       recurrence: t.recurrence || "none",
       creditCardId:
         t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
@@ -430,6 +431,7 @@ router.put(
         return res.status(404).json({ error: "Transaction not found" });
       }
 
+      const wasCleared = Boolean(trx.isCleared);
       const wasBalanceApplied = Boolean(trx.balanceApplied);
       // Reverse old transaction's effect on any linked credit card / debt / savings account
       await adjustAccountForTransaction(trx, -1, dbTx);
@@ -590,7 +592,13 @@ router.put(
       );
 
       // Apply updated transaction's effect on linked account, preserving applied status if it had already been applied
-      await adjustAccountForTransaction(trx, 1, dbTx, wasBalanceApplied);
+      // or if transitioning from unpaid to paid (e.g. overdue bill paid manually)
+      await adjustAccountForTransaction(
+        trx,
+        1,
+        dbTx,
+        wasBalanceApplied || (!wasCleared && nextIsCleared)
+      );
 
       await dbTx.commit();
       res.json(trx);

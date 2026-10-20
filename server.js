@@ -333,9 +333,7 @@ async function initialize() {
         for (const t of rows) {
           const isTargeted =
             (t.toAccount &&
-              ["DEBT", "CREDIT_CARD", "SAVINGS_GOAL"].includes(
-                t.toAccount.type
-              )) ||
+              ["DEBT", "CREDIT_CARD"].includes(t.toAccount.type)) ||
             (t.fromAccount && t.fromAccount.type === "CREDIT_CARD");
 
           if (isTargeted && t.createdAt) {
@@ -361,6 +359,40 @@ async function initialize() {
 
         await Setting.upsert({
           key: "balance_applied_correction_v1",
+          value: "true",
+        });
+      }
+
+      // Deliberate One-Off Restoration: Ensure all cleared savings goal contributions have balanceApplied: true
+      const savingsRestored = await Setting.findByPk(
+        "balance_applied_savings_restoration_v1"
+      );
+      if (!savingsRestored || savingsRestored.value !== "true") {
+        const savingsContributions = await Transaction.findAll({
+          where: {
+            isCleared: true,
+            balanceApplied: false,
+            toAccountId: { [Op.ne]: null },
+          },
+          include: [{ model: Account, as: "toAccount" }],
+        });
+
+        const restoreIds = savingsContributions
+          .filter((t) => t.toAccount && t.toAccount.type === "SAVINGS_GOAL")
+          .map((t) => t.id);
+
+        if (restoreIds.length > 0) {
+          await Transaction.update(
+            { balanceApplied: true },
+            { where: { id: { [Op.in]: restoreIds } } }
+          );
+          console.log(
+            `✅ Restored balanceApplied = true for ${restoreIds.length} savings goal contribution transactions.`
+          );
+        }
+
+        await Setting.upsert({
+          key: "balance_applied_savings_restoration_v1",
           value: "true",
         });
       }
