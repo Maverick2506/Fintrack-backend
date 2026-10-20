@@ -40,6 +40,12 @@ const adjustAccountForTransaction = async (
   const todayStr = getTodayString();
   const isPastDated = trx.date < todayStr;
 
+  let toAcc = null;
+  if (trx.toAccountId) {
+    toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
+  }
+  const isSavingsGoal = Boolean(toAcc && toAcc.type === "SAVINGS_GOAL");
+
   if (direction === 1) {
     // Already applied? Skip to prevent double counting
     if (trx.balanceApplied) return;
@@ -47,9 +53,10 @@ const adjustAccountForTransaction = async (
     // Unpaid/pending expenses have not affected account balances yet
     if (trx.type === "EXPENSE" && !trx.isCleared) return;
 
-    // Historical past-dated transactions (created with a past date) were already in the account's opening balance.
-    // If forceApply is true (e.g. editing an already-applied transaction), re-apply regardless of date.
-    if (isPastDated && !trx.balanceApplied && !forceApply) {
+    // Historical past-dated transactions (created with a past date) on cards/debts were already in opening balance.
+    // Savings goals are exempt: every contribution towards a savings goal adds to the goal regardless of date.
+    // If forceApply is true (e.g. editing an already-applied transaction or overdue bill paid), re-apply regardless of date.
+    if (isPastDated && !trx.balanceApplied && !forceApply && !isSavingsGoal) {
       trx.balanceApplied = false;
       await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
       return;
@@ -71,7 +78,6 @@ const adjustAccountForTransaction = async (
 
     // 2. Cleared EXPENSE or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
     if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.toAccountId) {
-      const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
       if (toAcc) {
         if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
           await Account.increment("initialBalance", {
@@ -113,7 +119,6 @@ const adjustAccountForTransaction = async (
 
     // 2. Reverse EXPENSE or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
     if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.toAccountId) {
-      const toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
       if (toAcc) {
         if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
           await Account.increment("initialBalance", {

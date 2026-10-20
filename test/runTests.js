@@ -1455,6 +1455,81 @@ async function runTestSuite() {
     headers: authHeaders,
   });
 
+  // 14c. Backdated savings contribution entered via Add Transaction applies to goal balance
+  const backdatedGoalRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/savings-goals",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Emergency Fund",
+      target_amount: 1000,
+      current_amount: 500,
+    }
+  );
+  assert(backdatedGoalRes.status === 201 && backdatedGoalRes.body.id, "Creates test savings goal with $500");
+  const backdatedGoalId = backdatedGoalRes.body.id;
+
+  // Add a $100 contribution dated 10 days ago (2020-01-01)
+  const backdatedExpRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Backdated Savings Deposit",
+      amount: 100.0,
+      category: "Savings Transfer",
+      targetAccountId: backdatedGoalId,
+      due_date: "2020-01-01",
+      is_paid: true,
+    }
+  );
+  assert(backdatedExpRes.status === 201 && backdatedExpRes.body.id, "Creates backdated savings contribution of $100");
+  const backdatedExpId = backdatedExpRes.body.id;
+
+  let goalCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  let foundBackdatedGoal = (goalCheck.body || []).find((g) => g.id === backdatedGoalId);
+  assert(parseFloat(foundBackdatedGoal.current_amount) === 600.0, "Backdated savings contribution applies to goal ($500 -> $600)");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${backdatedExpId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  goalCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  foundBackdatedGoal = (goalCheck.body || []).find((g) => g.id === backdatedGoalId);
+  assert(parseFloat(foundBackdatedGoal.current_amount) === 500.0, "Deleting backdated savings contribution cleanly restores goal to $500.00");
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/savings-goals/${backdatedGoalId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
