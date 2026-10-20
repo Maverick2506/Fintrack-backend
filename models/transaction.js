@@ -68,6 +68,11 @@ const Transaction = sequelize.define(
       { fields: ["date"] },
       { fields: ["fromAccountId"] },
       { fields: ["toAccountId"] },
+      {
+        unique: true,
+        fields: ["recurringGroupId", "date"],
+        name: "transactions_recurring_group_date_unique",
+      },
     ],
   }
 );

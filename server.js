@@ -199,6 +199,26 @@ async function initialize() {
         });
       }
 
+      // Safely ensure unique index on (recurringGroupId, date) exists
+      try {
+        const existingIndexes = await queryInterface.showIndex("Transactions");
+        const hasRecurringDateIndex = existingIndexes.some(
+          (idx) => idx.name === "transactions_recurring_group_date_unique"
+        );
+        if (!hasRecurringDateIndex) {
+          await queryInterface.addIndex(
+            "Transactions",
+            ["recurringGroupId", "date"],
+            {
+              unique: true,
+              name: "transactions_recurring_group_date_unique",
+            }
+          );
+        }
+      } catch (idxErr) {
+        // Index may already exist or dialect specific notice
+      }
+
       // Deliberate Backfill 1: balanceApplied (runs once, guarded by Setting flag)
       const balanceAppliedSetting = await Setting.findByPk(
         "legacy_balance_applied_backfilled"
