@@ -132,6 +132,7 @@ router.get(
         ],
         where: {
           type: "EXPENSE",
+          isCleared: true,
           date: { [Op.between]: [startOfMonth, endOfMonth] },
         },
         group: ["category"],
@@ -231,6 +232,7 @@ router.get(
       ],
       where: {
         type: "EXPENSE",
+        isCleared: true,
         date: { [Op.between]: [startOfMonth, endOfMonth] },
       },
       group: ["category"],
@@ -281,6 +283,7 @@ router.get(
       attributes: ["type", "date", "amount"],
       where: {
         type: { [Op.in]: ["INCOME", "EXPENSE"] },
+        isCleared: true,
         date: { [Op.between]: [windowStart, windowEnd] },
       },
       raw: true,
