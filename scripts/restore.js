@@ -25,8 +25,8 @@ if (fs.existsSync(envPath)) {
  * @param {boolean} options.force - Overwrite if data exists
  * @param {boolean} [options.production] - Explicit confirmation when target is production database
  * @param {object} [options.sequelizeInstance] - Optional Sequelize instance (for testing/custom DB)
- * @param {object} [options.models] - Optional custom models { Account, Transaction, Setting, Budget }
- * @returns {Promise<{accountsRestored: number, transactionsRestored: number, settingsRestored: number, budgetsRestored: number}>}
+ * @param {object} [options.models] - Optional custom models { Account, Transaction, Setting, Budget, NetWorthSnapshot }
+ * @returns {Promise<{accountsRestored: number, transactionsRestored: number, settingsRestored: number, budgetsRestored: number, snapshotsRestored: number}>}
  */
 async function restoreBackup(backupData, options = {}) {
   const { force = false, production = false, sequelizeInstance, models } = options;
@@ -40,6 +40,7 @@ async function restoreBackup(backupData, options = {}) {
   const Transaction = models ? models.Transaction : require("../models").Transaction;
   const Setting = models ? models.Setting : require("../models").Setting;
   const Budget = models ? models.Budget : require("../models").Budget;
+  const NetWorthSnapshot = models ? models.NetWorthSnapshot : require("../models").NetWorthSnapshot;
 
   if (!backupData || backupData.format !== "fintrack-backup" || backupData.version !== 1) {
     throw new Error('Invalid backup format. Expected "format": "fintrack-backup", "version": 1.');
@@ -84,6 +85,10 @@ async function restoreBackup(backupData, options = {}) {
     rollover: Boolean(b.rollover),
   }));
 
+  const cleanSnapshots = (backupData.netWorthSnapshots || []).map((sn) => ({
+    ...sn,
+  }));
+
   // Perform wipe (if forced) and insertions in a single transaction
   await db.transaction(async (t) => {
     if ((existingTxCount > 0 || existingAccCount > 0) && force) {
@@ -91,6 +96,7 @@ async function restoreBackup(backupData, options = {}) {
       await Account.destroy({ where: {}, transaction: t });
       await Setting.destroy({ where: {}, transaction: t });
       if (Budget) await Budget.destroy({ where: {}, transaction: t });
+      if (NetWorthSnapshot) await NetWorthSnapshot.destroy({ where: {}, transaction: t });
     }
 
     if (cleanAccounts.length > 0) {
@@ -105,6 +111,9 @@ async function restoreBackup(backupData, options = {}) {
     if (cleanBudgets.length > 0 && Budget) {
       await Budget.bulkCreate(cleanBudgets, { transaction: t, validate: false });
     }
+    if (cleanSnapshots.length > 0 && NetWorthSnapshot) {
+      await NetWorthSnapshot.bulkCreate(cleanSnapshots, { transaction: t, validate: false });
+    }
   });
 
   return {
@@ -112,6 +121,7 @@ async function restoreBackup(backupData, options = {}) {
     transactionsRestored: cleanTransactions.length,
     settingsRestored: cleanSettings.length,
     budgetsRestored: cleanBudgets.length,
+    snapshotsRestored: cleanSnapshots.length,
   };
 }
 
@@ -148,15 +158,16 @@ if (require.main === module) {
       if (db.isProductionDb) {
         console.warn("⚠️ WARNING: Target database is REMOTE PRODUCTION (DATABASE_URL)!");
       } else {
-        console.log("ℹ️ Target database is local development database.");
+        console.log("Target database is local SQLite development database.");
       }
 
-      const result = await restoreBackup(backupData, { force, production });
-      console.log("✅ Database restore completed successfully in a single transaction:");
-      console.log(`   - Accounts restored: ${result.accountsRestored}`);
-      console.log(`   - Transactions restored: ${result.transactionsRestored}`);
-      console.log(`   - Settings restored: ${result.settingsRestored}`);
-      console.log(`   - Budgets restored: ${result.budgetsRestored}`);
+      const summary = await restoreBackup(backupData, { force, production, sequelizeInstance: db });
+      console.log("✅ Restore completed successfully:");
+      console.log(`   - Accounts: ${summary.accountsRestored}`);
+      console.log(`   - Transactions: ${summary.transactionsRestored}`);
+      console.log(`   - Settings: ${summary.settingsRestored}`);
+      console.log(`   - Budgets: ${summary.budgetsRestored}`);
+      console.log(`   - Net Worth Snapshots: ${summary.snapshotsRestored}`);
       process.exit(0);
     } catch (err) {
       console.error("❌ Restore failed:", err.message);
@@ -165,6 +176,4 @@ if (require.main === module) {
   })();
 }
 
-module.exports = {
-  restoreBackup,
-};
+module.exports = { restoreBackup };

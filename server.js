@@ -38,6 +38,7 @@ const exportRoutes = require("./routes/export");
 const budgetRoutes = require("./routes/budgets");
 const forecastRoutes = require("./routes/forecast");
 const settingsRoutes = require("./routes/settings");
+const netWorthHistoryRoutes = require("./routes/netWorthHistory");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -117,6 +118,7 @@ app.use("/api", paychequeRoutes);
 app.use("/api/budgets", budgetRoutes);
 app.use("/api/forecast", forecastRoutes);
 app.use("/api/settings", settingsRoutes);
+app.use("/api/net-worth-history", netWorthHistoryRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);
@@ -229,6 +231,25 @@ async function initialize() {
           "⚠️ Could not create recurring unique index (existing duplicates may need manual cleanup):",
           idxErr.message
         );
+      }
+
+      // Safely ensure unique index on NetWorthSnapshots (date) exists
+      try {
+        const snapshotIndexes = await queryInterface.showIndex("NetWorthSnapshots");
+        const hasSnapshotDateIndex = snapshotIndexes.some(
+          (idx) =>
+            idx.name === "net_worth_snapshots_date_unique" ||
+            idx.fields?.some((f) => f.attribute === "date")
+        );
+        if (!hasSnapshotDateIndex) {
+          await queryInterface.addIndex("NetWorthSnapshots", ["date"], {
+            unique: true,
+            name: "net_worth_snapshots_date_unique",
+          });
+          console.log("✅ Added unique index on NetWorthSnapshots(date).");
+        }
+      } catch (snapIdxErr) {
+        // SQLite sync creates unique indexes automatically from model
       }
 
       // Deliberate Backfill 1: balanceApplied (runs once, guarded by Setting flag)

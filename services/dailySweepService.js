@@ -1,8 +1,9 @@
-const { sequelize, Account, Transaction, Setting } = require("../models");
+const { sequelize, Account, Transaction, Setting, NetWorthSnapshot } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const { getNextDueDate } = require("../routes/recurring");
 const { adjustAccountForTransaction } = require("./accountBalanceService");
+const { getBalancesSummary } = require("./netWorthService");
 
 const TIMEZONE = "America/Toronto";
 let isLocalSweepRunning = false;
@@ -199,6 +200,7 @@ const runDailySweep = async () => {
       }
     }
 
+    // 4. Persist last sweep summary
     await Setting.upsert(
       {
         key: "last_sweep_summary",
@@ -213,15 +215,47 @@ const runDailySweep = async () => {
       { transaction: dbTx }
     );
 
+    // 5. Capture or update today's net worth snapshot
+    const balances = await getBalancesSummary(dbTx, todayString);
+    const existingSnapshot = await NetWorthSnapshot.findOne({
+      where: { date: todayString },
+      transaction: dbTx,
+    });
+    if (existingSnapshot) {
+      await existingSnapshot.update(
+        {
+          checking: balances.checking,
+          savings: balances.savings,
+          debt: balances.debt,
+          cards: balances.cards,
+          netWorth: balances.netWorth,
+        },
+        { transaction: dbTx }
+      );
+    } else {
+      await NetWorthSnapshot.create(
+        {
+          date: todayString,
+          checking: balances.checking,
+          savings: balances.savings,
+          debt: balances.debt,
+          cards: balances.cards,
+          netWorth: balances.netWorth,
+        },
+        { transaction: dbTx }
+      );
+    }
+
     await dbTx.commit();
     console.log(
-      `Daily sweep complete: ${clearedExpenseCount} expenses cleared, ${clearedIncomeCount} incomes cleared, ${autoPayCount} auto-pays processed.`
+      `Daily sweep complete: ${clearedExpenseCount} expenses cleared, ${clearedIncomeCount} incomes cleared, ${autoPayCount} auto-pays processed. Net worth snapshot recorded (${balances.netWorth}).`
     );
     return {
       clearedExpenses: clearedExpenseCount,
       clearedIncome: clearedIncomeCount,
       autoPayProcessed: autoPayCount,
       date: todayString,
+      netWorth: balances.netWorth,
     };
   } catch (error) {
     await dbTx.rollback();

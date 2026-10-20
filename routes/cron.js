@@ -3,7 +3,7 @@ const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
 const { runDailySweep } = require("../services/dailySweepService");
 const { createRecurringExpenses } = require("./recurring");
 const { buildMorningDigest } = require("../services/notificationService");
-const { Account, Transaction, Setting, Budget } = require("../models");
+const { Account, Transaction, Setting, Budget, NetWorthSnapshot } = require("../models");
 
 const router = express.Router();
 
@@ -45,11 +45,12 @@ const handleDigest = async (req, res) => {
 
 const handleBackup = async (req, res) => {
   try {
-    const [accounts, transactions, settings, budgets] = await Promise.all([
+    const [accounts, transactions, settings, budgets, netWorthSnapshots] = await Promise.all([
       Account.findAll({ raw: true, order: [["id", "ASC"]] }),
       Transaction.findAll({ raw: true, order: [["id", "ASC"]] }),
       Setting.findAll({ raw: true, order: [["key", "ASC"]] }),
       Budget.findAll({ raw: true, order: [["category", "ASC"]] }),
+      NetWorthSnapshot.findAll({ raw: true, order: [["date", "ASC"]] }),
     ]);
 
     res.status(200).json({
@@ -60,6 +61,7 @@ const handleBackup = async (req, res) => {
       transactions,
       settings,
       budgets,
+      netWorthSnapshots,
     });
   } catch (error) {
     console.error("Backup error:", error);

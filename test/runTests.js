@@ -1,5 +1,5 @@
 const { Sequelize } = require("sequelize");
-const { Account, Transaction, Setting, Budget } = require("../models");
+const { Account, Transaction, Setting, Budget, NetWorthSnapshot } = require("../models");
 const { restoreBackup } = require("../scripts/restore");
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -3459,6 +3459,127 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + billDay4Res.body.id, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + billDay3Res.body.id, method: "DELETE", headers: authHeaders });
 
+
+
+
+  // 27. Net Worth History & Daily Snapshots (Phase G)
+  console.log("\n--- Suite 27: Net Worth History & Daily Snapshots ---");
+
+  // Cleanup any leftover snapshots from previous runs
+  await NetWorthSnapshot.destroy({ where: {} });
+
+  // 1. Initial GET /api/net-worth-history rejects without auth
+  const unauthHistoryRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/net-worth-history",
+    method: "GET",
+  });
+  assert(unauthHistoryRes.status === 401, "GET /api/net-worth-history returns 401 unauthenticated");
+
+  // 2. Initial history is empty
+  const initialHistoryRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/net-worth-history",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(
+    initialHistoryRes.status === 200 &&
+      Array.isArray(initialHistoryRes.body.snapshots) &&
+      initialHistoryRes.body.snapshots.length === 0,
+    "GET /api/net-worth-history returns empty snapshots list initially"
+  );
+  assert(
+    initialHistoryRes.body.change30Days === null,
+    "change30Days is null when no historical snapshot exists"
+  );
+
+  // 3. Trigger Daily Sweep - captures today's snapshot
+  const sweepRes1 = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/daily-check",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(sweepRes1.status === 200, "Daily sweep execution succeeds");
+
+  const snapshotCount1 = await NetWorthSnapshot.count();
+  assert(snapshotCount1 === 1, "Daily sweep created exactly one NetWorthSnapshot for today");
+
+  const todaySnapshot = await NetWorthSnapshot.findOne();
+  assert(
+    todaySnapshot !== null && typeof todaySnapshot.netWorth !== "undefined",
+    "NetWorthSnapshot records today's date and computed netWorth"
+  );
+
+  // 4. Second Daily Sweep on same day is idempotent (updates, does not duplicate)
+  const sweepRes2 = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/daily-check",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(sweepRes2.status === 200, "Second daily sweep succeeds");
+  const snapshotCount2 = await NetWorthSnapshot.count();
+  assert(snapshotCount2 === 1, "Second daily sweep on same day updates snapshot idempotently without duplicating");
+
+  // 5. Seed a baseline snapshot 30 days prior and verify change30Days calculation
+  const todayDateStr = todaySnapshot.date;
+  const { subDays, parseISO, format: fmtDate } = require("date-fns");
+  const priorDate30 = fmtDate(subDays(parseISO(todayDateStr), 30), "yyyy-MM-dd");
+
+  const baselineNW = Math.round((parseFloat(todaySnapshot.netWorth) - 500) * 100) / 100;
+  await NetWorthSnapshot.create({
+    date: priorDate30,
+    checking: 1000,
+    savings: 2000,
+    debt: 500,
+    cards: 100,
+    netWorth: baselineNW,
+  });
+
+  const historyWithBaselineRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/net-worth-history",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(historyWithBaselineRes.status === 200, "GET /api/net-worth-history returns 200 with baseline data");
+  assert(
+    historyWithBaselineRes.body.snapshots.length === 2,
+    "Returns both snapshots in chronological order"
+  );
+  assert(
+    historyWithBaselineRes.body.change30Days !== null &&
+      Math.abs(historyWithBaselineRes.body.change30Days.absolute - 500) < 0.01,
+    "Calculates change30Days.absolute accurately (+500 difference)"
+  );
+  assert(
+    historyWithBaselineRes.body.change30Days.priorDate === priorDate30,
+    "change30Days references the correct priorDate"
+  );
+
+  // 6. Backup includes netWorthSnapshots
+  const backupRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/backup",
+    method: "GET",
+    headers: cronHeaders,
+  });
+  assert(backupRes.status === 200, "Backup endpoint returns HTTP 200");
+  assert(
+    Array.isArray(backupRes.body.netWorthSnapshots) && backupRes.body.netWorthSnapshots.length === 2,
+    "Backup payload includes netWorthSnapshots array with 2 records"
+  );
+
+  // Cleanup Suite 27
+  await NetWorthSnapshot.destroy({ where: {} });
 
 
   // Cleanup

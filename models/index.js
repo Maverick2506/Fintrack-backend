@@ -3,6 +3,7 @@ const Account = require("./account");
 const Transaction = require("./transaction");
 const Setting = require("./setting");
 const Budget = require("./budget");
+const NetWorthSnapshot = require("./netWorthSnapshot");
 
 Account.hasMany(Transaction, {
   as: "outgoingTransactions",
@@ -30,4 +31,5 @@ module.exports = {
   Transaction,
   Setting,
   Budget,
+  NetWorthSnapshot,
 };
