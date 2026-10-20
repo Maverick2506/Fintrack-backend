@@ -207,6 +207,30 @@ async function initialize() {
         });
       }
 
+      // Safely ensure registered account columns exist on Accounts (Phase J)
+      try {
+        const accountTableDesc = await queryInterface.describeTable("Accounts");
+        if (!accountTableDesc.registeredType) {
+          await queryInterface.addColumn("Accounts", "registeredType", {
+            type: DataTypes.STRING,
+            allowNull: true,
+          });
+        }
+        if (!accountTableDesc.contributionRoom) {
+          await queryInterface.addColumn("Accounts", "contributionRoom", {
+            type: DataTypes.DECIMAL(10, 2),
+            allowNull: true,
+          });
+        }
+        if (!accountTableDesc.roomYear) {
+          await queryInterface.addColumn("Accounts", "roomYear", {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+          });
+        }
+      } catch (accColErr) {
+        console.warn("⚠️ Could not verify/add Accounts columns:", accColErr.message);
+      }
       // Safely ensure unique index on (recurringGroupId, date) exists
       try {
         const existingIndexes = await queryInterface.showIndex("Transactions");

@@ -147,6 +147,13 @@ const schemas = {
     initialBalance: optionalNumber(z.coerce.number().nonnegative()),
     target_date: optionalDate,
     dueDate: optionalDate,
+    registeredType: z
+      .preprocess(
+        (v) => (v === "" || v === null ? null : typeof v === "string" ? v.toUpperCase() : v),
+        z.enum(["TFSA", "RRSP", "FHSA"]).nullable().optional()
+      ),
+    contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
+    roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
   }),
 
   updateSavingsGoal: z.object({
@@ -157,6 +164,13 @@ const schemas = {
     initialBalance: optionalNumber(z.coerce.number().nonnegative()),
     target_date: optionalDate,
     dueDate: optionalDate,
+    registeredType: z
+      .preprocess(
+        (v) => (v === "" || v === null ? null : typeof v === "string" ? v.toUpperCase() : v),
+        z.enum(["TFSA", "RRSP", "FHSA"]).nullable().optional()
+      ),
+    contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
+    roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
   }),
 
   updateChecking: z.object({

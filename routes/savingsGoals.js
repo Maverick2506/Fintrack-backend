@@ -48,14 +48,77 @@ router.get(
       }
     }
 
-    const formatted = goals.map((g) => ({
-      ...g.toJSON(),
-      current_amount: g.initialBalance,
-      goal_amount: g.targetAmount,
-      target_date: g.dueDate,
-      contributedLast90Days:
-        Math.round((contributionMap[g.id] || 0) * 100) / 100,
-    }));
+    // Phase J: Registered Account Calculations (TFSA, RRSP, FHSA)
+    const registeredGoals = goals.filter((g) => g.registeredType);
+    const regContributionsMap = {};
+    const regWithdrawalsMap = {};
+
+    if (registeredGoals.length > 0) {
+      const currentYear = nowZoned.getFullYear();
+      for (const rg of registeredGoals) {
+        const year = rg.roomYear || currentYear;
+        const yearStart = `${year}-01-01`;
+        const yearEnd = `${year}-12-31`;
+
+        const [inflow, outflow] = await Promise.all([
+          Transaction.sum("amount", {
+            where: {
+              toAccountId: rg.id,
+              isCleared: true,
+              date: { [Op.between]: [yearStart, yearEnd] },
+            },
+          }),
+          Transaction.sum("amount", {
+            where: {
+              fromAccountId: rg.id,
+              isCleared: true,
+              date: { [Op.between]: [yearStart, yearEnd] },
+            },
+          }),
+        ]);
+
+        regContributionsMap[rg.id] = parseFloat(inflow) || 0;
+        regWithdrawalsMap[rg.id] = parseFloat(outflow) || 0;
+      }
+    }
+
+    const formatted = goals.map((g) => {
+      const isRegistered = Boolean(g.registeredType);
+      const contRoom =
+        g.contributionRoom !== null && g.contributionRoom !== undefined
+          ? parseFloat(g.contributionRoom)
+          : null;
+      const contributedThisYear = isRegistered
+        ? Math.round((regContributionsMap[g.id] || 0) * 100) / 100
+        : null;
+      const withdrawnThisYear = isRegistered
+        ? Math.round((regWithdrawalsMap[g.id] || 0) * 100) / 100
+        : null;
+      const roomLeft =
+        isRegistered && contRoom !== null
+          ? Math.round((contRoom - contributedThisYear) * 100) / 100
+          : null;
+      const isOverContributed = roomLeft !== null && roomLeft < 0;
+      const roomReturnsNextYear =
+        isRegistered && g.registeredType === "TFSA" ? withdrawnThisYear : null;
+
+      return {
+        ...g.toJSON(),
+        current_amount: g.initialBalance,
+        goal_amount: g.targetAmount,
+        target_date: g.dueDate,
+        contributedLast90Days:
+          Math.round((contributionMap[g.id] || 0) * 100) / 100,
+        registeredType: g.registeredType || null,
+        contributionRoom: contRoom,
+        roomYear: g.roomYear || null,
+        contributedThisYear,
+        withdrawnThisYear,
+        roomLeft,
+        isOverContributed,
+        roomReturnsNextYear,
+      };
+    });
     res.json(formatted);
   })
 );
@@ -73,6 +136,21 @@ router.post(
 
     const targetAmount = req.body.target_amount ?? req.body.goal_amount ?? 0;
 
+    const regType = req.body.registeredType
+      ? String(req.body.registeredType).toUpperCase()
+      : null;
+    const contRoom =
+      req.body.contributionRoom !== undefined &&
+      req.body.contributionRoom !== null &&
+      req.body.contributionRoom !== ""
+        ? parseFloat(req.body.contributionRoom)
+        : null;
+    const rYear = req.body.roomYear
+      ? parseInt(req.body.roomYear, 10)
+      : regType
+      ? new Date().getFullYear()
+      : null;
+
     const newGoal = await Account.create({
       name: req.body.name,
       type: "SAVINGS_GOAL",
@@ -80,6 +158,9 @@ router.post(
       dueDate: req.body.target_date || req.body.dueDate || null,
       initialBalance: startingAmount,
       isActive: true,
+      registeredType: regType,
+      contributionRoom: contRoom,
+      roomYear: rYear,
     });
 
     res.status(201).json({
@@ -88,6 +169,14 @@ router.post(
       goal_amount: newGoal.targetAmount,
       target_date: newGoal.dueDate,
       contributedLast90Days: 0,
+      registeredType: newGoal.registeredType,
+      contributionRoom: newGoal.contributionRoom !== null ? parseFloat(newGoal.contributionRoom) : null,
+      roomYear: newGoal.roomYear,
+      contributedThisYear: 0,
+      withdrawnThisYear: 0,
+      roomLeft: newGoal.contributionRoom !== null ? parseFloat(newGoal.contributionRoom) : null,
+      isOverContributed: false,
+      roomReturnsNextYear: newGoal.registeredType === "TFSA" ? 0 : null,
     });
   })
 );
@@ -212,12 +301,32 @@ router.put(
       ) {
         updates.initialBalance = parseFloat(req.body.current_amount);
       }
+      if (req.body.registeredType !== undefined) {
+        updates.registeredType = req.body.registeredType
+          ? String(req.body.registeredType).toUpperCase()
+          : null;
+      }
+      if (req.body.contributionRoom !== undefined) {
+        updates.contributionRoom =
+          req.body.contributionRoom !== null && req.body.contributionRoom !== ""
+            ? parseFloat(req.body.contributionRoom)
+            : null;
+      }
+      if (req.body.roomYear !== undefined) {
+        updates.roomYear = req.body.roomYear
+          ? parseInt(req.body.roomYear, 10)
+          : null;
+      }
+
       await goal.update(updates);
       res.json({
         ...goal.toJSON(),
         current_amount: goal.initialBalance,
         goal_amount: goal.targetAmount,
         target_date: goal.dueDate,
+        registeredType: goal.registeredType,
+        contributionRoom: goal.contributionRoom !== null ? parseFloat(goal.contributionRoom) : null,
+        roomYear: goal.roomYear,
       });
     } else {
       res.status(404).json({ error: "Savings Goal not found" });

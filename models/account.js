@@ -53,6 +53,18 @@ const Account = sequelize.define(
       type: DataTypes.BOOLEAN,
       defaultValue: true,
     },
+    registeredType: {
+      type: DataTypes.STRING,
+      allowNull: true,
+    },
+    contributionRoom: {
+      type: DataTypes.DECIMAL(10, 2),
+      allowNull: true,
+    },
+    roomYear: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
   },
   {
     indexes: [{ fields: ["type"] }],

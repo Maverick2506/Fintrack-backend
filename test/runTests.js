@@ -3689,6 +3689,116 @@ async function runTestSuite() {
   });
 
 
+
+  // 29. Registered Accounts Tracking: TFSA, RRSP, FHSA (Phase J)
+  console.log("\n--- Suite 29: Registered Accounts (TFSA / RRSP / FHSA) ---");
+
+  // 1. Create a registered TFSA goal
+  const tfsaRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/savings-goals",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Wealthsimple TFSA",
+      target_amount: 50000,
+      current_amount: 10000,
+      registeredType: "TFSA",
+      contributionRoom: 7000,
+      roomYear: 2026,
+    }
+  );
+  assert(tfsaRes.status === 201 && tfsaRes.body.id, "Creates registered TFSA savings goal with room 7000");
+  const tfsaId = tfsaRes.body.id;
+
+  // 2. Initial state
+  const initialTfsaRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const tfsaRecord1 = (initialTfsaRes.body || []).find((g) => g.id === tfsaId);
+  assert(tfsaRecord1 && tfsaRecord1.registeredType === "TFSA", "Recognizes goal registeredType as TFSA");
+  assert(tfsaRecord1.contributionRoom === 7000, "Reports contribution room $7,000");
+  assert(tfsaRecord1.contributedThisYear === 0, "Initial contributedThisYear is 0");
+  assert(tfsaRecord1.roomLeft === 7000, "Initial roomLeft is 7000");
+  assert(tfsaRecord1.isOverContributed === false, "isOverContributed is false");
+
+  // 3. Add $2,000 contribution and $500 withdrawal in 2026
+  const tfsaDeposit = await Transaction.create({
+    title: "TFSA 2026 Contribution",
+    amount: 2000,
+    type: "TRANSFER",
+    toAccountId: tfsaId,
+    date: "2026-03-15",
+    isCleared: true,
+    balanceApplied: true,
+  });
+
+  const tfsaWithdrawal = await Transaction.create({
+    title: "TFSA 2026 Withdrawal",
+    amount: 500,
+    type: "TRANSFER",
+    fromAccountId: tfsaId,
+    date: "2026-06-20",
+    isCleared: true,
+    balanceApplied: true,
+  });
+
+  const activeTfsaRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const tfsaRecord2 = (activeTfsaRes.body || []).find((g) => g.id === tfsaId);
+  assert(tfsaRecord2.contributedThisYear === 2000, "Accurately calculates contributedThisYear ($2,000)");
+  assert(tfsaRecord2.withdrawnThisYear === 500, "Accurately calculates withdrawnThisYear ($500)");
+  assert(tfsaRecord2.roomLeft === 5000, "Accurately calculates roomLeft (7000 - 2000 = 5000)");
+  assert(tfsaRecord2.roomReturnsNextYear === 500, "Calculates roomReturnsNextYear for TFSA (+$500 on Jan 1)");
+
+  // 4. Test Over-Contribution: Add $6,000 contribution (total 8000 on 7000 limit)
+  const tfsaOverDeposit = await Transaction.create({
+    title: "TFSA Second Contribution",
+    amount: 6000,
+    type: "TRANSFER",
+    toAccountId: tfsaId,
+    date: "2026-08-10",
+    isCleared: true,
+    balanceApplied: true,
+  });
+
+  const overTfsaRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const tfsaRecord3 = (overTfsaRes.body || []).find((g) => g.id === tfsaId);
+  assert(tfsaRecord3.contributedThisYear === 8000, "contributedThisYear reaches $8,000");
+  assert(tfsaRecord3.roomLeft === -1000, "roomLeft is -$1,000");
+  assert(tfsaRecord3.isOverContributed === true, "Flags isOverContributed: true when over limit");
+
+  // Cleanup Suite 29
+  await tfsaDeposit.destroy();
+  await tfsaWithdrawal.destroy();
+  await tfsaOverDeposit.destroy();
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals/" + tfsaId,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+
   // Cleanup
   await request({
     hostname: "localhost",
