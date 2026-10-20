@@ -55,3 +55,63 @@ jobs:
           curl -fsS --max-time 120 --retry 3 --retry-delay 20 --retry-all-errors \
             -H "Authorization: Bearer $CRON_SECRET" \
             "$BACKEND_URL/api/trigger-recurring"
+
+  backup:
+    needs: run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download backup
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET secret is not set."
+            exit 1
+          fi
+          curl -fsS --max-time 120 --retry 3 --retry-delay 20 --retry-all-errors \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$BACKEND_URL/api/cron/backup" -o backup.json
+          test "$(jq -r .format backup.json)" = "fintrack-backup"
+          echo "Backup downloaded successfully. Accounts: $(jq '.accounts | length' backup.json), Transactions: $(jq '.transactions | length' backup.json)"
+
+      - name: Encrypt
+        env:
+          AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+        run: |
+          if [ -z "$AGE_RECIPIENT" ]; then
+            echo "::warning::Repository variable BACKUP_AGE_RECIPIENT is not configured. Encrypted backup skipped."
+            exit 0
+          fi
+          sudo apt-get install -y age
+          age -r "$AGE_RECIPIENT" -o backup.json.age backup.json
+          shred -u backup.json
+          echo "Backup encrypted with age successfully."
+
+      - name: Commit to private backups repo
+        env:
+          TOKEN: ${{ secrets.BACKUPS_REPO_TOKEN }}
+          AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
+        run: |
+          if [ -z "$AGE_RECIPIENT" ]; then
+            exit 0
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::Repository secret BACKUPS_REPO_TOKEN is not configured. Encrypted artifact will be retained via Actions artifact."
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:$TOKEN@github.com/Maverick2506/fintrack-backups.git" b
+          mkdir -p b/backups && cp backup.json.age "b/backups/$(date -u +%F).json.age"
+          cd b
+          git add .
+          git -c user.name="fintrack-bot" -c user.email="bot@users.noreply.github.com" commit -m "backup $(date -u +%F)" || echo "No changes to commit"
+          git push
+
+      - name: Upload encrypted backup artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-backup-${{ github.run_id }}
+          path: backup.json.age
+          if-no-files-found: ignore
+          retention-days: 90

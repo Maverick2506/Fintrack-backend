@@ -14,9 +14,45 @@ Render free instances spin down after 15 minutes of inactivity. To keep the serv
   - Keeps monthly active hours well within the ~750 hour free quota.
   - Fast waking: Neon database wakes in ~1s on demand.
 
-## Scheduled Workflows
+## Scheduled Workflows & Encrypted Backups
 
-- **Nightly Sweep & Recurrence:** Triggered automatically via GitHub Actions workflow (`.github/workflows/nightly-jobs.yml`) at `05:17 UTC` (00:17 / 01:17 Toronto time depending on daylight saving).
+- **Nightly Sweep, Recurrence & Backup:** Triggered automatically via GitHub Actions workflow (`.github/workflows/nightly-jobs.yml`) at `05:17 UTC` (00:17 / 01:17 Toronto time depending on daylight saving).
+- **Nightly Encrypted Backup:**
+  - Calls `GET /api/cron/backup` (`Authorization: Bearer $CRON_SECRET`).
+  - Encrypted on the runner before leaving memory using `age` and your public key (`BACKUP_AGE_RECIPIENT`).
+  - Stored in the private repository `fintrack-backups` (`BACKUPS_REPO_TOKEN` secret) and retained as an Actions artifact for 90 days.
+  - The private key remains completely offline in your password manager.
+
+### Setting Up `age` Key Pair for Backups
+
+1. Generate a key pair locally:
+   ```bash
+   age-keygen -o key.txt
+   ```
+2. Set the public key (`age1...`) in GitHub:
+   - **Repository:** `Fintrack-backend` → **Settings** → **Secrets and variables** → **Actions** → **Variables** tab
+   - **Name:** `BACKUP_AGE_RECIPIENT`
+   - **Value:** `age1...` (your public key)
+3. Keep `key.txt` strictly private and offline (e.g. in 1Password / Bitwarden / Keepass). Never commit it or upload to GitHub.
+
+### Restoring from Backup
+
+1. Decrypt the downloaded backup file:
+   ```bash
+   age -d -i key.txt backup.json.age > backup.json
+   ```
+2. Restore into local development SQLite database:
+   ```bash
+   node scripts/restore.js backup.json
+   ```
+   If the database already contains records, `--force` is required to overwrite:
+   ```bash
+   node scripts/restore.js backup.json --force
+   ```
+3. To restore to remote PostgreSQL (disaster recovery only):
+   ```bash
+   USE_PRODUCTION_DB=true DATABASE_URL="<connection-string>" node scripts/restore.js backup.json --force
+   ```
 
 ## Continuous Integration & Testing
 

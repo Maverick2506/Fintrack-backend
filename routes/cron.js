@@ -2,6 +2,7 @@ const express = require("express");
 const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
 const { runDailySweep } = require("../services/dailySweepService");
 const { createRecurringExpenses } = require("./recurring");
+const { Account, Transaction, Setting } = require("../models");
 
 const router = express.Router();
 
@@ -28,12 +29,36 @@ const handleTriggerRecurring = async (req, res) => {
   }
 };
 
+const handleBackup = async (req, res) => {
+  try {
+    const [accounts, transactions, settings] = await Promise.all([
+      Account.findAll({ raw: true, order: [["id", "ASC"]] }),
+      Transaction.findAll({ raw: true, order: [["id", "ASC"]] }),
+      Setting.findAll({ raw: true, order: [["key", "ASC"]] }),
+    ]);
+
+    res.status(200).json({
+      format: "fintrack-backup",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      accounts,
+      transactions,
+      settings,
+    });
+  } catch (error) {
+    console.error("Backup error:", error);
+    res.status(500).json({ error: "Failed to generate database backup." });
+  }
+};
+
 // Support both GET and POST for cron jobs and external webhooks with explicit cron auth
 router.all("/daily-check", cronAuthMiddleware, handleDailyCheck);
 router.all("/trigger-recurring", cronAuthMiddleware, handleTriggerRecurring);
+router.all("/backup", cronAuthMiddleware, handleBackup);
 
 // Backwards-compatible aliases
 router.all("/cron/daily-check", cronAuthMiddleware, handleDailyCheck);
 router.all("/cron/trigger-recurring", cronAuthMiddleware, handleTriggerRecurring);
+router.all("/cron/backup", cronAuthMiddleware, handleBackup);
 
 module.exports = router;

@@ -1,3 +1,9 @@
+const { Sequelize } = require("sequelize");
+const { Account, Transaction, Setting } = require("../models");
+const { restoreBackup } = require("../scripts/restore");
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
 const http = require("http");
 const { getBalancesSummary } = require("../services/netWorthService");
 const { getNextOccurrenceDate, getNextDueDate } = require("../routes/recurring");
@@ -2745,6 +2751,121 @@ async function runTestSuite() {
   );
 
 
+
+  
+  // 22. Nightly Encrypted Backups & Round-Trip Restore (Phase B)
+  console.log("\n--- Suite 22: Nightly Encrypted Backups & Round-Trip Restore (Phase B) ---");
+  const badBackupRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/backup",
+    method: "GET",
+    headers: { Authorization: "Bearer bad_secret_key" },
+  });
+  assert(badBackupRes.status === 401, "Rejects unauthorized backup request with HTTP 401");
+
+  const s22BackupRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/backup",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(s22BackupRes.status === 200, "GET /api/cron/backup returns HTTP 200 with valid authorization");
+  assert(
+    s22BackupRes.body.format === "fintrack-backup" && s22BackupRes.body.version === 1,
+    "Backup payload format is fintrack-backup version 1"
+  );
+  assert(
+    typeof s22BackupRes.body.exportedAt === "string" && !isNaN(Date.parse(s22BackupRes.body.exportedAt)),
+    "Backup payload includes valid ISO exportedAt timestamp"
+  );
+  assert(
+    Array.isArray(s22BackupRes.body.accounts) &&
+      Array.isArray(s22BackupRes.body.transactions) &&
+      Array.isArray(s22BackupRes.body.settings),
+    "Backup payload contains accounts, transactions, and settings arrays"
+  );
+
+  const s22BackupAliasRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/backup",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(s22BackupAliasRes.status === 200, "Alias GET /api/backup returns HTTP 200");
+
+  // Verify restore script refuses to overwrite without --force
+  const s22TestDb = new Sequelize({ dialect: "sqlite", storage: ":memory:", logging: false });
+  const S22Account = s22TestDb.define("Account", Account.rawAttributes, { timestamps: true });
+  const S22Transaction = s22TestDb.define("Transaction", Transaction.rawAttributes, { timestamps: true });
+  const S22Setting = s22TestDb.define("Setting", Setting.rawAttributes, { timestamps: true });
+  await s22TestDb.sync();
+
+  await S22Account.create({ id: "99999999-9999-9999-9999-999999999999", name: "Existing Guard", type: "CHECKING" });
+  let s22RefusedWithoutForce = false;
+  try {
+    await restoreBackup(s22BackupRes.body, {
+      force: false,
+      sequelizeInstance: s22TestDb,
+      models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting },
+    });
+  } catch (err) {
+    s22RefusedWithoutForce = err.message.includes("Refusing to overwrite");
+  }
+  assert(s22RefusedWithoutForce, "restoreBackup() refuses to overwrite existing database without force flag");
+
+  // Verify clean round-trip restore into isolated database
+  const s22RestoreRes = await restoreBackup(s22BackupRes.body, {
+    force: true,
+    sequelizeInstance: s22TestDb,
+    models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting },
+  });
+  assert(
+    s22RestoreRes.accountsRestored === s22BackupRes.body.accounts.length &&
+      s22RestoreRes.transactionsRestored === s22BackupRes.body.transactions.length &&
+      s22RestoreRes.settingsRestored === s22BackupRes.body.settings.length,
+    "Round-trip restore completes with exact account, transaction, and setting counts"
+  );
+
+  const restoredAccounts = await S22Account.findAll({ raw: true, order: [["id", "ASC"]] });
+  const restoredTransactions = await S22Transaction.findAll({ raw: true, order: [["id", "ASC"]] });
+
+  let accountsMatch = restoredAccounts.length === s22BackupRes.body.accounts.length;
+  if (accountsMatch && restoredAccounts.length > 0) {
+    accountsMatch = restoredAccounts.every((acc, i) => {
+      const orig = s22BackupRes.body.accounts[i];
+      return acc.id === orig.id && acc.name === orig.name && Number(acc.initialBalance) === Number(orig.initialBalance);
+    });
+  }
+  assert(accountsMatch, "Restored accounts preserve exact IDs, names, and balances");
+
+  let txMatch = restoredTransactions.length === s22BackupRes.body.transactions.length;
+  if (txMatch && restoredTransactions.length > 0) {
+    txMatch = restoredTransactions.every((tx, i) => {
+      const orig = s22BackupRes.body.transactions[i];
+      return (
+        tx.id === orig.id &&
+        Number(tx.amount) === Number(orig.amount) &&
+        Boolean(tx.balanceApplied) === Boolean(orig.balanceApplied) &&
+        Boolean(tx.isCleared) === Boolean(orig.isCleared)
+      );
+    });
+  }
+  assert(txMatch, "Restored transactions preserve exact IDs, amounts, and balanceApplied/isCleared states");
+
+  // Verify CLI invocation with invalid file rejected
+  const tmpBackupPath = path.join(__dirname, "temp_suite22_test.json");
+  fs.writeFileSync(tmpBackupPath, JSON.stringify({ format: "corrupt", version: 1 }));
+  let cliRejectedCorrupt = false;
+  try {
+    execSync(`node scripts/restore.js "${tmpBackupPath}"`, { stdio: "pipe" });
+  } catch (err) {
+    cliRejectedCorrupt = true;
+  }
+  if (fs.existsSync(tmpBackupPath)) fs.unlinkSync(tmpBackupPath);
+  assert(cliRejectedCorrupt, "scripts/restore.js CLI rejects invalid backup formats with non-zero exit code");
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
