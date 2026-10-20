@@ -83,7 +83,7 @@ You are a premier personal financial strategist for Maverick.
 Analyze this financial snapshot for the current month:
 
 1. Current Cash Snapshot:
-- Total Net Worth: ${balancesSummary.netWorth.toFixed(2)} (Checking: ${balancesSummary.checking.toFixed(2)}, Savings: ${balancesSummary.savings.toFixed(2)}, Debt: ${balancesSummary.debt.toFixed(2)}, Cards: ${balancesSummary.cards.toFixed(2)})
+- Total Net Worth: $${balancesSummary.netWorth.toFixed(2)} (Checking: $${balancesSummary.checking.toFixed(2)}, Savings: $${balancesSummary.savings.toFixed(2)}, Debt: $${balancesSummary.debt.toFixed(2)}, Cards: $${balancesSummary.cards.toFixed(2)})
 - Total Income Received So Far: $${monthlySummary.totalIncome.toFixed(2)}
 - Total Spending So Far: $${monthlySummary.totalSpending.toFixed(2)}
 - Current Live Net Cash Flow: $${monthlySummary.netFlow.toFixed(2)}

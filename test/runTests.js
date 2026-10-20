@@ -2855,6 +2855,23 @@ async function runTestSuite() {
   }
   assert(txMatch, "Restored transactions preserve exact IDs, amounts, and balanceApplied/isCleared states");
 
+  // Verify production guard refuses to restore without --production flag
+  s22TestDb.isProductionDb = true;
+  let s22ProdRefusedWithoutFlag = false;
+  try {
+    await restoreBackup(s22BackupRes.body, {
+      force: true,
+      production: false,
+      sequelizeInstance: s22TestDb,
+      models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting },
+    });
+  } catch (err) {
+    s22ProdRefusedWithoutFlag = err.message.includes("Target is the remote database; re-run with --production to confirm.");
+  }
+  s22TestDb.isProductionDb = false;
+  assert(s22ProdRefusedWithoutFlag, "restoreBackup() strictly refuses to restore to production database without --production flag");
+
+
   // Verify CLI invocation with invalid file rejected
   const tmpBackupPath = path.join(__dirname, "temp_suite22_test.json");
   fs.writeFileSync(tmpBackupPath, JSON.stringify({ format: "corrupt", version: 1 }));

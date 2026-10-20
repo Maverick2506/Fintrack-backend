@@ -5,7 +5,6 @@ const { toZonedTime, format } = require("date-fns-tz");
 const { Op } = require("sequelize");
 const { sequelize, Account, Transaction, Setting } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
-const { getCalculatedCheckingBalance } = require("../services/checkingService");
 const { getPaychequeProjection } = require("../services/projectionService");
 
 const router = express.Router();

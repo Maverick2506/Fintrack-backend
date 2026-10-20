@@ -23,7 +23,6 @@ const formatYMD = (y, mZeroIndexed, d) => {
 const {
   getPrimaryCheckingAccount,
   getCheckingActivity,
-  getCalculatedCheckingBalance,
 } = require("../services/checkingService");
 
 router.get(

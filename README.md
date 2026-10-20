@@ -35,6 +35,16 @@ Render free instances spin down after 15 minutes of inactivity. To keep the serv
    - **Value:** `age1...` (your public key)
 3. Keep `key.txt` strictly private and offline (e.g. in 1Password / Bitwarden / Keepass). Never commit it or upload to GitHub.
 
+### Setting Up Backup Repository & Access Token
+
+1. Create a private repository named `fintrack-backups` on GitHub with an initial `README.md` (so the initial clone succeeds).
+2. Create a fine-grained personal access token (GitHub Settings → Developer Settings → Personal access tokens → Fine-grained tokens):
+   - **Repository access:** Only select `fintrack-backups`
+   - **Permissions:** `Contents: Read and write`
+3. Save the token as a repository secret:
+   - **Repository:** `Fintrack-backend` → **Settings** → **Secrets and variables** → **Actions** → **Repository secrets**
+   - **Name:** `BACKUPS_REPO_TOKEN`
+
 ### Restoring from Backup
 
 1. Decrypt the downloaded backup file:
@@ -51,8 +61,9 @@ Render free instances spin down after 15 minutes of inactivity. To keep the serv
    ```
 3. To restore to remote PostgreSQL (disaster recovery only):
    ```bash
-   USE_PRODUCTION_DB=true DATABASE_URL="<connection-string>" node scripts/restore.js backup.json --force
+   USE_PRODUCTION_DB=true DATABASE_URL="<connection-string>" node scripts/restore.js backup.json --force --production
    ```
+   *(Note: The `--production` flag is strictly required when targeting a remote production database to prevent accidental data erasure).*
 
 ## Continuous Integration & Testing
 

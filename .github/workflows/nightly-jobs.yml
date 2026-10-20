@@ -58,6 +58,7 @@ jobs:
 
   backup:
     needs: run
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -80,10 +81,10 @@ jobs:
           AGE_RECIPIENT: ${{ vars.BACKUP_AGE_RECIPIENT }}
         run: |
           if [ -z "$AGE_RECIPIENT" ]; then
-            echo "::warning::Repository variable BACKUP_AGE_RECIPIENT is not configured. Encrypted backup skipped."
-            exit 0
+            echo "::error::Repository variable BACKUP_AGE_RECIPIENT is not configured."
+            exit 1
           fi
-          sudo apt-get install -y age
+          sudo apt-get update -qq && sudo apt-get install -y age
           age -r "$AGE_RECIPIENT" -o backup.json.age backup.json
           shred -u backup.json
           echo "Backup encrypted with age successfully."

@@ -23,14 +23,19 @@ if (fs.existsSync(envPath)) {
  * @param {object} backupData - Parsed JSON object from a FinTrack backup
  * @param {object} options - Configuration options
  * @param {boolean} options.force - Overwrite if data exists
+ * @param {boolean} [options.production] - Explicit confirmation when target is production database
  * @param {object} [options.sequelizeInstance] - Optional Sequelize instance (for testing/custom DB)
  * @param {object} [options.models] - Optional custom models { Account, Transaction, Setting }
  * @returns {Promise<{accountsRestored: number, transactionsRestored: number, settingsRestored: number}>}
  */
 async function restoreBackup(backupData, options = {}) {
-  const { force = false, sequelizeInstance, models } = options;
+  const { force = false, production = false, sequelizeInstance, models } = options;
 
   const db = sequelizeInstance || require("../database");
+  if (db.isProductionDb && !production) {
+    throw new Error("Target is the remote database; re-run with --production to confirm.");
+  }
+
   const Account = models?.Account || require("../models").Account;
   const Transaction = models?.Transaction || require("../models").Transaction;
   const Setting = models?.Setting || require("../models").Setting;
@@ -105,10 +110,11 @@ if (require.main === module) {
     try {
       const args = process.argv.slice(2);
       const force = args.includes("--force");
+      const production = args.includes("--production");
       const filePath = args.find((a) => !a.startsWith("--"));
 
       if (!filePath) {
-        console.error("Usage: node scripts/restore.js <path-to-backup.json> [--force]");
+        console.error("Usage: node scripts/restore.js <path-to-backup.json> [--force] [--production]");
         process.exit(1);
       }
 
@@ -121,14 +127,20 @@ if (require.main === module) {
       const rawContent = fs.readFileSync(resolvedPath, "utf-8");
       const backupData = JSON.parse(rawContent);
 
+      const db = require("../database");
+      if (db.isProductionDb && !production) {
+        console.error("❌ Target is the remote database; re-run with --production to confirm.");
+        process.exit(1);
+      }
+
       console.log(`Starting restore from ${resolvedPath}...`);
-      if (process.env.USE_PRODUCTION_DB === "true") {
+      if (db.isProductionDb) {
         console.warn("⚠️ WARNING: Target database is REMOTE PRODUCTION (DATABASE_URL)!");
       } else {
         console.log("ℹ️ Target database is local development database.");
       }
 
-      const result = await restoreBackup(backupData, { force });
+      const result = await restoreBackup(backupData, { force, production });
       console.log("✅ Database restore completed successfully in a single transaction:");
       console.log(`   - Accounts restored: ${result.accountsRestored}`);
       console.log(`   - Transactions restored: ${result.transactionsRestored}`);
