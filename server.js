@@ -39,6 +39,7 @@ const budgetRoutes = require("./routes/budgets");
 const forecastRoutes = require("./routes/forecast");
 const settingsRoutes = require("./routes/settings");
 const netWorthHistoryRoutes = require("./routes/netWorthHistory");
+const subscriptionRoutes = require("./routes/subscriptions");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -119,6 +120,7 @@ app.use("/api/budgets", budgetRoutes);
 app.use("/api/forecast", forecastRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/net-worth-history", netWorthHistoryRoutes);
+app.use("/api", subscriptionRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);

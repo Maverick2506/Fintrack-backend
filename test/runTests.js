@@ -3799,6 +3799,179 @@ async function runTestSuite() {
   });
 
 
+
+  // 30. Subscriptions & Recurring Series Intelligence (Phase K)
+  console.log("\n--- Suite 30: Subscriptions & Recurring Series Intelligence (Phase K) ---");
+
+  // 1. Unauthenticated request rejected
+  const unauthSub = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/subscriptions",
+    method: "GET",
+  });
+  assert(unauthSub.status === 401, "GET /api/subscriptions rejects unauthenticated request with HTTP 401");
+
+  // 2. Create test card for subscriptions
+  const subCardRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/credit-cards",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Streaming Card",
+      creditLimit: 5000,
+      currentBalance: 0,
+    }
+  );
+  const subCardId = subCardRes.body.id;
+
+  const netflixGroupId = crypto.randomUUID();
+  const gymGroupId = crypto.randomUUID();
+  const primeGroupId = crypto.randomUUID();
+  const cancelledGroupId = crypto.randomUUID();
+
+  // Netflix occurrences (price hike from 16.49 to 18.99)
+  const netflix1 = await Transaction.create({
+    title: "Netflix Standard",
+    amount: 16.49,
+    date: "2026-01-15",
+    type: "EXPENSE",
+    category: "Entertainment",
+    recurrence: "monthly",
+    isCleared: true,
+    recurringGroupId: netflixGroupId,
+    fromAccountId: subCardId,
+  });
+
+  const netflix2 = await Transaction.create({
+    title: "Netflix Standard",
+    amount: 18.99,
+    date: "2026-02-15",
+    type: "EXPENSE",
+    category: "Entertainment",
+    recurrence: "monthly",
+    isCleared: true,
+    recurringGroupId: netflixGroupId,
+    fromAccountId: subCardId,
+  });
+
+  const netflix3 = await Transaction.create({
+    title: "Netflix Standard",
+    amount: 18.99,
+    date: "2026-03-15",
+    type: "EXPENSE",
+    category: "Entertainment",
+    recurrence: "monthly",
+    isCleared: false,
+    recurringGroupId: netflixGroupId,
+    fromAccountId: subCardId,
+  });
+
+  // Gym membership (Bi-weekly $25)
+  const gym1 = await Transaction.create({
+    title: "GoodLife Fitness",
+    amount: 25.0,
+    date: "2026-02-01",
+    type: "EXPENSE",
+    category: "Health & Fitness",
+    recurrence: "bi-weekly",
+    isCleared: true,
+    recurringGroupId: gymGroupId,
+  });
+
+  // Amazon Prime (Yearly $120)
+  const prime1 = await Transaction.create({
+    title: "Amazon Prime",
+    amount: 120.0,
+    date: "2026-01-01",
+    type: "EXPENSE",
+    category: "Subscriptions",
+    recurrence: "yearly",
+    isCleared: true,
+    recurringGroupId: primeGroupId,
+  });
+
+  // Cancelled subscription (recurrence set to 'none' on latest occurrence)
+  const cancelled1 = await Transaction.create({
+    title: "Old Magazine Sub",
+    amount: 10.0,
+    date: "2025-11-01",
+    type: "EXPENSE",
+    category: "Entertainment",
+    recurrence: "none",
+    isCleared: true,
+    recurringGroupId: cancelledGroupId,
+  });
+
+  // 3. Query GET /api/subscriptions
+  const subRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/subscriptions",
+    method: "GET",
+    headers: authHeaders,
+  });
+
+  assert(subRes.status === 200, "GET /api/subscriptions returns HTTP 200");
+  assert(subRes.body.count === 3, "Returns exactly 3 active subscriptions (excludes cancelled)");
+
+  const subs = subRes.body.subscriptions || [];
+  const netflixSub = subs.find((s) => s.recurringGroupId === netflixGroupId);
+  const gymSub = subs.find((s) => s.recurringGroupId === gymGroupId);
+  const primeSub = subs.find((s) => s.recurringGroupId === primeGroupId);
+
+  assert(Boolean(netflixSub), "Includes Netflix subscription");
+  assert(Boolean(gymSub), "Includes Gym subscription");
+  assert(Boolean(primeSub), "Includes Prime subscription");
+
+  // Verify monthly and annual cost normalization
+  assert(netflixSub && netflixSub.monthlyCost === 18.99, "Netflix monthly cost is $18.99");
+  assert(netflixSub && netflixSub.annualCost === 227.88, "Netflix annual cost is $227.88");
+  assert(gymSub && Math.abs(gymSub.monthlyCost - 54.17) < 0.05, "Gym bi-weekly $25 normalizes to ~$54.17/mo");
+  assert(gymSub && gymSub.annualCost === 650.0, "Gym annual cost is $650.00");
+  assert(primeSub && primeSub.monthlyCost === 10.0, "Prime yearly $120 normalizes to $10.00/mo");
+  assert(primeSub && primeSub.annualCost === 120.0, "Prime annual cost is $120.00");
+
+  // Verify price change detection on Netflix
+  assert(netflixSub && Boolean(netflixSub.priceChange), "Detects price change on Netflix");
+  assert(netflixSub && netflixSub.priceChange.from === 16.49, "Price change from is $16.49");
+  assert(netflixSub && netflixSub.priceChange.to === 18.99, "Price change to is $18.99");
+  assert(netflixSub && netflixSub.priceChange.difference === 2.5, "Price change difference is +$2.50");
+  assert(netflixSub && netflixSub.priceChange.percent === 15.2, "Price change percent is +15.2%");
+
+  // Verify paying account association
+  assert(netflixSub && netflixSub.payingAccount === "Streaming Card", "Netflix correctly identifies paying card");
+  assert(netflixSub && netflixSub.isCreditCard === true, "Identifies paying account as credit card");
+  assert(gymSub && gymSub.payingAccount === "Primary Checking", "Gym defaults to Primary Checking");
+
+  // Verify sorting: highest monthly cost first
+  assert(subs[0].monthlyCost >= subs[1].monthlyCost && subs[1].monthlyCost >= subs[2].monthlyCost, "Subscriptions sorted by monthlyCost descending");
+
+  // Verify totals
+  const expectedTotalMonthly = Math.round((netflixSub.monthlyCost + gymSub.monthlyCost + primeSub.monthlyCost) * 100) / 100;
+  assert(subRes.body.totalMonthly === expectedTotalMonthly, "totalMonthly accurately reflects sum of active subscriptions");
+  const expectedTotalAnnual = Math.round((netflixSub.annualCost + gymSub.annualCost + primeSub.annualCost) * 100) / 100;
+  assert(subRes.body.totalAnnual === expectedTotalAnnual, "totalAnnual accurately reflects sum of active subscriptions");
+
+  // Cleanup Suite 30
+  await netflix1.destroy();
+  await netflix2.destroy();
+  await netflix3.destroy();
+  await gym1.destroy();
+  await prime1.destroy();
+  await cancelled1.destroy();
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards/" + subCardId,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
   // Cleanup
   await request({
     hostname: "localhost",
