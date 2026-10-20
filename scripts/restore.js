@@ -25,8 +25,8 @@ if (fs.existsSync(envPath)) {
  * @param {boolean} options.force - Overwrite if data exists
  * @param {boolean} [options.production] - Explicit confirmation when target is production database
  * @param {object} [options.sequelizeInstance] - Optional Sequelize instance (for testing/custom DB)
- * @param {object} [options.models] - Optional custom models { Account, Transaction, Setting }
- * @returns {Promise<{accountsRestored: number, transactionsRestored: number, settingsRestored: number}>}
+ * @param {object} [options.models] - Optional custom models { Account, Transaction, Setting, Budget }
+ * @returns {Promise<{accountsRestored: number, transactionsRestored: number, settingsRestored: number, budgetsRestored: number}>}
  */
 async function restoreBackup(backupData, options = {}) {
   const { force = false, production = false, sequelizeInstance, models } = options;
@@ -36,9 +36,10 @@ async function restoreBackup(backupData, options = {}) {
     throw new Error("Target is the remote database; re-run with --production to confirm.");
   }
 
-  const Account = models?.Account || require("../models").Account;
-  const Transaction = models?.Transaction || require("../models").Transaction;
-  const Setting = models?.Setting || require("../models").Setting;
+  const Account = models ? models.Account : require("../models").Account;
+  const Transaction = models ? models.Transaction : require("../models").Transaction;
+  const Setting = models ? models.Setting : require("../models").Setting;
+  const Budget = models ? models.Budget : require("../models").Budget;
 
   if (!backupData || backupData.format !== "fintrack-backup" || backupData.version !== 1) {
     throw new Error('Invalid backup format. Expected "format": "fintrack-backup", "version": 1.');
@@ -78,12 +79,18 @@ async function restoreBackup(backupData, options = {}) {
     ...s,
   }));
 
+  const cleanBudgets = (backupData.budgets || []).map((b) => ({
+    ...b,
+    rollover: Boolean(b.rollover),
+  }));
+
   // Perform wipe (if forced) and insertions in a single transaction
   await db.transaction(async (t) => {
     if ((existingTxCount > 0 || existingAccCount > 0) && force) {
       await Transaction.destroy({ where: {}, transaction: t });
       await Account.destroy({ where: {}, transaction: t });
       await Setting.destroy({ where: {}, transaction: t });
+      if (Budget) await Budget.destroy({ where: {}, transaction: t });
     }
 
     if (cleanAccounts.length > 0) {
@@ -95,12 +102,16 @@ async function restoreBackup(backupData, options = {}) {
     if (cleanSettings.length > 0) {
       await Setting.bulkCreate(cleanSettings, { transaction: t, validate: false });
     }
+    if (cleanBudgets.length > 0 && Budget) {
+      await Budget.bulkCreate(cleanBudgets, { transaction: t, validate: false });
+    }
   });
 
   return {
     accountsRestored: cleanAccounts.length,
     transactionsRestored: cleanTransactions.length,
     settingsRestored: cleanSettings.length,
+    budgetsRestored: cleanBudgets.length,
   };
 }
 
@@ -145,6 +156,7 @@ if (require.main === module) {
       console.log(`   - Accounts restored: ${result.accountsRestored}`);
       console.log(`   - Transactions restored: ${result.transactionsRestored}`);
       console.log(`   - Settings restored: ${result.settingsRestored}`);
+      console.log(`   - Budgets restored: ${result.budgetsRestored}`);
       process.exit(0);
     } catch (err) {
       console.error("❌ Restore failed:", err.message);

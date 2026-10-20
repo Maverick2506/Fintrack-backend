@@ -161,6 +161,17 @@ const schemas = {
   updateChecking: z.object({
     balance: z.coerce.number(),
   }),
+
+  setBudget: z
+    .object({
+      monthlyLimit: z.coerce.number().positive("Monthly limit must be greater than 0").optional(),
+      limit: z.coerce.number().positive("Monthly limit must be greater than 0").optional(),
+      rollover: z.boolean().optional().default(false),
+    })
+    .refine((data) => data.monthlyLimit !== undefined || data.limit !== undefined, {
+      message: "Monthly limit is required and must be greater than 0",
+      path: ["monthlyLimit"],
+    }),
 };
 
 module.exports = {

@@ -2,7 +2,7 @@ const express = require("express");
 const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
 const { runDailySweep } = require("../services/dailySweepService");
 const { createRecurringExpenses } = require("./recurring");
-const { Account, Transaction, Setting } = require("../models");
+const { Account, Transaction, Setting, Budget } = require("../models");
 
 const router = express.Router();
 
@@ -31,10 +31,11 @@ const handleTriggerRecurring = async (req, res) => {
 
 const handleBackup = async (req, res) => {
   try {
-    const [accounts, transactions, settings] = await Promise.all([
+    const [accounts, transactions, settings, budgets] = await Promise.all([
       Account.findAll({ raw: true, order: [["id", "ASC"]] }),
       Transaction.findAll({ raw: true, order: [["id", "ASC"]] }),
       Setting.findAll({ raw: true, order: [["key", "ASC"]] }),
+      Budget.findAll({ raw: true, order: [["category", "ASC"]] }),
     ]);
 
     res.status(200).json({
@@ -44,6 +45,7 @@ const handleBackup = async (req, res) => {
       accounts,
       transactions,
       settings,
+      budgets,
     });
   } catch (error) {
     console.error("Backup error:", error);

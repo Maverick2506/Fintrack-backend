@@ -35,6 +35,7 @@ const creditCardRoutes = require("./routes/creditCards");
 const paychequeRoutes = require("./routes/paycheques");
 const cronRoutes = require("./routes/cron");
 const exportRoutes = require("./routes/export");
+const budgetRoutes = require("./routes/budgets");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -111,6 +112,8 @@ app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
 app.use("/api", paychequeRoutes);
+app.use("/api/budgets", budgetRoutes);
+app.use("/api", budgetRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);

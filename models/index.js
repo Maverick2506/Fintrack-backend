@@ -2,6 +2,7 @@ const sequelize = require("../database");
 const Account = require("./account");
 const Transaction = require("./transaction");
 const Setting = require("./setting");
+const Budget = require("./budget");
 
 Account.hasMany(Transaction, {
   as: "outgoingTransactions",
@@ -28,4 +29,5 @@ module.exports = {
   Account,
   Transaction,
   Setting,
+  Budget,
 };

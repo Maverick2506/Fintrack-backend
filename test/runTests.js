@@ -1,5 +1,5 @@
 const { Sequelize } = require("sequelize");
-const { Account, Transaction, Setting } = require("../models");
+const { Account, Transaction, Setting, Budget } = require("../models");
 const { restoreBackup } = require("../scripts/restore");
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -2801,6 +2801,7 @@ async function runTestSuite() {
   const S22Account = s22TestDb.define("Account", Account.rawAttributes, { timestamps: true });
   const S22Transaction = s22TestDb.define("Transaction", Transaction.rawAttributes, { timestamps: true });
   const S22Setting = s22TestDb.define("Setting", Setting.rawAttributes, { timestamps: true });
+  const S22Budget = s22TestDb.define("Budget", Budget.rawAttributes, { timestamps: true });
   await s22TestDb.sync();
 
   await S22Account.create({ id: "99999999-9999-9999-9999-999999999999", name: "Existing Guard", type: "CHECKING" });
@@ -2809,7 +2810,7 @@ async function runTestSuite() {
     await restoreBackup(s22BackupRes.body, {
       force: false,
       sequelizeInstance: s22TestDb,
-      models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting },
+      models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting, Budget: S22Budget },
     });
   } catch (err) {
     s22RefusedWithoutForce = err.message.includes("Refusing to overwrite");
@@ -2820,7 +2821,7 @@ async function runTestSuite() {
   const s22RestoreRes = await restoreBackup(s22BackupRes.body, {
     force: true,
     sequelizeInstance: s22TestDb,
-    models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting },
+    models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting, Budget: S22Budget },
   });
   assert(
     s22RestoreRes.accountsRestored === s22BackupRes.body.accounts.length &&
@@ -2863,7 +2864,7 @@ async function runTestSuite() {
       force: true,
       production: false,
       sequelizeInstance: s22TestDb,
-      models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting },
+      models: { Account: S22Account, Transaction: S22Transaction, Setting: S22Setting, Budget: S22Budget },
     });
   } catch (err) {
     s22ProdRefusedWithoutFlag = err.message.includes("Target is the remote database; re-run with --production to confirm.");
@@ -2883,6 +2884,95 @@ async function runTestSuite() {
   }
   if (fs.existsSync(tmpBackupPath)) fs.unlinkSync(tmpBackupPath);
   assert(cliRejectedCorrupt, "scripts/restore.js CLI rejects invalid backup formats with non-zero exit code");
+
+  
+  // 23. Server-Backed Category Budgets (Phase C)
+  console.log("\n--- Suite 23: Server-Backed Category Budgets (Phase C) ---");
+  const unauthBudget = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets",
+    method: "GET",
+  });
+  assert(unauthBudget.status === 401, "GET /api/budgets rejects unauthenticated requests with HTTP 401");
+
+  const invalidLimitRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets/TestCat",
+    method: "PUT",
+    headers: authHeaders,
+  }, { monthlyLimit: -50 });
+  assert(invalidLimitRes.status === 400, "PUT /api/budgets/:category rejects negative monthly limit with HTTP 400");
+
+  const zeroLimitRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets/TestCat",
+    method: "PUT",
+    headers: authHeaders,
+  }, { monthlyLimit: 0 });
+  assert(zeroLimitRes.status === 400, "PUT /api/budgets/:category rejects zero monthly limit with HTTP 400");
+
+  const createBudgetRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets/Groceries",
+    method: "PUT",
+    headers: authHeaders,
+  }, { monthlyLimit: 400 });
+  assert(
+    createBudgetRes.status === 200 &&
+      createBudgetRes.body.category === "Groceries" &&
+      createBudgetRes.body.monthlyLimit === 400,
+    "PUT /api/budgets/:category creates new budget limit with HTTP 200"
+  );
+
+  const upsertBudgetRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets/Groceries",
+    method: "PUT",
+    headers: authHeaders,
+  }, { monthlyLimit: 550, rollover: true });
+  assert(
+    upsertBudgetRes.status === 200 &&
+      upsertBudgetRes.body.monthlyLimit === 550 &&
+      upsertBudgetRes.body.rollover === true,
+    "PUT /api/budgets/:category upserts existing budget with new limit and rollover: true"
+  );
+
+  const listBudgetsRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(
+    listBudgetsRes.status === 200 &&
+      Array.isArray(listBudgetsRes.body) &&
+      listBudgetsRes.body.some((b) => b.category === "Groceries" && b.monthlyLimit === 550),
+    "GET /api/budgets returns list containing upserted budget with computed available"
+  );
+
+  const deleteBudgetRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets/Groceries",
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(deleteBudgetRes.status === 204, "DELETE /api/budgets/:category removes budget with HTTP 204");
+
+  const deleteNotFoundRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets/NonExistentCategory",
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(deleteNotFoundRes.status === 404, "DELETE /api/budgets/:category returns HTTP 404 for non-existent category");
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
