@@ -201,16 +201,26 @@ router.put(
     const updates = {
       name: name ?? debt.name,
       targetAmount:
-        total_amount !== undefined ? parseFloat(total_amount) : debt.targetAmount,
+        total_amount !== undefined
+          ? total_amount !== null
+            ? parseFloat(total_amount)
+            : debt.targetAmount
+          : debt.targetAmount,
       minimumPayment:
         monthly_payment !== undefined
-          ? parseFloat(monthly_payment)
+          ? monthly_payment !== null
+            ? parseFloat(monthly_payment)
+            : null
           : debt.minimumPayment,
       dueDate:
         next_due_date !== undefined ? next_due_date || null : debt.dueDate,
     };
 
-    if (total_remaining !== undefined && total_remaining !== "") {
+    if (
+      total_remaining !== undefined &&
+      total_remaining !== "" &&
+      total_remaining !== null
+    ) {
       updates.initialBalance = parseFloat(total_remaining);
     }
     if (auto_pay !== undefined) {

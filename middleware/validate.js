@@ -18,6 +18,14 @@ const validateBody = (schema) => (req, res, next) => {
 
 const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 
+const optionalNumber = (n) =>
+  z.preprocess((v) => (v === "" ? undefined : v), n.optional());
+
+const optionalDate = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").nullable().optional()
+);
+
 const schemas = {
   createExpense: z.object({
     name: z.string().trim().min(1, "Name is required").max(255),
@@ -93,27 +101,30 @@ const schemas = {
   createDebt: z.object({
     name: z.string().trim().min(1, "Debt name is required").max(255),
     total_amount: z.coerce.number().positive("Total debt amount must be greater than 0"),
-    monthly_payment: z.coerce.number().nonnegative().optional(),
+    monthly_payment: optionalNumber(z.coerce.number().nonnegative()),
     auto_pay: z.boolean().optional().default(false),
-    next_due_date: z.string().nullable().optional(),
+    next_due_date: optionalDate,
     payment_frequency: z
       .enum(["weekly", "bi-weekly", "monthly", "yearly"])
       .optional()
       .default("monthly"),
-    interest_rate: z.coerce.number().nonnegative().nullable().optional(),
-    interestRate: z.coerce.number().nonnegative().nullable().optional(),
+    interest_rate: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .nullable()
+      .optional(),
+    interestRate: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .nullable()
+      .optional(),
   }),
 
   updateDebt: z.object({
     name: z.string().trim().min(1).max(255).optional(),
-    total_amount: z.union([z.coerce.number().positive(), z.literal("")]).optional(),
-    total_remaining: z.union([z.coerce.number(), z.literal("")]).optional(),
-    monthly_payment: z
-      .union([z.coerce.number().nonnegative(), z.literal("")])
-      .nullable()
-      .optional(),
+    total_amount: optionalNumber(z.coerce.number().positive()),
+    total_remaining: optionalNumber(z.coerce.number()),
+    monthly_payment: optionalNumber(z.coerce.number().nonnegative()).nullable(),
     auto_pay: z.boolean().optional(),
-    next_due_date: z.string().nullable().optional(),
+    next_due_date: optionalDate,
     payment_frequency: z
       .enum(["weekly", "bi-weekly", "monthly", "yearly"])
       .optional(),
@@ -129,26 +140,22 @@ const schemas = {
 
   createSavingsGoal: z.object({
     name: z.string().trim().min(1, "Goal name is required").max(255),
-    target_amount: z.coerce.number().positive().optional(),
-    goal_amount: z.coerce.number().positive().optional(),
-    current_amount: z.coerce.number().nonnegative().optional().default(0),
-    initialBalance: z.coerce.number().nonnegative().optional(),
-    target_date: z.string().nullable().optional(),
-    dueDate: z.string().nullable().optional(),
+    target_amount: optionalNumber(z.coerce.number().positive()),
+    goal_amount: optionalNumber(z.coerce.number().positive()),
+    current_amount: optionalNumber(z.coerce.number().nonnegative()).default(0),
+    initialBalance: optionalNumber(z.coerce.number().nonnegative()),
+    target_date: optionalDate,
+    dueDate: optionalDate,
   }),
 
   updateSavingsGoal: z.object({
     name: z.string().trim().min(1).max(255).optional(),
-    target_amount: z.union([z.coerce.number().positive(), z.literal("")]).optional(),
-    goal_amount: z.union([z.coerce.number().positive(), z.literal("")]).optional(),
-    current_amount: z
-      .union([z.coerce.number().nonnegative(), z.literal("")])
-      .optional(),
-    initialBalance: z
-      .union([z.coerce.number().nonnegative(), z.literal("")])
-      .optional(),
-    target_date: z.string().nullable().optional(),
-    dueDate: z.string().nullable().optional(),
+    target_amount: optionalNumber(z.coerce.number().positive()),
+    goal_amount: optionalNumber(z.coerce.number().positive()),
+    current_amount: optionalNumber(z.coerce.number().nonnegative()),
+    initialBalance: optionalNumber(z.coerce.number().nonnegative()),
+    target_date: optionalDate,
+    dueDate: optionalDate,
   }),
 
   updateChecking: z.object({

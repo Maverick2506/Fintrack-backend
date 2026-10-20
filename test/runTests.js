@@ -2175,6 +2175,20 @@ async function runTestSuite() {
   );
   assert(s17GoodDebtPut.status === 200 && s17GoodDebtPut.body.name === "Updated Suite 17 Debt", "PUT /debts/:id successfully updates with valid payload");
 
+  // Rejects malformed next_due_date on PUT /debts/:id
+  const s17MalformedDateDebt = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "PUT", headers: authHeaders },
+    { next_due_date: "invalid-date-format" }
+  );
+  assert(s17MalformedDateDebt.status === 400, "PUT /debts/:id rejects malformed next_due_date with HTTP 400");
+
+  // Empty string monthly_payment leaves existing value unchanged (does NOT become 0 or NaN)
+  const s17EmptyStringDebtPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "PUT", headers: authHeaders },
+    { monthly_payment: "" }
+  );
+  assert(s17EmptyStringDebtPut.status === 200 && parseFloat(s17EmptyStringDebtPut.body.monthly_payment) === 150.0, "PUT /debts/:id with empty string leaves monthly_payment unchanged at $150.00 (not 0 or NaN)");
+
   // Atomic debt payment
   const s17DebtPay = await request(
     { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}/pay`, method: "POST", headers: authHeaders },
@@ -2203,6 +2217,20 @@ async function runTestSuite() {
     { name: "Updated Suite 17 Goal", goal_amount: 1500.0 }
   );
   assert(s17GoodGoalPut.status === 200 && parseFloat(s17GoodGoalPut.body.goal_amount) === 1500.0, "PUT /savings-goals/:id successfully updates with valid payload");
+
+  // Rejects malformed target_date on PUT /savings-goals/:id
+  const s17MalformedDateGoal = await request(
+    { hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "PUT", headers: authHeaders },
+    { target_date: "invalid-date-format" }
+  );
+  assert(s17MalformedDateGoal.status === 400, "PUT /savings-goals/:id rejects malformed target_date with HTTP 400");
+
+  // Empty string goal_amount leaves existing value unchanged (does NOT become null or NaN)
+  const s17EmptyStringGoalPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "PUT", headers: authHeaders },
+    { goal_amount: "" }
+  );
+  assert(s17EmptyStringGoalPut.status === 200 && parseFloat(s17EmptyStringGoalPut.body.goal_amount) === 1500.0, "PUT /savings-goals/:id with empty string leaves goal_amount unchanged at $1,500.00 (not null or NaN)");
 
   // Atomic contribution to savings goal
   const s17GoalContribute = await request(

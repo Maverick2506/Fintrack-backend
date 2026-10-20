@@ -165,9 +165,10 @@ router.put(
         req.body.target_amount !== undefined ||
         req.body.goal_amount !== undefined
       ) {
-        updates.targetAmount = parseFloat(
-          req.body.target_amount ?? req.body.goal_amount
-        );
+        const rawTarget = req.body.target_amount ?? req.body.goal_amount;
+        if (rawTarget !== null && rawTarget !== undefined) {
+          updates.targetAmount = parseFloat(rawTarget);
+        }
       }
       if (
         req.body.target_date !== undefined ||
@@ -177,7 +178,8 @@ router.put(
       }
       if (
         req.body.current_amount !== undefined &&
-        req.body.current_amount !== ""
+        req.body.current_amount !== "" &&
+        req.body.current_amount !== null
       ) {
         updates.initialBalance = parseFloat(req.body.current_amount);
       }
