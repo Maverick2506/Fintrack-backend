@@ -2567,6 +2567,125 @@ async function runTestSuite() {
     },
   });
 
+  // --- Suite 20: Cleared-Only Filter for Spending Charts vs Unfiltered Monthly Expenses (U3) ---
+  console.log("\n--- Suite 20: Cleared-Only Filter for Spending Charts vs Unfiltered Monthly Expenses (U3) ---");
+  const s20Zoned = toZonedTime(new Date(), "America/Toronto");
+  const s20Year = s20Zoned.getFullYear();
+  const s20Month = s20Zoned.getMonth() + 1; // 1-indexed
+  const s20Date = `${s20Year}-${String(s20Month).padStart(2, "0")}-25`;
+
+  // 1. Create one unpaid bill in current month with unique category
+  const s20Category = "Suite20UnpaidCat";
+  const s20UnpaidBill = await Transaction.create({
+    title: "Suite 20 Unpaid Upcoming Bill",
+    amount: 155.0,
+    baseAmount: 155.0,
+    type: "EXPENSE",
+    category: s20Category,
+    date: s20Date,
+    isCleared: false,
+    balanceApplied: false,
+  });
+
+  // 2. Create one unpaid future paycheque in current month
+  const s20UnpaidPaycheque = await Transaction.create({
+    title: "Suite 20 Unpaid Future Paycheque",
+    amount: 850.0,
+    type: "INCOME",
+    category: "Income",
+    date: s20Date,
+    isCleared: false,
+    balanceApplied: false,
+  });
+
+  // 3. Check /dashboard spendingSummary excludes the unpaid bill
+  const s20DashRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/dashboard?year=${s20Year}&month=${s20Month}`,
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s20DashCat = (s20DashRes.body.spendingSummary || []).find((cat) => cat.name === s20Category);
+  assert(
+    !s20DashCat,
+    "/dashboard spendingSummary excludes unpaid bills (isCleared: false)"
+  );
+
+  // 4. Check /spending-summary excludes the unpaid bill
+  const s20SpendRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/spending-summary?year=${s20Year}&month=${s20Month}`,
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s20SpendCat = (s20SpendRes.body || []).find((cat) => cat.name === s20Category);
+  assert(
+    !s20SpendCat,
+    "/spending-summary excludes unpaid bills (isCleared: false)"
+  );
+
+  // 5. Check /trends excludes both unpaid income and unpaid expense
+  const s20TrendsRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/trends?year=${s20Year}&month=${s20Month}`,
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s20MonthName = new Date(s20Year, s20Month - 1, 1).toLocaleString("en-US", { month: "short" });
+  const s20Bucket = (s20TrendsRes.body || []).find((b) => b.name === s20MonthName);
+  const s20DashSummary = s20DashRes.body.monthlySummary;
+  assert(
+    s20Bucket !== undefined,
+    "/trends returns bucket for active month"
+  );
+  assert(
+    s20Bucket && Math.abs(s20Bucket.spending - s20DashSummary.totalSpending) < 0.01,
+    "/trends monthly spending aligns with dashboard cleared totalSpending"
+  );
+  assert(
+    s20Bucket && Math.abs(s20Bucket.income - s20DashSummary.totalIncome) < 0.01,
+    "/trends monthly income aligns with dashboard cleared totalIncome"
+  );
+
+  // 6. Check /expenses/monthly still includes the unpaid bill with is_paid: false
+  const s20MonthlyRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/monthly?year=${s20Year}&month=${s20Month}`,
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s20FoundBill = (s20MonthlyRes.body || []).find((e) => e.id === s20UnpaidBill.id);
+  assert(
+    s20FoundBill !== undefined && s20FoundBill.is_paid === false,
+    "/expenses/monthly preserves upcoming bills with is_paid: false"
+  );
+
+  // 7. Check /expenses/category still includes the unpaid bill with is_paid: false
+  const s20CatDrillRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/category?year=${s20Year}&month=${s20Month}&category=${encodeURIComponent(s20Category)}`,
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s20FoundCatDrill = (s20CatDrillRes.body || []).find((e) => e.id === s20UnpaidBill.id);
+  assert(
+    s20FoundCatDrill !== undefined && s20FoundCatDrill.is_paid === false,
+    "/expenses/category preserves upcoming bills with is_paid: false for drill-down"
+  );
+
+  // Clean up Suite 20 records
+  await Transaction.destroy({
+    where: {
+      id: [s20UnpaidBill.id, s20UnpaidPaycheque.id],
+    },
+  });
+
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
