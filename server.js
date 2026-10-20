@@ -113,7 +113,6 @@ app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
 app.use("/api", paychequeRoutes);
 app.use("/api/budgets", budgetRoutes);
-app.use("/api", budgetRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);

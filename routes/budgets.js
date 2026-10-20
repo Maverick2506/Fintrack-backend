@@ -23,7 +23,7 @@ router.get(
     let targetYear = nowZoned.getFullYear();
     let targetMonth = nowZoned.getMonth() + 1; // 1-12
 
-    if (req.query.month && /^\d{4}-\d{2}$/.test(req.query.month)) {
+    if (req.query.month && /^\d{4}-(0[1-9]|1[0-2])$/.test(req.query.month)) {
       const [y, m] = req.query.month.split("-").map(Number);
       targetYear = y;
       targetMonth = m;
@@ -81,14 +81,13 @@ router.put(
   validateBody(schemas.setBudget),
   asyncHandler(async (req, res) => {
     const category = decodeURIComponent(req.params.category).trim();
-    if (!category) {
-      return res.status(400).json({ error: "Category name is required." });
+    if (!category || category.length > 100) {
+      return res.status(400).json({ error: "Category name must be between 1 and 100 characters." });
     }
 
     const monthlyLimit = parseFloat(req.body.monthlyLimit ?? req.body.limit);
-    const rollover = req.body.rollover !== undefined ? Boolean(req.body.rollover) : false;
-
     let budget = await Budget.findOne({ where: { category } });
+    const rollover = req.body.rollover !== undefined ? Boolean(req.body.rollover) : (budget ? budget.rollover : false);
     if (budget) {
       budget.monthlyLimit = monthlyLimit;
       budget.rollover = rollover;

@@ -2974,6 +2974,37 @@ async function runTestSuite() {
   });
   assert(deleteNotFoundRes.status === 404, "DELETE /api/budgets/:category returns HTTP 404 for non-existent category");
 
+  // Verify C1: /api does not mistakenly mount budget router
+  const notARouteRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/not-a-route",
+    method: "PUT",
+    headers: authHeaders,
+  }, { monthlyLimit: 50 });
+  assert(notARouteRes.status === 404, "PUT /api/not-a-route returns HTTP 404 (not matched by budgets router)");
+
+  const budgetsAfterNotARoute = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/budgets",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const budgetsList = Array.isArray(budgetsAfterNotARoute.body) ? budgetsAfterNotARoute.body : [];
+  assert(!budgetsList.some((b) => b.category === "not-a-route"), "GET /api/budgets does not contain not-a-route");
+
+  const longCatName = "A".repeat(101);
+  const longCatRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/budgets/${longCatName}`,
+    method: "PUT",
+    headers: authHeaders,
+  }, { monthlyLimit: 100 });
+  assert(longCatRes.status === 400, "PUT /api/budgets/:category rejects category name > 100 chars with HTTP 400");
+
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
