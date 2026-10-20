@@ -19,7 +19,7 @@ const validateBody = (schema) => (req, res, next) => {
 const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
 
 const optionalNumber = (n) =>
-  z.preprocess((v) => (v === "" ? undefined : v), n.optional());
+  z.preprocess((v) => (v === "" || v === null ? undefined : v), n.optional());
 
 const optionalDate = z.preprocess(
   (v) => (v === "" ? null : v),

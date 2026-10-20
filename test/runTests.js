@@ -2196,6 +2196,20 @@ async function runTestSuite() {
   );
   assert(s17DebtPay.status === 200 && parseFloat(s17DebtPay.body.total_remaining) === 800.0, "Atomic debt payment reduces debt balance from $1,000 to $800.00");
 
+  // null total_remaining leaves existing value unchanged (does NOT reset to 0)
+  const s17NullDebtPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "PUT", headers: authHeaders },
+    { total_remaining: null }
+  );
+  assert(s17NullDebtPut.status === 200 && parseFloat(s17NullDebtPut.body.total_remaining) === 800.0, "PUT /debts/:id with null total_remaining leaves balance unchanged at $800.00 (not reset to 0)");
+
+  // null monthly_payment explicitly clears monthly_payment to null
+  const s17ClearPaymentDebtPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "PUT", headers: authHeaders },
+    { monthly_payment: null }
+  );
+  assert(s17ClearPaymentDebtPut.status === 200 && s17ClearPaymentDebtPut.body.monthly_payment === null, "PUT /debts/:id with null monthly_payment clears monthly_payment to null");
+
   // 2. Savings Goal PUT validation and atomic contribute
   const s17Goal = await request(
     { hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "POST", headers: authHeaders },
@@ -2238,6 +2252,13 @@ async function runTestSuite() {
     { amount: 150.0 }
   );
   assert(s17GoalContribute.status === 200 && parseFloat(s17GoalContribute.body.current_amount) === 350.0, "Atomic contribution increases savings goal from $200 to $350.00");
+
+  // null current_amount leaves existing value unchanged (does NOT reset to 0)
+  const s17NullGoalPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "PUT", headers: authHeaders },
+    { current_amount: null }
+  );
+  assert(s17NullGoalPut.status === 200 && parseFloat(s17NullGoalPut.body.current_amount) === 350.0, "PUT /savings-goals/:id with null current_amount leaves balance unchanged at $350.00 (not reset to 0)");
 
   // 3. Atomic credit card payment
   const s17Card = await request(
