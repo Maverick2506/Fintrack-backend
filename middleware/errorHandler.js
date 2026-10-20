@@ -21,10 +21,7 @@ function errorHandler(err, req, res, next) {
   if (!status) {
     const isUniqueViolation =
       err.name === "SequelizeUniqueConstraintError" ||
-      (err.original && err.original.code === "23505") ||
-      (err.original &&
-        err.original.code === "SQLITE_CONSTRAINT" &&
-        String(err.original.message).includes("UNIQUE constraint failed"));
+      (err.original && err.original.code === "23505");
 
     if (isUniqueViolation) {
       status = 409;
