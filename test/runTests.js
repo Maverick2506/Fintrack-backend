@@ -1,4 +1,5 @@
 const http = require("http");
+const { getBalancesSummary } = require("../services/netWorthService");
 const { getNextOccurrenceDate, getNextDueDate } = require("../routes/recurring");
 const { toZonedTime, format } = require("date-fns-tz");
 
@@ -2684,6 +2685,45 @@ async function runTestSuite() {
       id: [s20UnpaidBill.id, s20UnpaidPaycheque.id],
     },
   });
+
+  // --- Suite 21: Net Worth Service & Balances Summary Consistency (Phase A) ---
+  console.log("\n--- Suite 21: Net Worth Service & Balances Summary Consistency (Phase A) ---");
+  const s21Summary = await getBalancesSummary();
+  assert(
+    typeof s21Summary.checking === "number" &&
+      typeof s21Summary.savings === "number" &&
+      typeof s21Summary.debt === "number" &&
+      typeof s21Summary.cards === "number" &&
+      typeof s21Summary.netWorth === "number",
+    "getBalancesSummary() returns valid numeric balances for checking, savings, debt, cards, and netWorth"
+  );
+  assert(
+    Math.abs(s21Summary.netWorth - (s21Summary.checking + s21Summary.savings - s21Summary.debt - s21Summary.cards)) < 0.01,
+    "netWorth arithmetic strictly matches checking + savings - debt - cards"
+  );
+
+  const s21DashRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(
+    s21DashRes.status === 200 && s21DashRes.body.balancesSummary !== undefined,
+    "GET /api/dashboard returns balancesSummary object"
+  );
+  assert(
+    s21DashRes.body.balancesSummary &&
+      Math.abs(s21DashRes.body.balancesSummary.netWorth - s21Summary.netWorth) < 0.01,
+    "Dashboard balancesSummary.netWorth matches netWorthService calculation"
+  );
+  assert(
+    s21DashRes.body.balancesSummary &&
+      Math.abs(s21DashRes.body.balancesSummary.checking - s21Summary.checking) < 0.01,
+    "Dashboard balancesSummary.checking matches netWorthService live checking"
+  );
+
 
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");

@@ -1,4 +1,5 @@
 const express = require("express");
+const { getBalancesSummary } = require("../services/netWorthService");
 const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
@@ -80,6 +81,7 @@ router.get(
       savingsSummary,
       creditCardSummary,
       spendingByCategoryRaw,
+      balancesSummary,
     ] = await Promise.all([
       Transaction.sum("amount", {
         where: {
@@ -138,6 +140,7 @@ router.get(
         group: ["category"],
         raw: true,
       }),
+      getBalancesSummary(null, todayStr),
     ]);
 
     const checkingCurrentBalance = await getCalculatedCheckingBalance(
@@ -172,6 +175,7 @@ router.get(
       savingsSummary,
       creditCardSummary,
       spendingSummary,
+      balancesSummary,
     });
   })
 );
