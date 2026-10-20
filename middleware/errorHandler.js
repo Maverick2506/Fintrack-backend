@@ -26,8 +26,28 @@ function errorHandler(err, req, res, next) {
           err.original.code === "23505"))
     ) {
       status = 409;
-      message =
-        "Another occurrence of this recurring series is already on that date.";
+      const isRecurringConflict =
+        (err.fields &&
+          (Array.isArray(err.fields)
+            ? err.fields.includes("recurringGroupId")
+            : "recurringGroupId" in err.fields)) ||
+        (err.parent &&
+          err.parent.constraint ===
+            "transactions_recurring_group_date_unique") ||
+        (err.original &&
+          String(err.original.message).includes("recurringGroupId"));
+
+      if (isRecurringConflict) {
+        message =
+          "Another occurrence of this recurring series is already on that date.";
+      } else {
+        const fieldNames = err.fields
+          ? Array.isArray(err.fields)
+            ? err.fields.join(", ")
+            : Object.keys(err.fields).join(", ")
+          : "record";
+        message = `A duplicate ${fieldNames} already exists.`;
+      }
     } else {
       status = 500;
     }
