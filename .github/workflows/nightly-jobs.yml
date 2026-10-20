@@ -1,0 +1,57 @@
+name: Nightly jobs
+
+# Render's free instance sleeps when idle, so the node-cron schedules in
+# server.js rarely fire. This workflow wakes the service and calls the
+# daily sweep and recurring generation endpoints once a night.
+on:
+  schedule:
+    # GitHub cron is UTC. 05:17 UTC is 01:17 Toronto in summer (EDT) and
+    # 00:17 in winter (EST), so it always runs after Toronto midnight.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-jobs
+  cancel-in-progress: false
+
+env:
+  BACKEND_URL: ${{ vars.BACKEND_URL || 'https://fintrack-backend-rzrh.onrender.com' }}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check CRON_SECRET is configured
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::Repository secret CRON_SECRET is not set."
+            exit 1
+          fi
+
+      - name: Wake the backend
+        # A cold start on Render's free tier takes ~30-60s; retry until healthy.
+        run: |
+          curl -fsS --max-time 90 --retry 6 --retry-delay 15 --retry-all-errors \
+            "$BACKEND_URL/api/health"
+
+      - name: Daily sweep
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -fsS --max-time 120 --retry 3 --retry-delay 20 --retry-all-errors \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$BACKEND_URL/api/daily-check"
+
+      - name: Generate recurring transactions
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -fsS --max-time 120 --retry 3 --retry-delay 20 --retry-all-errors \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            "$BACKEND_URL/api/trigger-recurring"
