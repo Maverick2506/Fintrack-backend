@@ -169,29 +169,54 @@ const createRecurringExpenses = async (dbTx = null) => {
             );
           }
 
-          await Transaction.create(
-            {
-              ...baseTrx.get({ plain: true }),
-              id: undefined,
-              amount: newAmount,
-              baseAmount: baseAmountValue,
-              isTaxExclusive: isTaxExcl,
-              taxRate: taxRateVal,
-              taxApplied,
-              isCleared,
-              balanceApplied: false,
-              date: nextDateStr,
-              recurringGroupId: seriesId,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            { transaction: dbTx }
-          );
-          console.log(
-            `Created recurring ${baseTrx.type.toLowerCase()}: ${
-              baseTrx.title
-            } for ${nextDateStr}`
-          );
+          const createPayload = {
+            ...baseTrx.get({ plain: true }),
+            id: undefined,
+            amount: newAmount,
+            baseAmount: baseAmountValue,
+            isTaxExclusive: isTaxExcl,
+            taxRate: taxRateVal,
+            taxApplied,
+            isCleared,
+            balanceApplied: false,
+            date: nextDateStr,
+            recurringGroupId: seriesId,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          };
+
+          try {
+            if (dbTx) {
+              await Transaction.sequelize.transaction(
+                { transaction: dbTx },
+                async (nestedTx) => {
+                  await Transaction.create(createPayload, {
+                    transaction: nestedTx,
+                  });
+                }
+              );
+            } else {
+              await Transaction.create(createPayload);
+            }
+            console.log(
+              `Created recurring ${baseTrx.type.toLowerCase()}: ${
+                baseTrx.title
+              } for ${nextDateStr}`
+            );
+          } catch (createErr) {
+            if (
+              createErr.name === "SequelizeUniqueConstraintError" ||
+              (createErr.original &&
+                (createErr.original.code === "SQLITE_CONSTRAINT" ||
+                  createErr.original.code === "23505"))
+            ) {
+              console.log(
+                `Recurring transaction already created for group ${seriesId} on ${nextDateStr}, skipping duplicate.`
+              );
+            } else {
+              throw createErr;
+            }
+          }
         }
 
         step++;

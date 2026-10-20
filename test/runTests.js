@@ -2402,6 +2402,171 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s18DebtId}`, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s18PayoffDebtId}`, method: "DELETE", headers: authHeaders });
 
+  // 19. Hardening: Production Auth Enforcement & Recurring Group Idempotency (Unique Index)
+  console.log("\n--- Suite 19: Production Auth Enforcement & Recurring Group Idempotency ---");
+  const { assertAuthConfiguration } = require("../config/auth");
+  const { Transaction } = require("../models");
+  const { createRecurringExpenses } = require("../routes/recurring");
+
+  // 19.1: Verify assertAuthConfiguration in production mode
+  const origNodeEnv = process.env.NODE_ENV;
+  const origPassword = process.env.SUPER_SECRET_PASSWORD;
+
+  try {
+    process.env.NODE_ENV = "production";
+    delete process.env.SUPER_SECRET_PASSWORD;
+    let authError = null;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      authError = err;
+    }
+    assert(
+      authError !== null && authError.message.includes("FATAL CONFIGURATION ERROR: SUPER_SECRET_PASSWORD is not set"),
+      "assertAuthConfiguration() refuses to start when NODE_ENV is production and SUPER_SECRET_PASSWORD is unset"
+    );
+
+    // In production with default "maverick" password
+    process.env.SUPER_SECRET_PASSWORD = "maverick";
+    let authMaverickError = null;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      authMaverickError = err;
+    }
+    assert(
+      authMaverickError !== null && authMaverickError.message.includes("Refusing to boot with default credentials"),
+      "assertAuthConfiguration() refuses to start when NODE_ENV is production and SUPER_SECRET_PASSWORD is 'maverick'"
+    );
+
+    // With password set in production
+    process.env.SUPER_SECRET_PASSWORD = "test-prod-password-123";
+    let prodSuccess = true;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      prodSuccess = false;
+    }
+    assert(prodSuccess, "assertAuthConfiguration() succeeds in production when SUPER_SECRET_PASSWORD is provided");
+  } finally {
+    process.env.NODE_ENV = origNodeEnv;
+    if (origPassword !== undefined) {
+      process.env.SUPER_SECRET_PASSWORD = origPassword;
+    } else {
+      delete process.env.SUPER_SECRET_PASSWORD;
+    }
+  }
+
+  // 19.2: Unique Index on (recurringGroupId, date) prevents duplicate transactions
+  const s19GroupId = "99999999-9999-9999-9999-999999999999";
+  const s19Date = "2029-06-15";
+
+  const s19FirstTrx = await Transaction.create({
+    title: "Suite 19 Recurring Test A",
+    amount: 75.0,
+    baseAmount: 75.0,
+    type: "EXPENSE",
+    recurrence: "weekly",
+    date: s19Date,
+    recurringGroupId: s19GroupId,
+    isCleared: false,
+    balanceApplied: false,
+  });
+  assert(s19FirstTrx && s19FirstTrx.id, "Successfully creates initial recurring group occurrence");
+
+  let s19DupError = null;
+  try {
+    await Transaction.create({
+      title: "Suite 19 Recurring Test Duplicate",
+      amount: 75.0,
+      baseAmount: 75.0,
+      type: "EXPENSE",
+      date: s19Date,
+      recurringGroupId: s19GroupId,
+      isCleared: false,
+      balanceApplied: false,
+    });
+  } catch (err) {
+    s19DupError = err;
+  }
+  assert(
+    s19DupError !== null &&
+      (s19DupError.name === "SequelizeUniqueConstraintError" ||
+        (s19DupError.original && s19DupError.original.code === "SQLITE_CONSTRAINT")),
+    "Unique index on (recurringGroupId, date) strictly rejects duplicate transaction on identical date"
+  );
+
+  // 19.2b: Moving an occurrence onto a sibling's date returns HTTP 409 Conflict
+  const s19Date2 = "2029-06-22";
+  const s19SecondTrx = await Transaction.create({
+    title: "Suite 19 Recurring Test B",
+    amount: 75.0,
+    baseAmount: 75.0,
+    type: "EXPENSE",
+    recurrence: "weekly",
+    date: s19Date2,
+    recurringGroupId: s19GroupId,
+    isCleared: false,
+    balanceApplied: false,
+  });
+
+  const moveRes = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s19SecondTrx.id}`, method: "PUT", headers: authHeaders },
+    { due_date: s19Date }
+  );
+  assert(
+    moveRes.status === 409,
+    "Moving an occurrence onto a sibling's date returns HTTP 409 Conflict"
+  );
+  assert(
+    moveRes.body.error === "Another occurrence of this recurring series is already on that date.",
+    "Returns clear user-facing error message on recurring date conflict"
+  );
+
+  // 19.3: Multiple non-recurring transactions with recurringGroupId = null on the same date are permitted
+  let s19NullDateError = null;
+  let s19Null1, s19Null2;
+  try {
+    s19Null1 = await Transaction.create({
+      title: "Suite 19 One-off 1",
+      amount: 10.0,
+      type: "EXPENSE",
+      date: s19Date,
+      recurringGroupId: null,
+      isCleared: false,
+    });
+    s19Null2 = await Transaction.create({
+      title: "Suite 19 One-off 2",
+      amount: 20.0,
+      type: "EXPENSE",
+      date: s19Date,
+      recurringGroupId: null,
+      isCleared: false,
+    });
+  } catch (err) {
+    s19NullDateError = err;
+  }
+  assert(
+    s19NullDateError === null && s19Null1 && s19Null2,
+    "Multiple non-recurring transactions with NULL recurringGroupId on the same date are accepted"
+  );
+
+  // 19.4: createRecurringExpenses handles idempotent execution safely
+  let s19JobError = null;
+  try {
+    await createRecurringExpenses();
+  } catch (err) {
+    s19JobError = err;
+  }
+  assert(s19JobError === null, "createRecurringExpenses() executes safely and idempotently without crashing");
+
+  // Clean up Suite 19 records
+  await Transaction.destroy({
+    where: {
+      id: [s19FirstTrx.id, s19SecondTrx && s19SecondTrx.id, s19Null1 && s19Null1.id, s19Null2 && s19Null2.id].filter(Boolean),
+    },
+  });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
