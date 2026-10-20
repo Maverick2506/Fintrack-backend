@@ -46,6 +46,7 @@ const schemas = {
     baseAmount: z.coerce.number().nonnegative().nullable().optional(),
     taxApplied: z.boolean().optional().default(false),
     recurringGroupId: z.string().uuid().nullable().optional(),
+    applyToBalance: z.boolean().optional(),
   }),
 
   updateExpense: z.object({

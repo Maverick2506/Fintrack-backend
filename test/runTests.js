@@ -3004,6 +3004,162 @@ async function runTestSuite() {
   }, { monthlyLimit: 100 });
   assert(longCatRes.status === 400, "PUT /api/budgets/:category rejects category name > 100 chars with HTTP 400");
 
+  // 24. Past-Dated Credit Card Toggle Tests (Phase D)
+  console.log("\n--- Suite 24: Past-Dated Credit Card Toggle (Phase D) ---");
+
+  const testCardRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "POST",
+    headers: authHeaders,
+  }, { name: "Test Card Phase D", creditLimit: 2000, currentBalance: 500 });
+  assert(testCardRes.status === 201, "Creates test card for Phase D with $500 balance");
+  const testCardId = testCardRes.body.id;
+
+  const dYesterday = new Date();
+  dYesterday.setDate(dYesterday.getDate() - 1);
+  const yesterdayStr = dYesterday.toISOString().split("T")[0];
+
+  const dFiveDaysAgo = new Date();
+  dFiveDaysAgo.setDate(dFiveDaysAgo.getDate() - 5);
+  const fiveDaysAgoStr = dFiveDaysAgo.toISOString().split("T")[0];
+
+  const todayIso = new Date().toISOString().split("T")[0];
+
+  // 1. Past-dated card charge with applyToBalance: true
+  const pastAppliedExp = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Past Charge Applied",
+    amount: 50,
+    due_date: yesterdayStr,
+    creditCardId: testCardId,
+    applyToBalance: true,
+  });
+  assert(pastAppliedExp.status === 201 && pastAppliedExp.body.balanceApplied === true, "Past-dated expense with applyToBalance: true has balanceApplied: true");
+
+  let cardCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  let cardObj = cardCheck.body.find((c) => c.id === testCardId);
+  assert(parseFloat(cardObj.currentBalance) === 550, "Card balance increased to $550 with applyToBalance: true");
+
+  // 2. Past-dated card charge with applyToBalance omitted
+  const pastUnappliedExp = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Past Charge Already Included",
+    amount: 30,
+    due_date: fiveDaysAgoStr,
+    creditCardId: testCardId,
+  });
+  assert(pastUnappliedExp.status === 201 && pastUnappliedExp.body.balanceApplied === false, "Past-dated expense without applyToBalance has balanceApplied: false");
+
+  cardCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  cardObj = cardCheck.body.find((c) => c.id === testCardId);
+  assert(parseFloat(cardObj.currentBalance) === 550, "Card balance remains $550 for charge with applyToBalance omitted");
+
+  // 3. Today charge without applyToBalance
+  const todayExp = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Today Card Charge",
+    amount: 20,
+    due_date: todayIso,
+    creditCardId: testCardId,
+  });
+  assert(todayExp.status === 201 && todayExp.body.balanceApplied === true, "Today expense defaults to balanceApplied: true");
+
+  cardCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  cardObj = cardCheck.body.find((c) => c.id === testCardId);
+  assert(parseFloat(cardObj.currentBalance) === 570, "Card balance increased to $570 for today charge");
+
+  // 4. Delete pastAppliedExp
+  const delPastApplied = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses/" + pastAppliedExp.body.id,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(delPastApplied.status === 204, "Successfully deleted past-dated applied expense with HTTP 204");
+
+  cardCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  cardObj = cardCheck.body.find((c) => c.id === testCardId);
+  assert(parseFloat(cardObj.currentBalance) === 520, "Deleting applied past expense decrements card balance to $520");
+
+  // 5. Delete pastUnappliedExp
+  const delPastUnapplied = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses/" + pastUnappliedExp.body.id,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(delPastUnapplied.status === 204, "Successfully deleted past-dated unapplied expense with HTTP 204");
+
+  cardCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  cardObj = cardCheck.body.find((c) => c.id === testCardId);
+  assert(parseFloat(cardObj.currentBalance) === 520, "Deleting unapplied past expense leaves card balance unchanged at $520");
+
+  // Cleanup
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses/" + todayExp.body.id,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards/" + testCardId,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

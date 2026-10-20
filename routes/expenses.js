@@ -296,7 +296,7 @@ router.post(
       );
 
       // Apply balance change on Credit Card (charge) or Debt/Credit Card (paydown) if cleared
-      await adjustAccountForTransaction(newExp, 1, dbTx);
+      await adjustAccountForTransaction(newExp, 1, dbTx, req.body.applyToBalance === true);
 
       if (recurrence && recurrence !== "none") {
         await createRecurringExpenses(dbTx).catch((err) =>
