@@ -112,11 +112,12 @@ router.post(
         });
       }
 
-      debt.initialBalance = Math.max(
-        0,
-        Math.round((remainingDebt - paymentAmount) * 100) / 100
-      );
-      await debt.save({ transaction: dbTx });
+      await Account.increment("initialBalance", {
+        by: -paymentAmount,
+        where: { id: debt.id },
+        transaction: dbTx,
+      });
+      await debt.reload({ transaction: dbTx });
 
       // Record as EXPENSE under "Debt" category so it registers in both Monthly Expenses/Analytics AND Debt paydown
       await Transaction.create(
@@ -178,6 +179,7 @@ router.delete(
 
 router.put(
   "/debts/:id",
+  validateBody(schemas.updateDebt),
   asyncHandler(async (req, res) => {
     const debt = await Account.findByPk(req.params.id);
     if (!debt || debt.type !== "DEBT") {

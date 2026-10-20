@@ -104,12 +104,49 @@ const schemas = {
     interestRate: z.coerce.number().nonnegative().nullable().optional(),
   }),
 
+  updateDebt: z.object({
+    name: z.string().trim().min(1).max(255).optional(),
+    total_amount: z.union([z.coerce.number().positive(), z.literal("")]).optional(),
+    total_remaining: z.union([z.coerce.number(), z.literal("")]).optional(),
+    monthly_payment: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .nullable()
+      .optional(),
+    auto_pay: z.boolean().optional(),
+    next_due_date: z.string().nullable().optional(),
+    payment_frequency: z
+      .enum(["weekly", "bi-weekly", "monthly", "yearly"])
+      .optional(),
+    interest_rate: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .nullable()
+      .optional(),
+    interestRate: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .nullable()
+      .optional(),
+  }),
+
   createSavingsGoal: z.object({
     name: z.string().trim().min(1, "Goal name is required").max(255),
     target_amount: z.coerce.number().positive().optional(),
     goal_amount: z.coerce.number().positive().optional(),
     current_amount: z.coerce.number().nonnegative().optional().default(0),
     initialBalance: z.coerce.number().nonnegative().optional(),
+    target_date: z.string().nullable().optional(),
+    dueDate: z.string().nullable().optional(),
+  }),
+
+  updateSavingsGoal: z.object({
+    name: z.string().trim().min(1).max(255).optional(),
+    target_amount: z.union([z.coerce.number().positive(), z.literal("")]).optional(),
+    goal_amount: z.union([z.coerce.number().positive(), z.literal("")]).optional(),
+    current_amount: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .optional(),
+    initialBalance: z
+      .union([z.coerce.number().nonnegative(), z.literal("")])
+      .optional(),
     target_date: z.string().nullable().optional(),
     dueDate: z.string().nullable().optional(),
   }),

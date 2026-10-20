@@ -2150,6 +2150,86 @@ async function runTestSuite() {
 
   await request({ hostname: "localhost", port: 8000, path: `/api/savings-goals/${s16GoalCId}`, method: "DELETE", headers: authHeaders });
 
+  // 17. Validation & Atomic Increments: Debts, Savings Goals, and Card Payments
+  console.log("\n--- Suite 17: PUT Validation & Atomic Payment Increments ---");
+
+  // 1. Debt PUT validation and atomic pay
+  const s17Debt = await request(
+    { hostname: "localhost", port: 8000, path: "/api/debts", method: "POST", headers: authHeaders },
+    { name: "Suite 17 Debt", total_amount: 1000.0, monthly_payment: 100.0, next_due_date: "2026-11-01" }
+  );
+  assert(s17Debt.status === 201 && s17Debt.body.id, "Creates test debt for Suite 17");
+  const s17DebtId = s17Debt.body.id;
+
+  // Rejects invalid payload on PUT /debts/:id
+  const s17BadDebtPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "PUT", headers: authHeaders },
+    { payment_frequency: "invalid_freq_value" }
+  );
+  assert(s17BadDebtPut.status === 400, "PUT /debts/:id rejects invalid payment_frequency with HTTP 400");
+
+  // Valid PUT /debts/:id
+  const s17GoodDebtPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "PUT", headers: authHeaders },
+    { name: "Updated Suite 17 Debt", monthly_payment: 150.0, auto_pay: true }
+  );
+  assert(s17GoodDebtPut.status === 200 && s17GoodDebtPut.body.name === "Updated Suite 17 Debt", "PUT /debts/:id successfully updates with valid payload");
+
+  // Atomic debt payment
+  const s17DebtPay = await request(
+    { hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}/pay`, method: "POST", headers: authHeaders },
+    { amount: 200.0 }
+  );
+  assert(s17DebtPay.status === 200 && parseFloat(s17DebtPay.body.total_remaining) === 800.0, "Atomic debt payment reduces debt balance from $1,000 to $800.00");
+
+  // 2. Savings Goal PUT validation and atomic contribute
+  const s17Goal = await request(
+    { hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "POST", headers: authHeaders },
+    { name: "Suite 17 Goal", target_amount: 1000.0, current_amount: 200.0 }
+  );
+  assert(s17Goal.status === 201 && s17Goal.body.id, "Creates test savings goal for Suite 17");
+  const s17GoalId = s17Goal.body.id;
+
+  // Rejects invalid payload on PUT /savings-goals/:id
+  const s17BadGoalPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "PUT", headers: authHeaders },
+    { current_amount: -50 }
+  );
+  assert(s17BadGoalPut.status === 400, "PUT /savings-goals/:id rejects negative current_amount with HTTP 400");
+
+  // Valid PUT /savings-goals/:id
+  const s17GoodGoalPut = await request(
+    { hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "PUT", headers: authHeaders },
+    { name: "Updated Suite 17 Goal", goal_amount: 1500.0 }
+  );
+  assert(s17GoodGoalPut.status === 200 && parseFloat(s17GoodGoalPut.body.goal_amount) === 1500.0, "PUT /savings-goals/:id successfully updates with valid payload");
+
+  // Atomic contribution to savings goal
+  const s17GoalContribute = await request(
+    { hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}/contribute`, method: "POST", headers: authHeaders },
+    { amount: 150.0 }
+  );
+  assert(s17GoalContribute.status === 200 && parseFloat(s17GoalContribute.body.current_amount) === 350.0, "Atomic contribution increases savings goal from $200 to $350.00");
+
+  // 3. Atomic credit card payment
+  const s17Card = await request(
+    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
+    { name: "Suite 17 Card", currentBalance: 500.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+  );
+  assert(s17Card.status === 201 && s17Card.body.id, "Creates test credit card for Suite 17");
+  const s17CardId = s17Card.body.id;
+
+  const s17CardPay = await request(
+    { hostname: "localhost", port: 8000, path: `/api/credit-cards/${s17CardId}/pay`, method: "POST", headers: authHeaders },
+    { amount: 150.0 }
+  );
+  assert(s17CardPay.status === 200 && parseFloat(s17CardPay.body.currentBalance) === 350.0, "Atomic credit card payment reduces balance from $500 to $350.00");
+
+  // Cleanup Suite 17
+  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s17CardId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "DELETE", headers: authHeaders });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

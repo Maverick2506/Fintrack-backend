@@ -71,10 +71,13 @@ router.post(
       }
 
       const paymentAmount = parseFloat(req.body.amount);
-      // Unclamped arithmetic avoids drift when payments are edited or reversed
-      card.initialBalance =
-        parseFloat(card.initialBalance || 0) - paymentAmount;
-      await card.save({ transaction: dbTx });
+      // Atomic increment avoids lost updates under concurrency
+      await Account.increment("initialBalance", {
+        by: -paymentAmount,
+        where: { id: card.id },
+        transaction: dbTx,
+      });
+      await card.reload({ transaction: dbTx });
 
       // Record as TRANSFER (not EXPENSE) to prevent double-counting card spending
       await Transaction.create(

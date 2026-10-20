@@ -115,8 +115,13 @@ router.post(
       }
 
       const amount = parseFloat(req.body.amount);
-      goal.initialBalance = parseFloat(goal.initialBalance || 0) + amount;
-      await goal.save({ transaction: dbTx });
+      // Atomic increment avoids lost updates under concurrency
+      await Account.increment("initialBalance", {
+        by: amount,
+        where: { id: goal.id },
+        transaction: dbTx,
+      });
+      await goal.reload({ transaction: dbTx });
 
       await Transaction.create(
         {
@@ -149,6 +154,7 @@ router.post(
 
 router.put(
   "/savings-goals/:id",
+  validateBody(schemas.updateSavingsGoal),
   asyncHandler(async (req, res) => {
     const goal = await Account.findByPk(req.params.id);
     if (goal && goal.type === "SAVINGS_GOAL") {
