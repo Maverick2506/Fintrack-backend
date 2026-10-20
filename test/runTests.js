@@ -2724,6 +2724,26 @@ async function runTestSuite() {
     "Dashboard balancesSummary.checking matches netWorthService live checking"
   );
 
+  const s21ConfigRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/gemini-config",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s21FeedKey = s21ConfigRes.body.feedKey;
+  const s21CsvRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/export/financial-feed.csv?key=${s21FeedKey}`,
+    method: "GET",
+  });
+  assert(
+    s21CsvRes.status === 200 &&
+      s21CsvRes.raw.includes("Estimated Net Worth,$" + s21Summary.netWorth.toFixed(2)),
+    "Export CSV feed Estimated Net Worth strictly equals netWorthService calculation"
+  );
+
 
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");

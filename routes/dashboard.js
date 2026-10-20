@@ -143,10 +143,7 @@ router.get(
       getBalancesSummary(null, todayStr),
     ]);
 
-    const checkingCurrentBalance = await getCalculatedCheckingBalance(
-      checking,
-      todayStr
-    );
+    const checkingCurrentBalance = balancesSummary.checking;
 
     const spendingSummary = (spendingByCategoryRaw || []).map((item) => ({
       name: item.category,

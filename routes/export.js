@@ -88,9 +88,14 @@ const getFinancialData = async () => {
       }),
     ]);
 
-  const checkingAcc = accounts.find((a) => a.type === "CHECKING");
-  const checkingBalance = await getCalculatedCheckingBalance(checkingAcc, todayStr);
+  const balancesSummary = await getBalancesSummary(null, todayStr);
+  const checkingBalance = balancesSummary.checking;
+  const totalCC = balancesSummary.cards;
+  const totalDebt = balancesSummary.debt;
+  const totalSavings = balancesSummary.savings;
+  const netWorth = balancesSummary.netWorth;
 
+  const checkingAcc = accounts.find((a) => a.type === "CHECKING");
   const creditCards = accounts.filter((a) => a.type === "CREDIT_CARD");
   const allDebts = accounts.filter((a) => a.type === "DEBT");
   const debts = allDebts.filter(
@@ -100,12 +105,6 @@ const getFinancialData = async () => {
     (a) => parseFloat(a.initialBalance || 0) <= 0 || a.isActive === false
   );
   const savingsGoals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
-
-  const totalCC = creditCards.reduce((s, c) => s + parseFloat(c.initialBalance || 0), 0);
-  const totalDebt = debts.reduce((s, d) => s + parseFloat(d.initialBalance || 0), 0);
-  const totalSavings = savingsGoals.reduce((s, g) => s + parseFloat(g.initialBalance || 0), 0);
-
-  const netWorth = checkingBalance + totalSavings - totalDebt - totalCC;
   const clearedIncome = parseFloat(monthIncomeSum || 0);
   const clearedExpenses = parseFloat(monthExpensesSum || 0);
   const netFlow = clearedIncome - clearedExpenses;
