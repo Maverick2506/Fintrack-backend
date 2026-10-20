@@ -19,21 +19,23 @@ function errorHandler(err, req, res, next) {
   let message = err.message;
 
   if (!status) {
-    if (
+    const isUniqueViolation =
       err.name === "SequelizeUniqueConstraintError" ||
+      (err.original && err.original.code === "23505") ||
       (err.original &&
-        (err.original.code === "SQLITE_CONSTRAINT" ||
-          err.original.code === "23505"))
-    ) {
+        err.original.code === "SQLITE_CONSTRAINT" &&
+        String(err.original.message).includes("UNIQUE constraint failed"));
+
+    if (isUniqueViolation) {
       status = 409;
       const isRecurringConflict =
+        (err.parent &&
+          err.parent.constraint ===
+            "transactions_recurring_group_date_unique") ||
         (err.fields &&
           (Array.isArray(err.fields)
             ? err.fields.includes("recurringGroupId")
             : "recurringGroupId" in err.fields)) ||
-        (err.parent &&
-          err.parent.constraint ===
-            "transactions_recurring_group_date_unique") ||
         (err.original &&
           String(err.original.message).includes("recurringGroupId"));
 
