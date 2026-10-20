@@ -1,4 +1,4 @@
-const { sequelize, Account, Transaction } = require("../models");
+const { sequelize, Account, Transaction, Setting } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const { getNextDueDate } = require("../routes/recurring");
@@ -198,6 +198,20 @@ const runDailySweep = async () => {
         autoPayCount++;
       }
     }
+
+    await Setting.upsert(
+      {
+        key: "last_sweep_summary",
+        value: JSON.stringify({
+          timestamp: new Date().toISOString(),
+          clearedExpenses: clearedExpenseCount,
+          clearedIncome: clearedIncomeCount,
+          autoPayProcessed: autoPayCount,
+          date: todayString,
+        }),
+      },
+      { transaction: dbTx }
+    );
 
     await dbTx.commit();
     console.log(

@@ -3316,6 +3316,150 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + paychequeRes.body.id, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + recurringIncomeRes.body.id, method: "DELETE", headers: authHeaders });
 
+  // 26. Morning Push Notifications & Daily Digest Tests (Phase F)
+  console.log("\n--- Suite 26: Morning Push Notifications & Daily Digest (Phase F) ---");
+
+  // 1. Rejects unauthorized request with HTTP 401
+  const unauthDigestRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/digest",
+    method: "GET",
+    headers: { Authorization: "Bearer invalid_secret_token" },
+  });
+  assert(unauthDigestRes.status === 401, "GET /api/cron/digest rejects unauthenticated request with HTTP 401");
+
+  // Helper for cron auth
+  const cronHeaders = authHeaders;
+
+  // 2. Returns 204 when clean / nothing to report
+  // Ensure buffer is low and checking balance is high so no low balance alert triggers
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/settings/forecast-buffer",
+    method: "PUT",
+    headers: authHeaders,
+  }, { buffer: 0 });
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/checking",
+    method: "PUT",
+    headers: authHeaders,
+  }, { balance: 5000 });
+
+  // Clean any existing sweep setting, notify setting, or leftover bills for isolation
+  await Setting.destroy({ where: { key: ["last_sweep_summary", "NOTIFY_DETAIL"] } });
+  await Transaction.destroy({ where: { title: ["Day 4 Far Bill", "Day 3 Near Bill"] } });
+
+  const emptyDigestRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/digest",
+    method: "GET",
+    headers: cronHeaders,
+  });
+  assert(emptyDigestRes.status === 204, "GET /api/cron/digest returns HTTP 204 when there is nothing to report");
+
+  // 3. Verify 3-day boundary: Bill on Day 4 is excluded (returns 204), Bill on Day 3 is included (returns 200)
+  const d3Str = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const d4Str = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+
+  const billDay4Res = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Day 4 Far Bill",
+    amount: 120,
+    due_date: d4Str,
+    is_paid: false,
+  });
+
+  const digestWithDay4Res = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/digest",
+    method: "GET",
+    headers: cronHeaders,
+  });
+  assert(digestWithDay4Res.status === 204, "Digest strictly ignores bills due on Day 4 (returns HTTP 204)");
+
+  const billDay3Res = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Day 3 Near Bill",
+    amount: 75,
+    due_date: d3Str,
+    is_paid: false,
+  });
+
+  const digestWithDay3Res = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/digest",
+    method: "GET",
+    headers: cronHeaders,
+  });
+  assert(digestWithDay3Res.status === 200, "Digest includes bills due within 3 days (returns HTTP 200)");
+  assert(digestWithDay3Res.body.message.includes("Day 3 Near Bill"), "Digest message includes near bill title");
+  assert(digestWithDay3Res.body.message.includes("$75.00"), "Digest message includes formatted bill amount");
+  assert(!digestWithDay3Res.body.message.includes("Day 4 Far Bill"), "Digest message strictly excludes Day 4 bill");
+
+  // 4. Low-balance alert triggers priority: "high"
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/settings/forecast-buffer",
+    method: "PUT",
+    headers: authHeaders,
+  }, { buffer: 200 });
+
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/checking",
+    method: "PUT",
+    headers: authHeaders,
+  }, { balance: 50 });
+
+  const lowBalDigestRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/digest",
+    method: "GET",
+    headers: cronHeaders,
+  });
+  assert(lowBalDigestRes.status === 200 && lowBalDigestRes.body.priority === "high", "Low-balance alert escalates digest to priority: high");
+  assert(lowBalDigestRes.body.message.includes("Low Balance Alert"), "Digest contains explicit Low Balance Alert text");
+
+  // 5. Privacy setting NOTIFY_DETAIL: "counts" suppresses dollar amounts
+  await Setting.upsert({ key: "NOTIFY_DETAIL", value: "counts" });
+  const countsDigestRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/cron/digest",
+    method: "GET",
+    headers: cronHeaders,
+  });
+  assert(countsDigestRes.status === 200, "Digest with NOTIFY_DETAIL=counts returns HTTP 200");
+  assert(countsDigestRes.body.message.includes("1 bill(s) due"), "Counts mode states bill count");
+  assert(!countsDigestRes.body.message.includes("$75.00"), "Counts mode suppresses dollar amounts");
+
+  // Cleanup Suite 26
+  await Setting.destroy({ where: { key: "NOTIFY_DETAIL" } });
+  await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + billDay4Res.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + billDay3Res.body.id, method: "DELETE", headers: authHeaders });
+
+
 
   // Cleanup
   await request({

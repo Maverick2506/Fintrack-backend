@@ -1,0 +1,40 @@
+name: Morning Digest
+
+on:
+  schedule:
+    - cron: "37 12 * * *" # ≈ 08:37 Toronto (EDT) / 07:37 (EST)
+  workflow_dispatch:
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request Morning Digest and Publish to ntfy
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          BACKEND_URL: https://fintrack-backend-rzrh.onrender.com
+        run: |
+          code=$(curl -sS -o d.json -w '%{http_code}' --max-time 120 --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer $CRON_SECRET" "$BACKEND_URL/api/cron/digest")
+          if [ "$code" = "204" ]; then
+            echo "Nothing to report this morning (HTTP 204)."
+            exit 0
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::Digest endpoint returned unexpected HTTP status code $code"
+            cat d.json
+            exit 1
+          fi
+          AUTH_HEADER=""
+          if [ -n "$NTFY_TOKEN" ]; then
+            AUTH_HEADER="-H \"Authorization: Bearer $NTFY_TOKEN\""
+          fi
+          eval curl -fsS $AUTH_HEADER \
+            -H "\"Title: $(jq -r .title d.json)\"" \
+            -H "\"Priority: $(jq -r .priority d.json)\"" \
+            -H "\"Tags: $(jq -r .tags d.json)\"" \
+            -d "\"$(jq -r .message d.json)\"" \
+            "https://ntfy.sh/$NTFY_TOPIC"
+          echo "Morning digest successfully delivered to ntfy topic."
