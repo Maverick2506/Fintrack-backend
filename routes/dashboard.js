@@ -3,6 +3,7 @@ const { getBalancesSummary } = require("../services/netWorthService");
 const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
+const { subDays } = require("date-fns");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -77,7 +78,7 @@ router.get(
       upcomingBills,
       allUpcomingBills,
       debtSummary,
-      savingsSummary,
+      savingsSummaryRaw,
       creditCardSummary,
       spendingByCategoryRaw,
       balancesSummary,
@@ -141,6 +142,36 @@ router.get(
       }),
       getBalancesSummary(null, todayStr),
     ]);
+
+    const cutoff90Days = format(subDays(nowZoned, 90), "yyyy-MM-dd", {
+      timeZone: TIMEZONE,
+    });
+    const goalIds = (savingsSummaryRaw || []).map((g) => g.id);
+    const goalContributionMap = {};
+    if (goalIds.length > 0) {
+      const contributions = await Transaction.findAll({
+        attributes: ["toAccountId", "amount"],
+        where: {
+          toAccountId: { [Op.in]: goalIds },
+          isCleared: true,
+          date: { [Op.gte]: cutoff90Days },
+        },
+        raw: true,
+      });
+      for (const c of contributions) {
+        goalContributionMap[c.toAccountId] =
+          (goalContributionMap[c.toAccountId] || 0) + (parseFloat(c.amount) || 0);
+      }
+    }
+
+    const savingsSummary = (savingsSummaryRaw || []).map((g) => ({
+      ...g.toJSON(),
+      current_amount: g.initialBalance,
+      goal_amount: g.targetAmount,
+      target_date: g.dueDate,
+      contributedLast90Days:
+        Math.round((goalContributionMap[g.id] || 0) * 100) / 100,
+    }));
 
     const checkingCurrentBalance = balancesSummary.checking;
 

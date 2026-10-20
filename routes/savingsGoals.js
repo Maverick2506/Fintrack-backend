@@ -2,6 +2,7 @@ const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
+const { subDays } = require("date-fns");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
@@ -22,11 +23,38 @@ router.get(
       where: { type: "SAVINGS_GOAL", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
+
+    const nowZoned = toZonedTime(new Date(), TIMEZONE);
+    const cutoff90Days = format(subDays(nowZoned, 90), "yyyy-MM-dd", {
+      timeZone: TIMEZONE,
+    });
+    const goalIds = goals.map((g) => g.id);
+
+    const contributionMap = {};
+    if (goalIds.length > 0) {
+      const contributions = await Transaction.findAll({
+        attributes: ["toAccountId", "amount"],
+        where: {
+          toAccountId: { [Op.in]: goalIds },
+          isCleared: true,
+          date: { [Op.gte]: cutoff90Days },
+        },
+        raw: true,
+      });
+
+      for (const c of contributions) {
+        contributionMap[c.toAccountId] =
+          (contributionMap[c.toAccountId] || 0) + (parseFloat(c.amount) || 0);
+      }
+    }
+
     const formatted = goals.map((g) => ({
       ...g.toJSON(),
       current_amount: g.initialBalance,
       goal_amount: g.targetAmount,
       target_date: g.dueDate,
+      contributedLast90Days:
+        Math.round((contributionMap[g.id] || 0) * 100) / 100,
     }));
     res.json(formatted);
   })
@@ -59,6 +87,7 @@ router.post(
       current_amount: newGoal.initialBalance,
       goal_amount: newGoal.targetAmount,
       target_date: newGoal.dueDate,
+      contributedLast90Days: 0,
     });
   })
 );

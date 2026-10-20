@@ -3582,6 +3582,113 @@ async function runTestSuite() {
   await NetWorthSnapshot.destroy({ where: {} });
 
 
+
+  // 28. Savings Goal Pacing & 90-Day Contribution Window (Phase I)
+  console.log("\n--- Suite 28: Savings Goal Pacing & 90-Day Contributions ---");
+
+  // 1. Create a test savings goal
+  const pacingGoalRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/savings-goals",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Emergency Pacing Fund",
+      target_amount: 5000,
+      current_amount: 1000,
+      target_date: "2027-10-01",
+    }
+  );
+  assert(pacingGoalRes.status === 201 && pacingGoalRes.body.id, "Creates test savings goal with target date");
+  const pacingGoalId = pacingGoalRes.body.id;
+
+  // 2. Initial GET /api/savings-goals reports contributedLast90Days === 0
+  const initialGoalsRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const foundGoal1 = (initialGoalsRes.body || []).find((g) => g.id === pacingGoalId);
+  assert(foundGoal1 && foundGoal1.contributedLast90Days === 0, "Initial savings goal reports contributedLast90Days === 0");
+
+  // 3. Create transactions:
+  // a) Cleared contribution 10 days ago ($150) -> should be counted
+  const { subDays: sDays, format: fmtD } = require("date-fns");
+  const date10DaysAgo = fmtD(sDays(new Date(), 10), "yyyy-MM-dd");
+  const date120DaysAgo = fmtD(sDays(new Date(), 120), "yyyy-MM-dd");
+
+  const txRecentCleared = await Transaction.create({
+    title: "Recent Cleared Savings Transfer",
+    amount: 150,
+    type: "TRANSFER",
+    toAccountId: pacingGoalId,
+    date: date10DaysAgo,
+    isCleared: true,
+    balanceApplied: true,
+  });
+
+  // b) Uncleared contribution 10 days ago ($50) -> should NOT be counted
+  const txRecentUncleared = await Transaction.create({
+    title: "Pending Savings Transfer",
+    amount: 50,
+    type: "TRANSFER",
+    toAccountId: pacingGoalId,
+    date: date10DaysAgo,
+    isCleared: false,
+    balanceApplied: false,
+  });
+
+  // c) Cleared contribution 120 days ago ($200) -> should NOT be counted (outside 90-day window)
+  const txOldCleared = await Transaction.create({
+    title: "Old Cleared Savings Transfer",
+    amount: 200,
+    type: "TRANSFER",
+    toAccountId: pacingGoalId,
+    date: date120DaysAgo,
+    isCleared: true,
+    balanceApplied: true,
+  });
+
+  // 4. GET /api/savings-goals reflects exactly $150.00
+  const updatedGoalsRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const foundGoal2 = (updatedGoalsRes.body || []).find((g) => g.id === pacingGoalId);
+  assert(foundGoal2 && foundGoal2.contributedLast90Days === 150, "contributedLast90Days includes cleared 90-day transactions and excludes uncleared and old ones ($150.00)");
+
+  // 5. GET /api/dashboard savingsSummary includes matching contributedLast90Days
+  const dashboardRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const dashSavingsGoal = (dashboardRes.body?.savingsSummary || []).find((g) => g.id === pacingGoalId);
+  assert(dashSavingsGoal && dashSavingsGoal.contributedLast90Days === 150, "Dashboard savingsSummary includes accurate contributedLast90Days");
+
+  // Cleanup Suite 28
+  await txRecentCleared.destroy();
+  await txRecentUncleared.destroy();
+  await txOldCleared.destroy();
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/savings-goals/" + pacingGoalId,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+
   // Cleanup
   await request({
     hostname: "localhost",
