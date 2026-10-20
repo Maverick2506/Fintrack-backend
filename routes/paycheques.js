@@ -57,17 +57,17 @@ router.post(
       recurrence: recurrence || "none",
     });
 
-    res.status(201).json({
-      ...newIncome.toJSON(),
-      name: newIncome.title,
-      payment_date: newIncome.date,
-    });
-
     if (recurrence && recurrence !== "none") {
       await createRecurringExpenses().catch((err) =>
         console.error("Background recurring generation error:", err)
       );
     }
+
+    res.status(201).json({
+      ...newIncome.toJSON(),
+      name: newIncome.title,
+      payment_date: newIncome.date,
+    });
   })
 );
 

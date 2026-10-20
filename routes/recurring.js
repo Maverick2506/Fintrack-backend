@@ -66,7 +66,7 @@ const getNextDueDate = (currentDate, recurrence) => {
   return getNextOccurrenceDate(currentDate, recurrence, 1);
 };
 
-const createRecurringExpenses = async () => {
+const createRecurringExpenses = async (dbTx = null) => {
   console.log("Running advanced timezone-aware recurring job...");
   try {
     const nowUtc = new Date();
@@ -89,6 +89,7 @@ const createRecurringExpenses = async () => {
         ["date", "DESC"],
         ["createdAt", "DESC"],
       ],
+      transaction: dbTx,
     });
 
     const latestOccurrences = {};
@@ -132,6 +133,7 @@ const createRecurringExpenses = async () => {
             date: nextDateStr,
             ...duplicateCondition,
           },
+          transaction: dbTx,
         });
 
         if (!existing) {
@@ -162,26 +164,29 @@ const createRecurringExpenses = async () => {
           if (!seriesId) {
             seriesId = baseTrx.id || crypto.randomUUID();
             baseTrx.recurringGroupId = seriesId;
-            await baseTrx.save().catch((err) =>
+            await baseTrx.save({ transaction: dbTx }).catch((err) =>
               console.error("Could not backfill recurringGroupId on baseTrx:", err)
             );
           }
 
-          await Transaction.create({
-            ...baseTrx.get({ plain: true }),
-            id: undefined,
-            amount: newAmount,
-            baseAmount: baseAmountValue,
-            isTaxExclusive: isTaxExcl,
-            taxRate: taxRateVal,
-            taxApplied,
-            isCleared,
-            balanceApplied: false,
-            date: nextDateStr,
-            recurringGroupId: seriesId,
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          });
+          await Transaction.create(
+            {
+              ...baseTrx.get({ plain: true }),
+              id: undefined,
+              amount: newAmount,
+              baseAmount: baseAmountValue,
+              isTaxExclusive: isTaxExcl,
+              taxRate: taxRateVal,
+              taxApplied,
+              isCleared,
+              balanceApplied: false,
+              date: nextDateStr,
+              recurringGroupId: seriesId,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+            { transaction: dbTx }
+          );
           console.log(
             `Created recurring ${baseTrx.type.toLowerCase()}: ${
               baseTrx.title

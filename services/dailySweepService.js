@@ -2,6 +2,7 @@ const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const { getNextDueDate } = require("../routes/recurring");
+const { adjustAccountForTransaction } = require("./accountBalanceService");
 
 const TIMEZONE = "America/Toronto";
 let isLocalSweepRunning = false;
@@ -61,7 +62,6 @@ const runDailySweep = async () => {
       const [affectedRows] = await Transaction.update(
         {
           isCleared: true,
-          balanceApplied: true,
           amount: amt,
           baseAmount,
           taxApplied,
@@ -77,27 +77,11 @@ const runDailySweep = async () => {
 
       // Only adjust account balance if this worker actually won the race and transitioned the bill
       if (affectedRows === 1) {
-        if (
-          bill.fromAccount &&
-          bill.fromAccount.type === "CREDIT_CARD" &&
-          !bill.toAccountId
-        ) {
-          await Account.increment("initialBalance", {
-            by: amt,
-            where: { id: bill.fromAccountId },
-            transaction: dbTx,
-          });
-        } else if (
-          bill.toAccount &&
-          (bill.toAccount.type === "DEBT" ||
-            bill.toAccount.type === "CREDIT_CARD")
-        ) {
-          await Account.increment("initialBalance", {
-            by: -amt,
-            where: { id: bill.toAccountId },
-            transaction: dbTx,
-          });
-        }
+        bill.isCleared = true;
+        bill.amount = amt;
+        bill.baseAmount = baseAmount;
+        bill.taxApplied = taxApplied;
+        await adjustAccountForTransaction(bill, 1, dbTx, true);
         clearedExpenseCount++;
       }
     }

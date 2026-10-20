@@ -1830,6 +1830,135 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s15UnrelatedExpRes.body.id}`, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s15DebtId}`, method: "DELETE", headers: authHeaders });
 
+  // 16. Edge Cases: Pre-Fix Transfers, Target Preservation & Sweep Savings Contributions
+  console.log("\n--- Suite 16: Pre-Fix Transfers, Target Preservation & Sweep Savings ---");
+
+  // Scenario A: Pre-fix scheduled card payment with balanceApplied: true does NOT get applied twice by the sweep
+  // Setup: card at 800 (1000 minus 200 already applied in pre-fix state)
+  const s16CardA = await request(
+    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Card A", currentBalance: 800.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+  );
+  assert(s16CardA.status === 201 && s16CardA.body.id, "Creates test card at $800 balance");
+  const s16CardAId = s16CardA.body.id;
+
+  const s16Today = format(toZonedTime(new Date(), "America/Toronto"), "yyyy-MM-dd", { timeZone: "America/Toronto" });
+
+  // Create pre-fix style unpaid transfer due today that has balanceApplied: true
+  const { Transaction: DBTransaction } = require("../models");
+  const s16PreFixTrx = await DBTransaction.create({
+    title: "Pre-Fix Card Payment",
+    amount: 200.0,
+    date: s16Today,
+    type: "TRANSFER",
+    category: "Credit Card Payment",
+    isCleared: false,
+    balanceApplied: true, // simulates pre-fix state
+    toAccountId: s16CardAId,
+  });
+  assert(Boolean(s16PreFixTrx.id), "Directly seeds pre-fix unpaid card payment with balanceApplied: true");
+
+  // Run the daily sweep
+  const s16SweepRes = await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
+  assert(s16SweepRes.status === 200, "Daily check/sweep executes successfully");
+
+  // Card balance must still be $800, NOT $600!
+  const s16CardsCheckA = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  const s16FoundCardA = (s16CardsCheckA.body || []).find((c) => c.id === s16CardAId);
+  assert(parseFloat(s16FoundCardA?.currentBalance || 0) === 800.0, "Pre-fix transfer with balanceApplied: true is NOT applied twice by sweep (stays $800, not $600)");
+
+  // Cleanup A
+  await DBTransaction.destroy({ where: { id: s16PreFixTrx.id } });
+  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardAId}`, method: "DELETE", headers: authHeaders });
+
+  // Scenario B: Editing in Ledger preserves targetAccountId and does not unlink
+  // 1. Mark a scheduled $200 card payment paid: card 1,000 -> 800, still linked
+  const s16CardB = await request(
+    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Card B", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+  );
+  const s16CardBId = s16CardB.body.id;
+
+  const s16SchedPayment = await request(
+    { hostname: "localhost", port: 8000, path: "/api/expenses", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Sapphire Payment", amount: 200.0, category: "Credit Card Payment", targetAccountId: s16CardBId, due_date: s16Today, is_paid: false }
+  );
+  assert(s16SchedPayment.status === 201, "Creates scheduled unpaid card payment");
+  const s16SchedId = s16SchedPayment.body.id;
+
+  // Edit via PUT (simulating Ledger marking paid without sending targetAccountId or sending targetAccountId: null)
+  const s16EditPayment = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s16SchedId}`, method: "PUT", headers: authHeaders },
+    { name: "Suite 16 Sapphire Payment", amount: 200.0, category: "Credit Card Payment", is_paid: true, targetAccountId: null }
+  );
+  assert(s16EditPayment.status === 200, "Edits scheduled payment to mark as paid");
+  assert(s16EditPayment.body.toAccountId === s16CardBId, "Preserves targetAccountId link to card when targetAccountId was omitted/null in edit");
+
+  const s16CardsCheckB = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  const s16FoundCardB = (s16CardsCheckB.body || []).find((c) => c.id === s16CardBId);
+  assert(parseFloat(s16FoundCardB?.currentBalance || 0) === 800.0, "Card balance reduces to $800 after marking paid in Ledger");
+
+  // 2. Rename a $100 savings contribution in the Ledger: goal stays 600, still linked
+  const s16GoalB = await request(
+    { hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Vacation Goal", target_amount: 1000.0, current_amount: 500.0 }
+  );
+  const s16GoalBId = s16GoalB.body.id;
+
+  const s16SavingsTrx = await request(
+    { hostname: "localhost", port: 8000, path: "/api/expenses", method: "POST", headers: authHeaders },
+    { name: "Trip Deposit", amount: 100.0, category: "Savings Transfer", targetAccountId: s16GoalBId, due_date: s16Today, is_paid: true }
+  );
+  assert(s16SavingsTrx.status === 201, "Adds $100 savings contribution");
+  const s16SavingsTrxId = s16SavingsTrx.body.id;
+
+  // Rename the savings contribution with targetAccountId: null
+  const s16RenameRes = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s16SavingsTrxId}`, method: "PUT", headers: authHeaders },
+    { name: "Renamed Trip Deposit", amount: 100.0, category: "Savings Transfer", is_paid: true, targetAccountId: null }
+  );
+  assert(s16RenameRes.status === 200, "Renames savings contribution in Ledger");
+  assert(s16RenameRes.body.toAccountId === s16GoalBId, "Savings contribution remains linked to goal after rename");
+
+  const s16GoalsCheckB = await request({ hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "GET", headers: authHeaders });
+  const s16FoundGoalB = (s16GoalsCheckB.body || []).find((g) => g.id === s16GoalBId);
+  assert(parseFloat(s16FoundGoalB?.current_amount || 0) === 600.0, "Savings goal balance remains $600 after rename");
+
+  // Cleanup B
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s16SchedId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardBId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s16SavingsTrxId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/savings-goals/${s16GoalBId}`, method: "DELETE", headers: authHeaders });
+
+  // Scenario C: The sweep adds unpaid savings contributions to the goal
+  const s16GoalC = await request(
+    { hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Sweep Goal", target_amount: 1000.0, current_amount: 500.0 }
+  );
+  const s16GoalCId = s16GoalC.body.id;
+
+  const s16UnpaidContrib = await request(
+    { hostname: "localhost", port: 8000, path: "/api/expenses", method: "POST", headers: authHeaders },
+    { name: "Pending Savings Contribution", amount: 100.0, category: "Savings Transfer", targetAccountId: s16GoalCId, due_date: s16Today, is_paid: false }
+  );
+  assert(s16UnpaidContrib.status === 201, "Creates unpaid $100 savings contribution due today");
+  const s16UnpaidContribId = s16UnpaidContrib.body.id;
+
+  // Execute daily sweep
+  await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
+
+  const s16GoalsCheckC = await request({ hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "GET", headers: authHeaders });
+  const s16FoundGoalC = (s16GoalsCheckC.body || []).find((g) => g.id === s16GoalCId);
+  assert(parseFloat(s16FoundGoalC?.current_amount || 0) === 600.0, "Daily sweep adds unpaid savings contribution to goal ($500 -> $600)");
+
+  // Deleting contribution restores goal to 500
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s16UnpaidContribId}`, method: "DELETE", headers: authHeaders });
+  const s16GoalsCheckC2 = await request({ hostname: "localhost", port: 8000, path: "/api/savings-goals", method: "GET", headers: authHeaders });
+  const s16FoundGoalC2 = (s16GoalsCheckC2.body || []).find((g) => g.id === s16GoalCId);
+  assert(parseFloat(s16FoundGoalC2?.current_amount || 0) === 500.0, "Deleting swept savings contribution cleanly restores goal to $500.00");
+
+  await request({ hostname: "localhost", port: 8000, path: `/api/savings-goals/${s16GoalCId}`, method: "DELETE", headers: authHeaders });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

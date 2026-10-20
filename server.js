@@ -397,6 +397,47 @@ async function initialize() {
           value: "true",
         });
       }
+
+      // One-off remediation for pre-fix scheduled transfers:
+      // Scheduled card payments created before the fix had balanceApplied: true and deducted from toAccount immediately.
+      // Revert the premature balance deduction on the target account, and set balanceApplied: false so the sweep can apply it when due.
+      const transfersReset = await Setting.findByPk(
+        "unpaid_transfers_balance_applied_reset_v1"
+      );
+      if (!transfersReset || transfersReset.value !== "true") {
+        const prematureTransfers = await Transaction.findAll({
+          where: {
+            type: "TRANSFER",
+            isCleared: false,
+            balanceApplied: true,
+            toAccountId: { [Op.ne]: null },
+          },
+        });
+
+        for (const trx of prematureTransfers) {
+          const amt = parseFloat(trx.amount) || 0;
+          if (amt > 0 && trx.toAccountId) {
+            // Re-add the amount that was prematurely deducted from credit card or debt
+            await Account.increment("initialBalance", {
+              by: amt,
+              where: { id: trx.toAccountId },
+            });
+          }
+          trx.balanceApplied = false;
+          await trx.save({ fields: ["balanceApplied"] });
+        }
+
+        if (prematureTransfers.length > 0) {
+          console.log(
+            `✅ Reverted premature balance deduction and reset balanceApplied = false for ${prematureTransfers.length} scheduled unpaid transfers.`
+          );
+        }
+
+        await Setting.upsert({
+          key: "unpaid_transfers_balance_applied_reset_v1",
+          value: "true",
+        });
+      }
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
     }

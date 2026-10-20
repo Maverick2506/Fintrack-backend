@@ -7,15 +7,14 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
+const {
+  adjustAccountForTransaction,
+  getTodayString,
+  TIMEZONE,
+} = require("../services/accountBalanceService");
 const router = express.Router();
 
 router.use(authMiddleware);
-
-const TIMEZONE = "America/Toronto";
-const getTodayString = () =>
-  format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", {
-    timeZone: TIMEZONE,
-  });
 
 // Helper to format YYYY-MM-DD month boundaries cleanly
 const getMonthDateRange = (year, month) => {
@@ -25,120 +24,6 @@ const getMonthDateRange = (year, month) => {
   const lastDay = new Date(y, m, 0).getDate();
   const endDate = `${y}-${String(m).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
   return { startDate, endDate };
-};
-
-// Apply or reverse balance effect of a cleared transaction on linked non-checking accounts
-const adjustAccountForTransaction = async (
-  trx,
-  direction = 1,
-  dbTx = null,
-  forceApply = false
-) => {
-  const amount = parseFloat(trx.amount) || 0;
-  if (amount === 0) return;
-
-  const todayStr = getTodayString();
-  const isPastDated = trx.date < todayStr;
-
-  let toAcc = null;
-  if (trx.toAccountId) {
-    toAcc = await Account.findByPk(trx.toAccountId, { transaction: dbTx });
-  }
-  const isSavingsGoal = Boolean(toAcc && toAcc.type === "SAVINGS_GOAL");
-
-  if (direction === 1) {
-    // Already applied? Skip to prevent double counting
-    if (trx.balanceApplied) return;
-
-    // Unpaid/pending expenses or transfers have not affected account balances yet
-    if (!trx.isCleared) return;
-
-    // Historical past-dated transactions (created with a past date) on cards/debts were already in opening balance.
-    // Savings goals are exempt: every contribution towards a savings goal adds to the goal regardless of date.
-    // If forceApply is true (e.g. editing an already-applied transaction or overdue bill paid), re-apply regardless of date.
-    if (isPastDated && !trx.balanceApplied && !forceApply && !isSavingsGoal) {
-      trx.balanceApplied = false;
-      await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
-      return;
-    }
-
-    let applied = false;
-    // 1. Cleared expense charged FROM a Credit Card
-    if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
-      const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
-      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-        await Account.increment("initialBalance", {
-          by: amount,
-          where: { id: trx.fromAccountId },
-          transaction: dbTx,
-        });
-        applied = true;
-      }
-    }
-
-    // 2. Cleared EXPENSE or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
-    if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.toAccountId) {
-      if (toAcc) {
-        if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-          await Account.increment("initialBalance", {
-            by: -amount,
-            where: { id: trx.toAccountId },
-            transaction: dbTx,
-          });
-          applied = true;
-        } else if (toAcc.type === "SAVINGS_GOAL") {
-          await Account.increment("initialBalance", {
-            by: amount,
-            where: { id: trx.toAccountId },
-            transaction: dbTx,
-          });
-          applied = true;
-        }
-      }
-    }
-
-    if (applied) {
-      trx.balanceApplied = true;
-      await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
-    }
-  } else if (direction === -1) {
-    // Only reverse if balance was actually applied!
-    if (!trx.balanceApplied) return;
-
-    // 1. Reverse expense charged FROM a Credit Card
-    if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
-      const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
-      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
-        await Account.increment("initialBalance", {
-          by: -amount,
-          where: { id: trx.fromAccountId },
-          transaction: dbTx,
-        });
-      }
-    }
-
-    // 2. Reverse EXPENSE or TRANSFER directed TO a Debt, Credit Card, or Savings Goal
-    if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.toAccountId) {
-      if (toAcc) {
-        if (toAcc.type === "CREDIT_CARD" || toAcc.type === "DEBT") {
-          await Account.increment("initialBalance", {
-            by: amount,
-            where: { id: trx.toAccountId },
-            transaction: dbTx,
-          });
-        } else if (toAcc.type === "SAVINGS_GOAL") {
-          await Account.increment("initialBalance", {
-            by: -amount,
-            where: { id: trx.toAccountId },
-            transaction: dbTx,
-          });
-        }
-      }
-    }
-
-    trx.balanceApplied = false;
-    await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
-  }
 };
 
 // Resolve target Debt or Credit Card account when a transaction is categorized as Debt
@@ -413,14 +298,14 @@ router.post(
       // Apply balance change on Credit Card (charge) or Debt/Credit Card (paydown) if cleared
       await adjustAccountForTransaction(newExp, 1, dbTx);
 
-      await dbTx.commit();
-      res.status(201).json(newExp);
-
       if (recurrence && recurrence !== "none") {
-        await createRecurringExpenses().catch((err) =>
+        await createRecurringExpenses(dbTx).catch((err) =>
           console.error("Background recurring generation error:", err)
         );
       }
+
+      await dbTx.commit();
+      res.status(201).json(newExp);
     } catch (error) {
       await dbTx.rollback();
       throw error;
@@ -465,20 +350,40 @@ router.put(
       const nextCategory = req.body.category || trx.category;
 
       let nextToAccountId = trx.toAccountId;
-      if (
+      const hasExplicitTarget =
         req.body.targetAccountId !== undefined ||
-        req.body.toAccountId !== undefined
-      ) {
-        const explicitTarget =
-          req.body.targetAccountId !== undefined
-            ? req.body.targetAccountId
-            : req.body.toAccountId;
+        req.body.toAccountId !== undefined;
+      const explicitTarget =
+        req.body.targetAccountId !== undefined
+          ? req.body.targetAccountId
+          : req.body.toAccountId;
+
+      if (hasExplicitTarget && explicitTarget) {
         nextToAccountId = await resolvePaydownTargetId(
           explicitTarget,
           nextCategory,
           nextTitle,
           dbTx
         );
+      } else if (hasExplicitTarget && !explicitTarget) {
+        if (nextCategory === "Debt") {
+          nextToAccountId = await resolvePaydownTargetId(
+            null,
+            nextCategory,
+            nextTitle,
+            dbTx
+          );
+        } else if (
+          ["Credit Card Payment", "Savings Transfer", "Savings"].includes(
+            nextCategory
+          ) ||
+          trx.type === "TRANSFER"
+        ) {
+          // Preserve existing toAccountId for transfers and savings/card payments when target is unset
+          nextToAccountId = trx.toAccountId;
+        } else {
+          nextToAccountId = null;
+        }
       } else if (nextCategory === "Debt" && !nextToAccountId) {
         nextToAccountId = await resolvePaydownTargetId(
           null,
@@ -611,14 +516,14 @@ router.put(
         wasBalanceApplied || (!wasCleared && nextIsCleared)
       );
 
-      await dbTx.commit();
-      res.json(trx);
-
       if (req.body.recurrence && req.body.recurrence !== "none") {
-        await createRecurringExpenses().catch((err) =>
+        await createRecurringExpenses(dbTx).catch((err) =>
           console.error("Background recurring generation error:", err)
         );
       }
+
+      await dbTx.commit();
+      res.json(trx);
     } catch (error) {
       await dbTx.rollback();
       throw error;
