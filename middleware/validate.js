@@ -163,6 +163,10 @@ const schemas = {
     balance: z.coerce.number(),
   }),
 
+  setForecastBuffer: z.object({
+    buffer: z.coerce.number().min(0, "Buffer must be non-negative"),
+  }),
+
   setBudget: z
     .object({
       monthlyLimit: z.coerce.number().positive("Monthly limit must be greater than 0").optional(),

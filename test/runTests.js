@@ -3143,6 +3143,180 @@ async function runTestSuite() {
   cardObj = cardCheck.body.find((c) => c.id === testCardId);
   assert(parseFloat(cardObj.currentBalance) === 520, "Deleting unapplied past expense leaves card balance unchanged at $520");
 
+  // 25. Safe to Spend & Cashflow Forecast Tests (Phase E)
+  console.log("\n--- Suite 25: Safe to Spend & Cashflow Forecast (Phase E) ---");
+
+  // Setting endpoint: rejects negative buffer with HTTP 400
+  const negBufferRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/settings/forecast-buffer",
+    method: "PUT",
+    headers: authHeaders,
+  }, { buffer: -50 });
+  assert(negBufferRes.status === 400, "PUT /api/settings/forecast-buffer rejects negative buffer with HTTP 400");
+
+  // Set buffer to 200
+  const setBufferRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/settings/forecast-buffer",
+    method: "PUT",
+    headers: authHeaders,
+  }, { buffer: 200 });
+  assert(setBufferRes.status === 200 && setBufferRes.body.buffer === 200, "PUT /api/settings/forecast-buffer sets buffer to 200");
+
+  // Set primary checking balance to known 2500
+  const setCheckRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/checking",
+    method: "PUT",
+    headers: authHeaders,
+  }, { balance: 2500 });
+  assert(setCheckRes.status === 200, "Initializes checking balance to $2500.00 for forecast test");
+
+  // Determine dates using calendar arithmetic
+  const now = new Date();
+  const getOffsetDate = (days) => {
+    const d = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    return d.toISOString().split("T")[0];
+  };
+
+  const day1Str = getOffsetDate(1);
+  const day2Str = getOffsetDate(2);
+  const day40Str = getOffsetDate(40);
+
+  // 1. Create bill paid from checking on Day 1 ($300)
+  const checkingBillRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Hydro Bill",
+    amount: 300,
+    due_date: day1Str,
+    is_paid: false,
+  });
+  assert(checkingBillRes.status === 201, "Creates upcoming checking bill on Day 1 for $300");
+
+  // 2. Create credit card & charge on Day 1 ($150) -> must NOT reduce checking
+  const cardPhaseERes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Card",
+    creditLimit: 2000,
+    currentBalance: 0,
+  });
+  const phaseECardId = cardPhaseERes.body.id;
+
+  const suite25CardChargeRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Card Charge",
+    amount: 150,
+    due_date: day1Str,
+    creditCardId: phaseECardId,
+    is_paid: false,
+  });
+  assert(suite25CardChargeRes.status === 201, "Creates credit card charge on Day 1 for $150");
+
+  // 3. Create auto-pay debt due on Day 1 ($100 minimum payment, $500 balance)
+  const debtPhaseERes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/debts",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Student Loan",
+    total_amount: 500,
+    monthly_payment: 100,
+    next_due_date: day1Str,
+    auto_pay: true,
+    payment_frequency: "monthly",
+  });
+  const phaseEDebtId = debtPhaseERes.body.id;
+  assert(debtPhaseERes.status === 201, "Creates auto-pay debt due on Day 1 with $100 min payment");
+
+  // 4. Create paycheque on Day 2 ($1000)
+  const paychequeRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/paycheques",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Paycheque",
+    amount: 1000,
+    payment_date: day2Str,
+  });
+  assert(paychequeRes.status === 201, "Creates paycheque on Day 2 for $1000");
+
+  // 5. Create a recurring income transaction that repeats monthly into the 40+ day horizon
+  const recurringIncomeRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/paycheques",
+    method: "POST",
+    headers: authHeaders,
+  }, {
+    name: "Suite 25 Recurring Bonus",
+    amount: 500,
+    payment_date: day40Str,
+    recurrence: "monthly",
+  });
+  assert(recurringIncomeRes.status === 201, "Creates recurring income to verify projection");
+
+  // Query 60-day forecast
+  const forecastRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/forecast?days=60",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(forecastRes.status === 200, "GET /api/forecast returns HTTP 200");
+  const forecast = forecastRes.body;
+
+  assert(forecast.startBalance === 2500, "Forecast reports startBalance of $2500");
+  assert(forecast.buffer === 200, "Forecast reports buffer of $200");
+  assert(forecast.nextPayday === day2Str, "Forecast identifies nextPayday on Day 2");
+
+  // Verify Day 1: checking bill ($300) + auto-pay ($100) applied; card charge ($150) omitted
+  const forecastDay1 = forecast.days.find((d) => d.date === day1Str);
+  assert(forecastDay1 !== undefined, "Forecast contains Day 1 entry");
+  assert(forecastDay1.balance === 2100, "Day 1 balance is exactly $2100 (2500 - 300 - 100, omitting card charge)");
+
+  const day1ItemTitles = forecastDay1.items.map((it) => it.title);
+  assert(day1ItemTitles.includes("Suite 25 Hydro Bill"), "Day 1 includes checking bill");
+  assert(day1ItemTitles.some((t) => t.includes("Suite 25 Student Loan")), "Day 1 includes auto-pay debt");
+  assert(!day1ItemTitles.includes("Suite 25 Card Charge"), "Day 1 strictly excludes credit card charge");
+
+  // Verify Safe to Spend:
+  // Before Day 2 (Day 0 balance is 2500, Day 1 balance is 2100) -> min is 2100.
+  // safeToSpend = 2100 - buffer(200) = 1900.
+  assert(forecast.safeToSpend === 1900, "safeToSpend correctly calculated as $1900.00 (minBeforePayday 2100 - buffer 200)");
+
+  // Clean up Suite 25 records
+  await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + checkingBillRes.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/expenses/" + suite25CardChargeRes.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards/" + phaseECardId, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/debts/" + phaseEDebtId, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + paychequeRes.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + recurringIncomeRes.body.id, method: "DELETE", headers: authHeaders });
+
+
   // Cleanup
   await request({
     hostname: "localhost",
