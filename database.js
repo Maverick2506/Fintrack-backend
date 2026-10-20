@@ -1,3 +1,4 @@
+const path = require("path");
 const { Sequelize } = require("sequelize");
 
 let sequelize;
@@ -35,7 +36,7 @@ if (shouldUseRemoteDb) {
   console.log("🛠️ Using local development database (isolated from live production site)...");
   sequelize = new Sequelize({
     dialect: "sqlite",
-    storage: "./local-database.sqlite",
+    storage: path.join(__dirname, "local-database.sqlite"),
     logging: false,
   });
 }

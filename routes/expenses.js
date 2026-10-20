@@ -402,8 +402,12 @@ router.put(
 
       const isCreditCardPayment =
         targetAccount && targetAccount.type === "CREDIT_CARD";
+      const isDebtPayment =
+        targetAccount && targetAccount.type === "DEBT";
       const nextType = isCreditCardPayment
         ? "TRANSFER"
+        : isDebtPayment
+        ? "EXPENSE"
         : req.body.type
         ? String(req.body.type).toUpperCase()
         : trx.type;

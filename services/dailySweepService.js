@@ -144,16 +144,14 @@ const runDailySweep = async () => {
           debt.paymentFrequency || "monthly"
         );
 
-        const updatePayload = {
-          initialBalance: newBal,
-        };
+        const updatePayload = {};
         if (nextDueStr && newBal > 0) {
           updatePayload.dueDate = nextDueStr;
-        } else if (newBal <= 0) {
+        } else {
           updatePayload.autoPay = false;
         }
 
-        // Atomic Compare-And-Swap: Only adjust account and create payment if this instance successfully claimed the due payment
+        // Atomic Compare-And-Swap: Claim this payment by advancing due date or disabling auto-pay
         const [affectedDebtCount] = await Account.update(updatePayload, {
           where: {
             id: debt.id,
@@ -166,6 +164,21 @@ const runDailySweep = async () => {
         if (affectedDebtCount !== 1) {
           // Another concurrent sweep instance already updated this debt
           continue;
+        }
+
+        // Atomic decrement avoids lost updates if another balance transaction occurred concurrently
+        await Account.increment("initialBalance", {
+          by: -paymentAmount,
+          where: { id: debt.id },
+          transaction: dbTx,
+        });
+
+        await debt.reload({ transaction: dbTx });
+        if (debt.initialBalance <= 0) {
+          await Account.update(
+            { initialBalance: 0, autoPay: false },
+            { where: { id: debt.id }, transaction: dbTx }
+          );
         }
 
         await Transaction.create(

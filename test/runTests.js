@@ -2279,6 +2279,129 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: `/api/savings-goals/${s17GoalId}`, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s17DebtId}`, method: "DELETE", headers: authHeaders });
 
+  // --- Suite 18: Auto-Pay Atomic Decrements & Transfer Type Re-derivation ---
+  console.log("\n--- Suite 18: Auto-Pay Atomic Decrements & Transfer Type Re-derivation ---");
+
+  // 18a. Auto-Pay atomic decrement & scheduling advancement
+  const s18Today = format(toZonedTime(new Date(), "America/Toronto"), "yyyy-MM-dd", { timeZone: "America/Toronto" });
+  const s18Debt = await request(
+    { hostname: "localhost", port: 8000, path: "/api/debts", method: "POST", headers: authHeaders },
+    {
+      name: "Suite 18 Auto-Pay Debt",
+      total_amount: 500.0,
+      monthly_payment: 100.0,
+      auto_pay: true,
+      next_due_date: s18Today,
+      payment_frequency: "monthly",
+    }
+  );
+  assert(s18Debt.status === 201 && s18Debt.body.id, "Creates test auto-pay debt due today with $500 balance");
+  const s18DebtId = s18Debt.body.id;
+
+  // Payoff debt: balance equal to payment amount to test zero-floor and autoPay deactivation
+  const s18PayoffDebt = await request(
+    { hostname: "localhost", port: 8000, path: "/api/debts", method: "POST", headers: authHeaders },
+    {
+      name: "Suite 18 Payoff Debt",
+      total_amount: 100.0,
+      monthly_payment: 100.0,
+      auto_pay: true,
+      next_due_date: s18Today,
+      payment_frequency: "monthly",
+    }
+  );
+  assert(s18PayoffDebt.status === 201 && s18PayoffDebt.body.id, "Creates test auto-pay debt due today for complete payoff");
+  const s18PayoffDebtId = s18PayoffDebt.body.id;
+
+  // Run sweep: should process both due auto-pay debts
+  const s18Sweep1 = await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
+  assert(s18Sweep1.status === 200, "Daily sweep processes due auto-pay debts");
+
+  const s18DebtAfterSweep1 = await request({ hostname: "localhost", port: 8000, path: "/api/debts", method: "GET", headers: authHeaders });
+  const s18FoundDebt1 = (s18DebtAfterSweep1.body || []).find((d) => d.id === s18DebtId);
+  assert(
+    parseFloat(s18FoundDebt1.total_remaining) === 400.0,
+    "Auto-pay atomically decrements debt balance from $500 to $400"
+  );
+  assert(
+    s18FoundDebt1.next_due_date > s18Today,
+    "Auto-pay advances next_due_date to next monthly cycle"
+  );
+  assert(
+    s18FoundDebt1.auto_pay === true,
+    "Auto-pay remains active when remaining balance > 0"
+  );
+
+  const s18FoundPayoffDebt = (s18DebtAfterSweep1.body || []).find((d) => d.id === s18PayoffDebtId);
+  assert(
+    parseFloat(s18FoundPayoffDebt.total_remaining) === 0.0,
+    "Auto-pay decrements debt to exactly $0.00 upon payoff"
+  );
+  assert(
+    s18FoundPayoffDebt.auto_pay === false,
+    "Auto-pay automatically turns off when debt balance reaches zero"
+  );
+
+  // 18b. Editing a TRANSFER to target a DEBT account re-derives type as EXPENSE
+  const s18Card = await request(
+    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
+    { name: "Suite 18 Card", currentBalance: 300.0, creditLimit: 1000.0, dueDate: "2026-11-20" }
+  );
+  assert(s18Card.status === 201 && s18Card.body.id, "Creates test card for transfer re-derivation");
+  const s18CardId = s18Card.body.id;
+
+  const s18Transfer = await request(
+    { hostname: "localhost", port: 8000, path: "/api/expenses", method: "POST", headers: authHeaders },
+    {
+      name: "Card Paydown Transfer",
+      amount: 50.0,
+      due_date: s18Today,
+      category: "Credit Card Payment",
+      targetAccountId: s18CardId,
+      is_paid: false,
+    }
+  );
+  assert(s18Transfer.status === 201 && s18Transfer.body.type === "TRANSFER", "Card payment created with type TRANSFER");
+  const s18TrxId = s18Transfer.body.id;
+
+  // Edit transaction: target the debt account instead of the card
+  const s18RetargetDebt = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s18TrxId}`, method: "PUT", headers: authHeaders },
+    {
+      name: "Payment for Suite 18 Auto-Pay Debt",
+      category: "Debt",
+      targetAccountId: s18DebtId,
+    }
+  );
+  assert(
+    s18RetargetDebt.status === 200 && s18RetargetDebt.body.type === "EXPENSE",
+    "Editing transfer to target a DEBT account re-derives type as EXPENSE"
+  );
+  assert(
+    s18RetargetDebt.body.category === "Debt",
+    "Editing transfer to target debt sets category to Debt"
+  );
+
+  // Edit transaction back to target the credit card: re-derives as TRANSFER
+  const s18RetargetCard = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s18TrxId}`, method: "PUT", headers: authHeaders },
+    {
+      name: "Payment for Suite 18 Card",
+      category: "Credit Card Payment",
+      targetAccountId: s18CardId,
+    }
+  );
+  assert(
+    s18RetargetCard.status === 200 && s18RetargetCard.body.type === "TRANSFER",
+    "Editing debt expense to target a CREDIT_CARD account re-derives type as TRANSFER"
+  );
+
+  // Clean up Suite 18 records
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s18TrxId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s18CardId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s18DebtId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s18PayoffDebtId}`, method: "DELETE", headers: authHeaders });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
