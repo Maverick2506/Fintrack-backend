@@ -399,42 +399,80 @@ async function initialize() {
       }
 
       // One-off remediation for pre-fix scheduled transfers:
-      // Scheduled card payments created before the fix had balanceApplied: true and deducted from toAccount immediately.
-      // Revert the premature balance deduction on the target account, and set balanceApplied: false so the sweep can apply it when due.
+      // Scheduled card payments created before the fix had balance prematurely deducted from toAccount.
+      // 1) Those created between 6b06ed2 and this fix had balanceApplied: true.
+      // 2) Those created before 6b06ed2 had balanceApplied: false, but the old code still applied them immediately if date >= createdAt.
+      // Revert the premature balance deduction on the target account, and set balanceApplied: false so the sweep applies cleanly on due date.
       const transfersReset = await Setting.findByPk(
-        "unpaid_transfers_balance_applied_reset_v1"
+        "unpaid_transfers_balance_applied_reset_v2"
       );
       if (!transfersReset || transfersReset.value !== "true") {
-        const prematureTransfers = await Transaction.findAll({
+        const cleanupCutoff = new Date();
+        const candidateTransfers = await Transaction.findAll({
           where: {
             type: "TRANSFER",
             isCleared: false,
-            balanceApplied: true,
             toAccountId: { [Op.ne]: null },
+            createdAt: { [Op.lte]: cleanupCutoff },
           },
+          include: [{ model: Account, as: "toAccount" }],
         });
 
-        for (const trx of prematureTransfers) {
+        let restoredCount = 0;
+        for (const trx of candidateTransfers) {
+          const isTargetDebtOrCard =
+            trx.toAccount && ["CREDIT_CARD", "DEBT"].includes(trx.toAccount.type);
+          if (!isTargetDebtOrCard) continue;
+
+          const createdDateStr = trx.createdAt
+            ? format(toZonedTime(trx.createdAt, "America/Toronto"), "yyyy-MM-dd")
+            : null;
+          const isPremature =
+            trx.balanceApplied === true ||
+            (trx.balanceApplied === false && createdDateStr && trx.date >= createdDateStr);
+
+          if (!isPremature) continue;
+
           const amt = parseFloat(trx.amount) || 0;
-          if (amt > 0 && trx.toAccountId) {
-            // Re-add the amount that was prematurely deducted from credit card or debt
-            await Account.increment("initialBalance", {
-              by: amt,
-              where: { id: trx.toAccountId },
+          if (amt <= 0) continue;
+
+          const claimKey = `remed_unpaid_transfer_${trx.id}`;
+          const dbTx = await sequelize.transaction();
+          try {
+            const [_, created] = await Setting.findOrCreate({
+              where: { key: claimKey },
+              defaults: { key: claimKey, value: "restored" },
+              transaction: dbTx,
             });
+
+            if (created) {
+              await Account.increment("initialBalance", {
+                by: amt,
+                where: { id: trx.toAccountId },
+                transaction: dbTx,
+              });
+              await Transaction.update(
+                { balanceApplied: false },
+                { where: { id: trx.id }, transaction: dbTx }
+              );
+              await dbTx.commit();
+              restoredCount++;
+            } else {
+              await dbTx.rollback();
+            }
+          } catch (claimErr) {
+            await dbTx.rollback().catch(() => {});
           }
-          trx.balanceApplied = false;
-          await trx.save({ fields: ["balanceApplied"] });
         }
 
-        if (prematureTransfers.length > 0) {
+        if (restoredCount > 0) {
           console.log(
-            `✅ Reverted premature balance deduction and reset balanceApplied = false for ${prematureTransfers.length} scheduled unpaid transfers.`
+            `✅ Reverted premature balance deduction and reset balanceApplied = false for ${restoredCount} scheduled unpaid transfers.`
           );
         }
 
         await Setting.upsert({
-          key: "unpaid_transfers_balance_applied_reset_v1",
+          key: "unpaid_transfers_balance_applied_reset_v2",
           value: "true",
         });
       }

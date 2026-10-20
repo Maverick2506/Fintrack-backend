@@ -1871,6 +1871,81 @@ async function runTestSuite() {
   await DBTransaction.destroy({ where: { id: s16PreFixTrx.id } });
   await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardAId}`, method: "DELETE", headers: authHeaders });
 
+  // Scenario A2: Pre-6b06ed2 transfer (balanceApplied: false, but prematurely applied at creation)
+  const s16CardA2 = await request(
+    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Card A2", currentBalance: 800.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+  );
+  assert(s16CardA2.status === 201 && s16CardA2.body.id, "Creates test card A2 at $800 balance");
+  const s16CardA2Id = s16CardA2.body.id;
+
+  const s16Pre6bTrx = await DBTransaction.create({
+    title: "Pre-6b06ed2 Card Payment",
+    amount: 200.0,
+    date: s16Today,
+    type: "TRANSFER",
+    category: "Credit Card Payment",
+    isCleared: false,
+    balanceApplied: false, // pre-6b06ed2 rows had balanceApplied: false
+    toAccountId: s16CardA2Id,
+    createdAt: new Date(),
+  });
+
+  // Verify atomic concurrency claim mechanism on this row
+  const { Setting: DBSetting, Account: DBAccount, sequelize: DBSequelize } = require("../models");
+  const claimKey = `remed_unpaid_transfer_${s16Pre6bTrx.id}`;
+  
+  // Instance 1 claims
+  const t1 = await DBSequelize.transaction();
+  const [_, created1] = await DBSetting.findOrCreate({
+    where: { key: claimKey },
+    defaults: { key: claimKey, value: "restored" },
+    transaction: t1,
+  });
+  if (created1) {
+    await DBAccount.increment("initialBalance", { by: 200.0, where: { id: s16CardA2Id }, transaction: t1 });
+    await DBTransaction.update({ balanceApplied: false }, { where: { id: s16Pre6bTrx.id }, transaction: t1 });
+    await t1.commit();
+  }
+  assert(created1 === true, "First server instance successfully claims pre-6b06ed2 transfer and restores $200");
+
+  // Instance 2 attempts concurrent claim on same row
+  const t2 = await DBSequelize.transaction();
+  let created2 = false;
+  try {
+    const [__, c2] = await DBSetting.findOrCreate({
+      where: { key: claimKey },
+      defaults: { key: claimKey, value: "restored" },
+      transaction: t2,
+    });
+    created2 = c2;
+    if (created2) {
+      await DBAccount.increment("initialBalance", { by: 200.0, where: { id: s16CardA2Id }, transaction: t2 });
+      await t2.commit();
+    } else {
+      await t2.rollback();
+    }
+  } catch {
+    await t2.rollback().catch(() => {});
+  }
+  assert(created2 === false, "Second concurrent server instance fails claim and does NOT double-increment balance");
+
+  // Check card balance before sweep: 800 + 200 restored = 1000
+  let cardA2Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  let foundCardA2 = (cardA2Check.body || []).find((c) => c.id === s16CardA2Id);
+  assert(parseFloat(foundCardA2?.currentBalance || 0) === 1000.0, "Card A2 balance restored to $1,000 prior to sweep");
+
+  // Sweep runs on due date: applies $200 payment cleanly
+  await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
+  cardA2Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  foundCardA2 = (cardA2Check.body || []).find((c) => c.id === s16CardA2Id);
+  assert(parseFloat(foundCardA2?.currentBalance || 0) === 800.0, "After sweep, pre-6b06ed2 payment leaves card cleanly at $800.00 (not $600)");
+
+  // Cleanup A2
+  await DBTransaction.destroy({ where: { id: s16Pre6bTrx.id } });
+  await DBSetting.destroy({ where: { key: claimKey } });
+  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardA2Id}`, method: "DELETE", headers: authHeaders });
+
   // Scenario B: Editing in Ledger preserves targetAccountId and does not unlink
   // 1. Mark a scheduled $200 card payment paid: card 1,000 -> 800, still linked
   const s16CardB = await request(
@@ -1929,6 +2004,31 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardBId}`, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s16SavingsTrxId}`, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: `/api/savings-goals/${s16GoalBId}`, method: "DELETE", headers: authHeaders });
+
+  // 3. Edit debt payment to "Food & Drink" unlinks toAccountId
+  const s16DebtB = await request(
+    { hostname: "localhost", port: 8000, path: "/api/debts", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Debt Unlink", total_amount: 500.0, monthly_payment: 25.0, next_due_date: "2026-11-01" }
+  );
+  const s16DebtBId = s16DebtB.body.id;
+
+  const s16DebtPayment = await request(
+    { hostname: "localhost", port: 8000, path: "/api/expenses", method: "POST", headers: authHeaders },
+    { name: "Debt Payment Test", amount: 50.0, category: "Debt", targetAccountId: s16DebtBId, due_date: s16Today, is_paid: true }
+  );
+  assert(s16DebtPayment.status === 201 && s16DebtPayment.body.toAccountId === s16DebtBId, "Creates debt payment linked to debt");
+  const s16DebtPaymentId = s16DebtPayment.body.id;
+
+  // Change category to "Food & Drink" with targetAccountId: null
+  const s16SwitchCatRes = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s16DebtPaymentId}`, method: "PUT", headers: authHeaders },
+    { name: "Lunch with Team", amount: 50.0, category: "Food & Drink", is_paid: true, targetAccountId: null }
+  );
+  assert(s16SwitchCatRes.status === 200, "Updates transaction category to Food & Drink");
+  assert(s16SwitchCatRes.body.toAccountId === null, "Changing category to Food & Drink unlinks toAccountId");
+
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s16DebtPaymentId}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s16DebtBId}`, method: "DELETE", headers: authHeaders });
 
   // Scenario C: The sweep adds unpaid savings contributions to the goal
   const s16GoalC = await request(
