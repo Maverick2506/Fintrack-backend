@@ -407,16 +407,18 @@ async function initialize() {
         "unpaid_transfers_balance_applied_reset_v2"
       );
       if (!transfersReset || transfersReset.value !== "true") {
-        const cleanupCutoff = new Date();
         const candidateTransfers = await Transaction.findAll({
           where: {
             type: "TRANSFER",
             isCleared: false,
             toAccountId: { [Op.ne]: null },
-            createdAt: { [Op.lte]: cleanupCutoff },
           },
           include: [{ model: Account, as: "toAccount" }],
         });
+
+        // Any instant after 6b06ed2 was deployed and before 57874c8 could have run works;
+        // 57874c8 was committed 2026-10-20 02:25 -04:00.
+        const LEGACY_CUTOFF = new Date("2026-10-20T06:00:00Z");
 
         let restoredCount = 0;
         for (const trx of candidateTransfers) {
@@ -429,7 +431,10 @@ async function initialize() {
             : null;
           const isPremature =
             trx.balanceApplied === true ||
-            (trx.balanceApplied === false && createdDateStr && trx.date >= createdDateStr);
+            (trx.balanceApplied === false &&
+              trx.createdAt < LEGACY_CUTOFF &&
+              createdDateStr &&
+              trx.date >= createdDateStr);
 
           if (!isPremature) continue;
 

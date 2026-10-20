@@ -1888,11 +1888,12 @@ async function runTestSuite() {
     isCleared: false,
     balanceApplied: false, // pre-6b06ed2 rows had balanceApplied: false
     toAccountId: s16CardA2Id,
-    createdAt: new Date(),
+    createdAt: new Date("2026-10-18T12:00:00Z"), // before LEGACY_CUTOFF
   });
 
   // Verify atomic concurrency claim mechanism on this row
   const { Setting: DBSetting, Account: DBAccount, sequelize: DBSequelize } = require("../models");
+  const { Op } = require("sequelize");
   const claimKey = `remed_unpaid_transfer_${s16Pre6bTrx.id}`;
   
   // Instance 1 claims
@@ -1945,6 +1946,96 @@ async function runTestSuite() {
   await DBTransaction.destroy({ where: { id: s16Pre6bTrx.id } });
   await DBSetting.destroy({ where: { key: claimKey } });
   await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardA2Id}`, method: "DELETE", headers: authHeaders });
+
+  // Scenario A3: A payment scheduled under the new code is untouched by the cleanup
+  const s16CardA3 = await request(
+    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
+    { name: "Suite 16 Card A3", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+  );
+  assert(s16CardA3.status === 201 && s16CardA3.body.id, "Creates test card A3 at $1,000 balance");
+  const s16CardA3Id = s16CardA3.body.id;
+
+  // Schedule a $200 unpaid card payment due today under the new code
+  const s16NewPayment = await request(
+    { hostname: "localhost", port: 8000, path: "/api/expenses", method: "POST", headers: authHeaders },
+    {
+      name: "Scheduled Payment New Code",
+      amount: 200.0,
+      category: "Credit Card Payment",
+      targetAccountId: s16CardA3Id,
+      due_date: s16Today,
+      is_paid: false,
+    }
+  );
+  assert(s16NewPayment.status === 201, "Schedules unpaid $200 card payment under new code");
+  const s16NewPaymentId = s16NewPayment.body.id;
+
+  // Verify initial state: card balance stays at $1,000 and payment has balanceApplied = false
+  let cardA3Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  let foundCardA3 = (cardA3Check.body || []).find((c) => c.id === s16CardA3Id);
+  assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 starts at $1,000 balance upon payment scheduling");
+
+  const newTrxInDb = await DBTransaction.findByPk(s16NewPaymentId);
+  const LEGACY_CUTOFF = new Date("2026-10-20T06:00:00Z");
+  assert(newTrxInDb.balanceApplied === false, "Payment scheduled under new code has balanceApplied = false");
+  assert(new Date(newTrxInDb.createdAt) >= LEGACY_CUTOFF, "Payment scheduled under new code has createdAt >= LEGACY_CUTOFF");
+
+  // Run the cleanup logic on candidate transfers
+  const candidateTransfersA3 = await DBTransaction.findAll({
+    where: {
+      id: s16NewPaymentId,
+      type: "TRANSFER",
+      isCleared: false,
+      toAccountId: { [Op.ne]: null },
+    },
+    include: [{ model: DBAccount, as: "toAccount" }],
+  });
+
+  let a3RestoredCount = 0;
+  for (const trx of candidateTransfersA3) {
+    const isTargetDebtOrCard =
+      trx.toAccount && ["CREDIT_CARD", "DEBT"].includes(trx.toAccount.type);
+    if (!isTargetDebtOrCard) continue;
+
+    const createdDateStr = trx.createdAt
+      ? format(toZonedTime(trx.createdAt, "America/Toronto"), "yyyy-MM-dd")
+      : null;
+    const isPremature =
+      trx.balanceApplied === true ||
+      (trx.balanceApplied === false &&
+        trx.createdAt < LEGACY_CUTOFF &&
+        createdDateStr &&
+        trx.date >= createdDateStr);
+
+    if (!isPremature) continue;
+
+    const claimKeyA3 = `remed_unpaid_transfer_${trx.id}`;
+    const [_, created] = await DBSetting.findOrCreate({
+      where: { key: claimKeyA3 },
+      defaults: { key: claimKeyA3, value: "restored" },
+    });
+    if (created) {
+      await DBAccount.increment("initialBalance", { by: parseFloat(trx.amount), where: { id: trx.toAccountId } });
+      a3RestoredCount++;
+    }
+  }
+
+  assert(a3RestoredCount === 0, "A payment scheduled under the new code is untouched by the cleanup (0 restored)");
+
+  // Card A3 balance must remain $1,000 (NOT incremented to $1,200)
+  cardA3Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  foundCardA3 = (cardA3Check.body || []).find((c) => c.id === s16CardA3Id);
+  assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 balance remains $1,000 after cleanup (not corrupted to $1,200)");
+
+  // Daily sweep then runs on due date and cleanly applies the $200 payment (1,000 -> 800)
+  await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
+  cardA3Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
+  foundCardA3 = (cardA3Check.body || []).find((c) => c.id === s16CardA3Id);
+  assert(parseFloat(foundCardA3?.currentBalance || 0) === 800.0, "Daily sweep applies scheduled payment on due date leaving card cleanly at $800.00");
+
+  // Cleanup A3
+  await DBTransaction.destroy({ where: { id: s16NewPaymentId } });
+  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardA3Id}`, method: "DELETE", headers: authHeaders });
 
   // Scenario B: Editing in Ledger preserves targetAccountId and does not unlink
   // 1. Mark a scheduled $200 card payment paid: card 1,000 -> 800, still linked
