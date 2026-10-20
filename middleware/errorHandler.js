@@ -15,7 +15,24 @@ function notFoundHandler(req, res) {
 
 // eslint-disable-next-line no-unused-vars
 function errorHandler(err, req, res, next) {
-  const status = err.status || err.statusCode || 500;
+  let status = err.status || err.statusCode;
+  let message = err.message;
+
+  if (!status) {
+    if (
+      err.name === "SequelizeUniqueConstraintError" ||
+      (err.original &&
+        (err.original.code === "SQLITE_CONSTRAINT" ||
+          err.original.code === "23505"))
+    ) {
+      status = 409;
+      message =
+        "Another occurrence of this recurring series is already on that date.";
+    } else {
+      status = 500;
+    }
+  }
+
   const isClientErr = status >= 400 && status < 500;
   const isProd = process.env.NODE_ENV === "production";
 
@@ -36,7 +53,7 @@ function errorHandler(err, req, res, next) {
   }
 
   const safeMessage = isClientErr
-    ? err.message || "Bad request"
+    ? message || "Bad request"
     : "Internal server error";
 
   const body = { error: safeMessage };

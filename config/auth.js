@@ -40,9 +40,12 @@ const verifyPassword = (inputPassword) => {
 
 const assertAuthConfiguration = () => {
   if (isProd()) {
-    if (!process.env.SUPER_SECRET_PASSWORD) {
+    if (
+      !process.env.SUPER_SECRET_PASSWORD ||
+      process.env.SUPER_SECRET_PASSWORD === "maverick"
+    ) {
       throw new Error(
-        "❌ FATAL CONFIGURATION ERROR: SUPER_SECRET_PASSWORD is not set in production environment variables. Refusing to boot with default credentials."
+        "❌ FATAL CONFIGURATION ERROR: SUPER_SECRET_PASSWORD is not set or is set to default credentials ('maverick') in production environment variables. Refusing to boot with default credentials."
       );
     }
     if (!process.env.JWT_SECRET) {

@@ -214,9 +214,15 @@ async function initialize() {
               name: "transactions_recurring_group_date_unique",
             }
           );
+          console.log(
+            "✅ Added unique index transactions_recurring_group_date_unique on (recurringGroupId, date)."
+          );
         }
       } catch (idxErr) {
-        // Index may already exist or dialect specific notice
+        console.warn(
+          "⚠️ Could not create recurring unique index (existing duplicates may need manual cleanup):",
+          idxErr.message
+        );
       }
 
       // Deliberate Backfill 1: balanceApplied (runs once, guarded by Setting flag)

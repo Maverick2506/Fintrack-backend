@@ -2426,6 +2426,19 @@ async function runTestSuite() {
       "assertAuthConfiguration() refuses to start when NODE_ENV is production and SUPER_SECRET_PASSWORD is unset"
     );
 
+    // In production with default "maverick" password
+    process.env.SUPER_SECRET_PASSWORD = "maverick";
+    let authMaverickError = null;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      authMaverickError = err;
+    }
+    assert(
+      authMaverickError !== null && authMaverickError.message.includes("Refusing to boot with default credentials"),
+      "assertAuthConfiguration() refuses to start when NODE_ENV is production and SUPER_SECRET_PASSWORD is 'maverick'"
+    );
+
     // With password set in production
     process.env.SUPER_SECRET_PASSWORD = "test-prod-password-123";
     let prodSuccess = true;
@@ -2453,6 +2466,7 @@ async function runTestSuite() {
     amount: 75.0,
     baseAmount: 75.0,
     type: "EXPENSE",
+    recurrence: "weekly",
     date: s19Date,
     recurringGroupId: s19GroupId,
     isCleared: false,
@@ -2480,6 +2494,33 @@ async function runTestSuite() {
       (s19DupError.name === "SequelizeUniqueConstraintError" ||
         (s19DupError.original && s19DupError.original.code === "SQLITE_CONSTRAINT")),
     "Unique index on (recurringGroupId, date) strictly rejects duplicate transaction on identical date"
+  );
+
+  // 19.2b: Moving an occurrence onto a sibling's date returns HTTP 409 Conflict
+  const s19Date2 = "2029-06-22";
+  const s19SecondTrx = await Transaction.create({
+    title: "Suite 19 Recurring Test B",
+    amount: 75.0,
+    baseAmount: 75.0,
+    type: "EXPENSE",
+    recurrence: "weekly",
+    date: s19Date2,
+    recurringGroupId: s19GroupId,
+    isCleared: false,
+    balanceApplied: false,
+  });
+
+  const moveRes = await request(
+    { hostname: "localhost", port: 8000, path: `/api/expenses/${s19SecondTrx.id}`, method: "PUT", headers: authHeaders },
+    { due_date: s19Date }
+  );
+  assert(
+    moveRes.status === 409,
+    "Moving an occurrence onto a sibling's date returns HTTP 409 Conflict"
+  );
+  assert(
+    moveRes.body.error === "Another occurrence of this recurring series is already on that date.",
+    "Returns clear user-facing error message on recurring date conflict"
   );
 
   // 19.3: Multiple non-recurring transactions with recurringGroupId = null on the same date are permitted
@@ -2522,7 +2563,7 @@ async function runTestSuite() {
   // Clean up Suite 19 records
   await Transaction.destroy({
     where: {
-      id: [s19FirstTrx.id, s19Null1 && s19Null1.id, s19Null2 && s19Null2.id].filter(Boolean),
+      id: [s19FirstTrx.id, s19SecondTrx && s19SecondTrx.id, s19Null1 && s19Null1.id, s19Null2 && s19Null2.id].filter(Boolean),
     },
   });
 
