@@ -61,6 +61,10 @@ const Transaction = sequelize.define(
       type: DataTypes.UUID,
       allowNull: true,
     },
+    clientRef: {
+      type: DataTypes.UUID,
+      allowNull: true,
+    },
   },
   {
     indexes: [

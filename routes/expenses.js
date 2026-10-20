@@ -271,6 +271,28 @@ router.post(
           ? "Credit Card Payment"
           : finalCategory;
 
+      // Phase L: Idempotent clientRef check
+      if (req.body.clientRef) {
+        const existing = await Transaction.findOne({
+          where: { clientRef: req.body.clientRef },
+          transaction: dbTx,
+        });
+        if (existing) {
+          await dbTx.rollback();
+          return res.status(200).json({
+            ...existing.toJSON(),
+            id: existing.id,
+            name: existing.title,
+            amount: parseFloat(existing.amount),
+            date: existing.date,
+            due_date: existing.date,
+            category: existing.category,
+            is_paid: existing.isCleared,
+            isDuplicate: true,
+          });
+        }
+      }
+
       const isRecurring = recurrence && recurrence !== "none";
       const finalRecurringGroupId =
         req.body.recurringGroupId || (isRecurring ? crypto.randomUUID() : null);
@@ -291,6 +313,7 @@ router.post(
           recurringGroupId: finalRecurringGroupId,
           fromAccountId: fromAccount.id,
           toAccountId: resolvedToAccountId,
+          clientRef: req.body.clientRef || null,
         },
         { transaction: dbTx }
       );

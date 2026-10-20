@@ -3972,6 +3972,108 @@ async function runTestSuite() {
     headers: authHeaders,
   });
 
+
+  // 31. Idempotent Offline Retries & clientRef Deduplication (Phase L)
+  console.log("\n--- Suite 31: Idempotent Offline Retries & clientRef Deduplication (Phase L) ---");
+
+  const testClientRef1 = crypto.randomUUID();
+  const testClientRef2 = crypto.randomUUID();
+
+  // 1. First expense submission with clientRef
+  const expRes1 = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Lunch at Cafe",
+      amount: 14.50,
+      due_date: "2026-04-15",
+      category: "Food & Drink",
+      clientRef: testClientRef1,
+    }
+  );
+  assert(expRes1.status === 201 && expRes1.body.id, "Creates first transaction with clientRef with HTTP 201");
+  const expId1 = expRes1.body.id;
+
+  // 2. Retry identical submission with the same clientRef
+  const retryExpRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Lunch at Cafe",
+      amount: 14.50,
+      due_date: "2026-04-15",
+      category: "Food & Drink",
+      clientRef: testClientRef1,
+    }
+  );
+  assert(retryExpRes.status === 200, "Retrying identical submission returns HTTP 200 (idempotent)");
+  assert(retryExpRes.body.id === expId1, "Returns the existing transaction ID without duplicating");
+  assert(retryExpRes.body.isDuplicate === true, "Flags response with isDuplicate: true");
+
+  // Verify only 1 row exists in database for this clientRef
+  const matchCount = await Transaction.count({
+    where: { clientRef: testClientRef1 },
+  });
+  assert(matchCount === 1, "Database strictly contains exactly 1 record for unique clientRef");
+
+  // 3. First paycheque submission with clientRef
+  const payRes1 = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/paycheques",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Freelance Design",
+      amount: 750.00,
+      payment_date: "2026-04-15",
+      clientRef: testClientRef2,
+    }
+  );
+  assert(payRes1.status === 201 && payRes1.body.id, "Creates paycheque with clientRef with HTTP 201");
+  const payId1 = payRes1.body.id;
+
+  // 4. Retry paycheque with same clientRef
+  const retryPayRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/paycheques",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Freelance Design",
+      amount: 750.00,
+      payment_date: "2026-04-15",
+      clientRef: testClientRef2,
+    }
+  );
+  assert(retryPayRes.status === 200, "Retrying paycheque returns HTTP 200");
+  assert(retryPayRes.body.id === payId1, "Returns existing paycheque ID without duplicating");
+
+  // Cleanup Suite 31
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/expenses/" + expId1,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  await Transaction.destroy({ where: { id: payId1 } });
+
   // Cleanup
   await request({
     hostname: "localhost",

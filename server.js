@@ -208,6 +208,12 @@ async function initialize() {
           allowNull: true,
         });
       }
+      if (!tableDesc.clientRef) {
+        await queryInterface.addColumn("Transactions", "clientRef", {
+          type: DataTypes.UUID,
+          allowNull: true,
+        });
+      }
 
       // Safely ensure registered account columns exist on Accounts (Phase J)
       try {
@@ -257,6 +263,23 @@ async function initialize() {
           "⚠️ Could not create recurring unique index (existing duplicates may need manual cleanup):",
           idxErr.message
         );
+      }
+
+      // Safely ensure unique index on Transactions (clientRef) exists (Phase L)
+      try {
+        const existingIndexes = await queryInterface.showIndex("Transactions");
+        const hasClientRefIndex = existingIndexes.some(
+          (idx) => idx.name === "transactions_client_ref_unique"
+        );
+        if (!hasClientRefIndex) {
+          await queryInterface.addIndex("Transactions", ["clientRef"], {
+            unique: true,
+            name: "transactions_client_ref_unique",
+          });
+          console.log("✅ Added unique index transactions_client_ref_unique on (clientRef).");
+        }
+      } catch (idxErr) {
+        console.warn("⚠️ Could not create clientRef unique index:", idxErr.message);
       }
 
       // Safely ensure unique index on NetWorthSnapshots (date) exists

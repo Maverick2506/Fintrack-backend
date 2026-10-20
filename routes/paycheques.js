@@ -42,6 +42,21 @@ router.post(
       defaults: { type: "CHECKING", initialBalance: 0.0 },
     });
 
+    // Phase L: Idempotent clientRef check
+    if (req.body.clientRef) {
+      const existing = await Transaction.findOne({
+        where: { clientRef: req.body.clientRef },
+      });
+      if (existing) {
+        return res.status(200).json({
+          ...existing.toJSON(),
+          name: existing.title,
+          payment_date: existing.date,
+          isDuplicate: true,
+        });
+      }
+    }
+
     const todayStr = getTodayString();
     // Only mark income cleared if its payment date has arrived
     const isCleared = payment_date <= todayStr;
@@ -55,6 +70,7 @@ router.post(
       isCleared,
       toAccountId: checking ? checking.id : null,
       recurrence: recurrence || "none",
+      clientRef: req.body.clientRef || null,
     });
 
     if (recurrence && recurrence !== "none") {

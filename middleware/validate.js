@@ -47,6 +47,7 @@ const schemas = {
     taxApplied: z.boolean().optional().default(false),
     recurringGroupId: z.string().uuid().nullable().optional(),
     applyToBalance: z.boolean().optional(),
+    clientRef: z.string().uuid().nullable().optional(),
   }),
 
   updateExpense: z.object({
@@ -67,6 +68,7 @@ const schemas = {
     baseAmount: z.coerce.number().nonnegative().nullable().optional(),
     taxApplied: z.boolean().optional(),
     recurringGroupId: z.string().uuid().nullable().optional(),
+    clientRef: z.string().uuid().nullable().optional(),
   }),
 
   createPaycheque: z.object({
@@ -77,6 +79,7 @@ const schemas = {
       .enum(["none", "weekly", "bi-weekly", "monthly", "yearly"])
       .optional()
       .default("none"),
+    clientRef: z.string().uuid().nullable().optional(),
   }),
 
   paymentAmount: z.object({
