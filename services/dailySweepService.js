@@ -176,7 +176,7 @@ const runDailySweep = async () => {
         await debt.reload({ transaction: dbTx });
         if (debt.initialBalance <= 0) {
           await Account.update(
-            { initialBalance: 0, autoPay: false },
+            { autoPay: false },
             { where: { id: debt.id }, transaction: dbTx }
           );
         }

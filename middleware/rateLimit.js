@@ -1,6 +1,7 @@
 const rateLimit = require("express-rate-limit");
 
-const isDev = process.env.NODE_ENV !== "production";
+const isRelaxed =
+  process.env.NODE_ENV === "test" || process.env.RELAX_RATE_LIMIT === "true";
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -20,7 +21,7 @@ const aiLimiter = rateLimit({
 
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: isDev ? 2000 : 300,
+  max: isRelaxed ? 2000 : 300,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests. Try again shortly." },
