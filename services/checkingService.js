@@ -51,11 +51,19 @@ const getCheckingActivity = async (checkingId, todayStr, dbTx = null) => {
       transaction: dbTx,
     }),
     Transaction.sum("amount", {
-      where: { type: "TRANSFER", fromAccountId: checkingId },
+      where: {
+        type: "TRANSFER",
+        isCleared: true,
+        fromAccountId: checkingId,
+      },
       transaction: dbTx,
     }),
     Transaction.sum("amount", {
-      where: { type: "TRANSFER", toAccountId: checkingId },
+      where: {
+        type: "TRANSFER",
+        isCleared: true,
+        toAccountId: checkingId,
+      },
       transaction: dbTx,
     }),
   ]);

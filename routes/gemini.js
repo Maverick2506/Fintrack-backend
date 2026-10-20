@@ -3,8 +3,9 @@ const { GoogleGenAI } = require("@google/genai");
 const { sequelize, Transaction, Account } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
-const { getNextOccurrenceDate } = require("./recurring");
 const authMiddleware = require("../middleware/authMiddleware");
+const { getPaychequeProjection } = require("../services/projectionService");
+const { getCalculatedCheckingBalance } = require("../services/checkingService");
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
@@ -55,73 +56,14 @@ router.post("/financial-advice", async (req, res) => {
       "No future income accurately projected for the rest of this month.";
     let totalProjectedAmount = 0;
     try {
-      const recentPaycheques = await Transaction.findAll({
-        where: { type: "INCOME" },
-        order: [["date", "DESC"]],
-        limit: 5,
-      });
-
-      if (recentPaycheques.length > 0) {
-        const totalAmount = recentPaycheques.reduce(
-          (sum, p) => sum + parseFloat(p.amount),
-          0
-        );
-        const averageAmount = totalAmount / recentPaycheques.length;
-
-        // Detect recurrence cadence dynamically
-        let cadence = "bi-weekly";
-        if (
-          recentPaycheques[0].recurrence &&
-          ["weekly", "bi-weekly", "monthly"].includes(
-            recentPaycheques[0].recurrence
-          )
-        ) {
-          cadence = recentPaycheques[0].recurrence;
-        } else if (recentPaycheques.length >= 2) {
-          const [y1, m1, d1] = recentPaycheques[0].date.split("-").map(Number);
-          const [y2, m2, d2] = recentPaycheques[1].date.split("-").map(Number);
-          const diffDays = Math.round(
-            Math.abs(Date.UTC(y1, m1 - 1, d1) - Date.UTC(y2, m2 - 1, d2)) /
-              (1000 * 60 * 60 * 24)
-          );
-          if (diffDays >= 6 && diffDays <= 8) cadence = "weekly";
-          else if (diffDays >= 12 && diffDays <= 17) cadence = "bi-weekly";
-          else if (diffDays >= 27) cadence = "monthly";
-        }
-
-        let upcomingDates = [];
-        let totalProjectedInLoop = 0;
-        let step = 1;
-
-        while (step <= 10) {
-          const nextDateStr = getNextOccurrenceDate(
-            recentPaycheques[0].date,
-            cadence,
-            step
-          );
-          if (!nextDateStr) break;
-
-          // Only project dates falling strictly within the remainder of the current month
-          if (nextDateStr.startsWith(currentMonthPrefix)) {
-            if (nextDateStr > todayStr) {
-              upcomingDates.push(nextDateStr);
-              totalProjectedInLoop += averageAmount;
-            }
-          } else if (nextDateStr > todayStr) {
-            // Crossed into next month
-            break;
-          }
-          step++;
-        }
-
-        if (upcomingDates.length > 0) {
-          totalProjectedAmount = totalProjectedInLoop;
-          projectedIncomeText = `Expected Upcoming Income: $${totalProjectedAmount.toFixed(
-            2
-          )} total, arriving across ${
-            upcomingDates.length
-          } upcoming paycheque(s) (${upcomingDates.join(", ")}).`;
-        }
+      const projection = await getPaychequeProjection(todayStr, currentMonthPrefix);
+      if (projection.projectedPaychequeDates.length > 0) {
+        totalProjectedAmount = projection.totalProjectedIncome;
+        projectedIncomeText = `Expected Upcoming Income: $${totalProjectedAmount.toFixed(
+          2
+        )} total, arriving across ${
+          projection.projectedPaychequeDates.length
+        } upcoming paycheque(s) (${projection.projectedPaychequeDates.join(", ")}).`;
       }
     } catch (err) {
       console.error("Failed to project income, continuing without it.", err);
@@ -396,7 +338,7 @@ router.post("/chat-advisor", async (req, res) => {
       }),
       Transaction.findAll({
         where: {
-          type: "EXPENSE",
+          type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
           isCleared: false,
           date: { [Op.gte]: todayStr },
         },
@@ -406,6 +348,9 @@ router.post("/chat-advisor", async (req, res) => {
     ]);
 
     const checking = accounts.find((a) => a.type === "CHECKING");
+    const checkingBalance = checking
+      ? await getCalculatedCheckingBalance(checking, todayStr)
+      : 0;
     const cards = accounts.filter((a) => a.type === "CREDIT_CARD");
     const debts = accounts.filter((a) => a.type === "DEBT");
     const goals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
@@ -417,9 +362,7 @@ Today's date is ${todayStr}.
 LIVE FINANCIAL REALITY FOR MAVERICK:
 - Checking Account: ${
       checking
-        ? `${checking.name} (Current Balance: $${parseFloat(
-            checking.initialBalance || 0
-          ).toFixed(2)})`
+        ? `${checking.name} (Current Balance: $${checkingBalance.toFixed(2)})`
         : "Primary Checking ($0.00)"
     }
 - Current Month Cash Flow: Total Cleared Income: $${(

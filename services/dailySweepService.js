@@ -24,11 +24,11 @@ const runDailySweep = async () => {
     let clearedIncomeCount = 0;
     let autoPayCount = 0;
 
-    // 1. Process Due Pending Expenses (Credit Card charges, Paydown bills, & Checking bills)
+    // 1. Process Due Pending Expenses & Transfers (Credit Card charges, Paydown bills, & Checking bills)
     const pendingBillsDue = await Transaction.findAll({
       where: {
         isCleared: false,
-        type: "EXPENSE",
+        type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
         date: { [Op.lte]: todayString },
       },
       include: [

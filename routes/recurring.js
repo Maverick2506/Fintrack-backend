@@ -78,12 +78,12 @@ const createRecurringExpenses = async () => {
     const horizonUtc = new Date(Date.UTC(tY, tM - 1, tD, 12, 0, 0) + 30 * 24 * 60 * 60 * 1000);
     const horizonString = `${horizonUtc.getUTCFullYear()}-${String(horizonUtc.getUTCMonth() + 1).padStart(2, "0")}-${String(horizonUtc.getUTCDate()).padStart(2, "0")}`;
 
-    // Fetch all INCOME and EXPENSE transactions ordered newest first so that
+    // Fetch all INCOME, EXPENSE, and TRANSFER transactions ordered newest first so that
     // if the latest instance of a series was changed to recurrence: "none",
     // we respect that and do not resurrect it from an older historical row.
     const allTransactions = await Transaction.findAll({
       where: {
-        type: { [Op.in]: ["EXPENSE", "INCOME"] },
+        type: { [Op.in]: ["EXPENSE", "INCOME", "TRANSFER"] },
       },
       order: [
         ["date", "DESC"],
@@ -122,18 +122,20 @@ const createRecurringExpenses = async () => {
           break;
         }
 
+        // When recurringGroupId is present, match strictly by recurringGroupId to avoid colliding distinct series with identical names
+        const duplicateCondition = baseTrx.recurringGroupId
+          ? { recurringGroupId: baseTrx.recurringGroupId }
+          : { type: baseTrx.type, title: baseTrx.title };
+
         const existing = await Transaction.findOne({
           where: {
             date: nextDateStr,
-            [Op.or]: [
-              baseTrx.recurringGroupId ? { recurringGroupId: baseTrx.recurringGroupId } : null,
-              { type: baseTrx.type, title: baseTrx.title },
-            ].filter(Boolean),
+            ...duplicateCondition,
           },
         });
 
         if (!existing) {
-          // Income is cleared once its date has arrived; expenses start unpaid (upcoming bill)
+          // Income is cleared once its date has arrived; expenses & transfers start unpaid (upcoming bill)
           const isCleared =
             baseTrx.type === "INCOME" ? nextDateStr <= todayStr : false;
 

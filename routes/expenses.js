@@ -50,8 +50,8 @@ const adjustAccountForTransaction = async (
     // Already applied? Skip to prevent double counting
     if (trx.balanceApplied) return;
 
-    // Unpaid/pending expenses have not affected account balances yet
-    if (trx.type === "EXPENSE" && !trx.isCleared) return;
+    // Unpaid/pending expenses or transfers have not affected account balances yet
+    if (!trx.isCleared) return;
 
     // Historical past-dated transactions (created with a past date) on cards/debts were already in opening balance.
     // Savings goals are exempt: every contribution towards a savings goal adds to the goal regardless of date.
@@ -164,16 +164,22 @@ const resolvePaydownTargetId = async (
       transaction: dbTx,
     });
     const normalizedTitle = title.toLowerCase().trim();
-    const matched = candidates.find((acc) => {
+    // Prefer exact match first
+    const exactMatch = candidates.find(
+      (acc) => (acc.name || "").toLowerCase().trim() === normalizedTitle
+    );
+    if (exactMatch) return exactMatch.id;
+
+    // Second: check if title is formatted as "Payment for <AccountName>" or "Auto-Pay for <AccountName>"
+    const prefixMatch = candidates.find((acc) => {
       const accName = (acc.name || "").toLowerCase().trim();
       return (
         accName &&
-        (normalizedTitle === accName ||
-          normalizedTitle.includes(accName) ||
-          accName.includes(normalizedTitle))
+        (normalizedTitle === `payment for ${accName}` ||
+          normalizedTitle === `auto-pay for ${accName}`)
       );
     });
-    if (matched) return matched.id;
+    if (prefixMatch) return prefixMatch.id;
   }
 
   return null;
@@ -411,7 +417,7 @@ router.post(
       res.status(201).json(newExp);
 
       if (recurrence && recurrence !== "none") {
-        createRecurringExpenses().catch((err) =>
+        await createRecurringExpenses().catch((err) =>
           console.error("Background recurring generation error:", err)
         );
       }
@@ -609,7 +615,7 @@ router.put(
       res.json(trx);
 
       if (req.body.recurrence && req.body.recurrence !== "none") {
-        createRecurringExpenses().catch((err) =>
+        await createRecurringExpenses().catch((err) =>
           console.error("Background recurring generation error:", err)
         );
       }

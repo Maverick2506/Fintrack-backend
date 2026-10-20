@@ -55,7 +55,7 @@ router.get(
       ? Promise.resolve([])
       : Transaction.findAll({
           where: {
-            type: "EXPENSE",
+            type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
             isCleared: false,
             date: { [Op.between]: [upcomingStartDate, endOfMonth] },
           },
@@ -80,10 +80,6 @@ router.get(
       savingsSummary,
       creditCardSummary,
       spendingByCategoryRaw,
-      allTimeIncome,
-      allTimeCheckingExp,
-      allTimeTransfersOut,
-      allTimeTransfersIn,
     ] = await Promise.all([
       Transaction.sum("amount", {
         where: {

@@ -64,7 +64,7 @@ router.post(
     });
 
     if (recurrence && recurrence !== "none") {
-      createRecurringExpenses().catch((err) =>
+      await createRecurringExpenses().catch((err) =>
         console.error("Background recurring generation error:", err)
       );
     }

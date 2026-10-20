@@ -1530,6 +1530,306 @@ async function runTestSuite() {
     headers: authHeaders,
   });
 
+  // 15. Future Unpaid Transfers, Upcoming Bills & Checking Balance Integrity
+  console.log("\n--- Suite 15: Future Unpaid Transfers & Advisor Balance Integrity ---");
+
+  // Create test card with $1,000 balance
+  const s15CardRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/credit-cards",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Suite 15 Sapphire Card",
+      currentBalance: 1000.0,
+      creditLimit: 5000.0,
+      dueDate: "2026-11-15",
+    }
+  );
+  assert(s15CardRes.status === 201 && s15CardRes.body.id, "Creates test credit card with balance $1,000");
+  const s15CardId = s15CardRes.body.id;
+
+  // Get current checking balance
+  const s15InitialDash = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15InitialChecking = parseFloat(s15InitialDash.body?.checkingAccount?.currentBalance || 0);
+
+  // Compute a future date (5 days from today in Toronto timezone)
+  const s15NowToronto = toZonedTime(new Date(), "America/Toronto");
+  const s15FutureToronto = new Date(s15NowToronto.getTime() + 5 * 24 * 60 * 60 * 1000);
+  const s15FutureDateStr = format(s15FutureToronto, "yyyy-MM-dd", { timeZone: "America/Toronto" });
+
+  // Add an unpaid $200 card payment scheduled for future date
+  const s15UnpaidTransfer = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Suite 15 Sapphire Payment",
+      amount: 200.0,
+      category: "Credit Card Payment",
+      targetAccountId: s15CardId,
+      due_date: s15FutureDateStr,
+      is_paid: false,
+    }
+  );
+  assert(s15UnpaidTransfer.status === 201 && s15UnpaidTransfer.body.id, "Schedules unpaid $200 card payment in future");
+  const s15TransferId = s15UnpaidTransfer.body.id;
+  assert(s15UnpaidTransfer.body.type === "TRANSFER", "Transaction categorized as TRANSFER");
+  assert(s15UnpaidTransfer.body.isCleared === false, "Transaction created with isCleared: false");
+  assert(s15UnpaidTransfer.body.balanceApplied === false, "Transaction created with balanceApplied: false");
+
+  // Verify card balance remains $1,000 (NOT deducted to $800)
+  const s15CardsCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15FoundCard = (s15CardsCheck.body || []).find((c) => c.id === s15CardId);
+  assert(parseFloat(s15FoundCard?.currentBalance || 0) === 1000.0, "Future unpaid card payment does NOT deduct card balance immediately (remains $1,000)");
+
+  // Verify checking balance has NOT decreased by $200
+  const s15AfterSchedDash = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15AfterChecking = parseFloat(s15AfterSchedDash.body?.checkingAccount?.currentBalance || 0);
+  assert(s15AfterChecking === s15InitialChecking, "Future unpaid transfer does NOT deduct checking balance immediately");
+
+  // Verify future transfer appears in upcoming bills
+  const s15UpcomingBills = s15AfterSchedDash.body?.upcomingBills || [];
+  const s15FoundUpcoming = s15UpcomingBills.find((b) => b.id === s15TransferId);
+  assert(Boolean(s15FoundUpcoming), "Future unpaid transfer appears in Upcoming Bills");
+
+  // Mark the payment paid via PUT /api/expenses/:id
+  const s15MarkPaidRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${s15TransferId}`,
+      method: "PUT",
+      headers: authHeaders,
+    },
+    {
+      name: "Suite 15 Sapphire Payment",
+      amount: 200.0,
+      category: "Credit Card Payment",
+      targetAccountId: s15CardId,
+      due_date: s15FutureDateStr,
+      is_paid: true,
+    }
+  );
+  assert(s15MarkPaidRes.status === 200, "Marks future transfer as paid via PUT /api/expenses/:id");
+
+  // Verify card balance is now $800.00
+  const s15CardsAfterPaid = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15FoundCardPaid = (s15CardsAfterPaid.body || []).find((c) => c.id === s15CardId);
+  assert(parseFloat(s15FoundCardPaid?.currentBalance || 0) === 800.0, "Marking payment as paid reduces card balance to $800.00");
+
+  // Verify checking balance decreases by $200
+  const s15PaidDash = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15PaidChecking = parseFloat(s15PaidDash.body?.checkingAccount?.currentBalance || 0);
+  assert(s15PaidChecking === s15InitialChecking - 200.0, "Marking transfer as paid reflects in checking balance");
+
+  // Delete the paid payment and verify card balance is restored to $1,000
+  const s15DeleteTransferRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${s15TransferId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  assert(s15DeleteTransferRes.status === 204, "Deletes paid transfer");
+
+  const s15CardsRestored = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/credit-cards",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15FoundCardRestored = (s15CardsRestored.body || []).find((c) => c.id === s15CardId);
+  assert(parseFloat(s15FoundCardRestored?.currentBalance || 0) === 1000.0, "Deleting paid transfer restores card balance to $1,000.00");
+
+  // Verify recurring transfer generation: create recurring transfer and trigger recurring generator
+  const s15RecTransferRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Suite 15 Recurring Card Payment",
+      amount: 50.0,
+      category: "Credit Card Payment",
+      targetAccountId: s15CardId,
+      due_date: format(s15NowToronto, "yyyy-MM-dd", { timeZone: "America/Toronto" }),
+      is_paid: true,
+      recurrence: "monthly",
+    }
+  );
+  assert(s15RecTransferRes.status === 201, "Creates recurring monthly credit card transfer");
+  const s15BaseRecId = s15RecTransferRes.body.id;
+
+  // Trigger recurring generation
+  const s15TriggerRecRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/recurring/trigger-recurring",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(s15TriggerRecRes.status === 200, "Triggers recurring generation for TRANSFER types");
+
+  // Check generated upcoming transfers
+  const s15RecDashRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/dashboard",
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15UpcomingRec = (s15RecDashRes.body?.upcomingBills || []).find(
+    (b) => b.title === "Suite 15 Recurring Card Payment" || b.name === "Suite 15 Recurring Card Payment"
+  );
+  if (s15UpcomingRec) {
+    assert(s15UpcomingRec.isCleared === false || s15UpcomingRec.is_paid === false, "Generated recurring transfer is unpaid (isCleared: false)");
+    assert(s15UpcomingRec.balanceApplied === false, "Generated recurring transfer has balanceApplied: false");
+    await request({
+      hostname: "localhost",
+      port: 8000,
+      path: `/api/expenses/${s15UpcomingRec.id}`,
+      method: "DELETE",
+      headers: authHeaders,
+    });
+  }
+
+  // Cleanup base recurring transfer and test card
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/expenses/${s15BaseRecId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+  await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/credit-cards/${s15CardId}`,
+    method: "DELETE",
+    headers: authHeaders,
+  });
+
+  // Test Item 9: Paydown target resolution prefix & exact matching
+  const s15DebtRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/debts",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Student Loan 15",
+      total_amount: 1000.0,
+      monthly_payment: 50.0,
+      next_due_date: "2026-11-01",
+    }
+  );
+  assert(s15DebtRes.status === 201 && s15DebtRes.body.id, "Creates test debt for paydown target resolution");
+  const s15DebtId = s15DebtRes.body.id;
+
+  // 1. Exact match
+  const s15ExactExpRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Student Loan 15",
+      amount: 100.0,
+      category: "Debt",
+      is_paid: true,
+    }
+  );
+  assert(s15ExactExpRes.status === 201 && s15ExactExpRes.body.toAccountId === s15DebtId, "Exact name matches target debt account");
+
+  // 2. Prefix 'Payment for <Account>'
+  const s15PrefixExpRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Payment for Student Loan 15",
+      amount: 100.0,
+      category: "Debt",
+      is_paid: true,
+    }
+  );
+  assert(s15PrefixExpRes.status === 201 && s15PrefixExpRes.body.toAccountId === s15DebtId, "Prefix 'Payment for <Account>' matches target debt account");
+
+  // 3. Unrelated debt title should NOT resolve randomly
+  const s15UnrelatedExpRes = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/expenses",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      name: "Random Other Expense",
+      amount: 100.0,
+      category: "Debt",
+      is_paid: true,
+    }
+  );
+  assert(s15UnrelatedExpRes.status === 201 && s15UnrelatedExpRes.body.toAccountId === null, "Unrelated expense does NOT resolve to target debt");
+
+  // Cleanup debt and expenses
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s15ExactExpRes.body.id}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s15PrefixExpRes.body.id}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s15UnrelatedExpRes.body.id}`, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s15DebtId}`, method: "DELETE", headers: authHeaders });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
