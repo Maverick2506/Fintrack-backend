@@ -72,12 +72,15 @@ Render free instances spin down after 15 minutes of inactivity. To keep the serv
 - Automated GitHub Actions CI workflow (`.github/workflows/ci.yml`) runs on every push and pull request to `main`.
 - Tests run against an isolated local SQLite test database (`test-database.sqlite`), strictly isolated from production (`isProductionDb` guard) and separated from development data (`local-database.sqlite`).
 - Run tests locally:
-  Start the server in test mode, then run the test runner:
+  Start the server in test mode with dev bypass enabled, then run the test runner:
   ```bash
-  # Terminal 1: Start backend in test mode
-  NODE_ENV=test npm start
+  # Terminal 1 (macOS/Linux)
+  NODE_ENV=test ALLOW_DEV_BYPASS=true npm start
 
-  # Terminal 2: Run test suite
+  # Terminal 1 (Windows PowerShell)
+  $env:NODE_ENV="test"; $env:ALLOW_DEV_BYPASS="true"; npm start
+
+  # Terminal 2
   npm test
   ```
-  *(Note: Starting the server with `NODE_ENV=test` ensures tests run against `test-database.sqlite`, keeping your `local-database.sqlite` development data completely intact).*
+  *(Note: Starting the server with `NODE_ENV=test` ensures tests run against `test-database.sqlite`, keeping your `local-database.sqlite` development data completely intact. In PowerShell, `$env:` variables persist for the remainder of that terminal session, so use a separate terminal for normal development).*
