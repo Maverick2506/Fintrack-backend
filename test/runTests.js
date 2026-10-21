@@ -3418,6 +3418,134 @@ async function runTestSuite() {
   await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + paychequeRes.body.id, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + recurringIncomeRes.body.id, method: "DELETE", headers: authHeaders });
 
+  // --- Suite 25.1: Estimated Paycheques & Settings (Review 17 Part 2) ---
+  console.log("\n--- Suite 25.1: Estimated Paycheques & Settings (Review 17 Part 2) ---");
+
+  // 1. Setting GET /api/settings/forecast-estimate-income returns true by default
+  const getEstSettingRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/settings/forecast-estimate-income",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(getEstSettingRes.status === 200 && getEstSettingRes.body.enabled === true, "GET /api/settings/forecast-estimate-income returns true by default");
+
+  // 2. Setting PUT /api/settings/forecast-estimate-income rejects invalid body
+  const badEstSettingRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/settings/forecast-estimate-income",
+    method: "PUT",
+    headers: authHeaders,
+  }, { enabled: "invalid" });
+  assert(badEstSettingRes.status === 400, "PUT /api/settings/forecast-estimate-income rejects invalid body with HTTP 400");
+
+  // 3. Test 1: Three one-off bi-weekly paycheques (-28, -14, +2 days) -> estimated items at +16, +30, +44, +58
+  const p1Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Paycheque -28",
+    amount: 2100,
+    payment_date: getOffsetDate(-28),
+  });
+  const p2Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Paycheque -14",
+    amount: 2100,
+    payment_date: getOffsetDate(-14),
+  });
+  const p3Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Paycheque +2",
+    amount: 2100,
+    payment_date: getOffsetDate(2),
+  });
+  assert(p1Res.status === 201 && p2Res.status === 201 && p3Res.status === 201, "Creates 3 one-off paycheques at -28, -14, and +2 days");
+
+  const forecastEst1Res = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
+  const f1 = forecastEst1Res.body;
+  assert(f1.estimatedIncome !== null, "Forecast returns estimatedIncome object");
+  assert(f1.estimatedIncome?.cadence === "bi-weekly", "estimatedIncome cadence is 'bi-weekly'");
+  assert(f1.estimatedIncome?.amount === 2100, "estimatedIncome amount is $2100");
+  assert(f1.estimatedIncome?.basedOn === 3, "estimatedIncome basedOn is 3");
+
+  const expDates = [getOffsetDate(16), getOffsetDate(30), getOffsetDate(44), getOffsetDate(58)];
+  assert(
+    expDates.every((d) => f1.estimatedIncome?.dates?.includes(d)),
+    "estimatedIncome dates include +16, +30, +44, and +58 days"
+  );
+
+  const day16 = f1.days.find((d) => d.date === getOffsetDate(16));
+  assert(
+    day16 && day16.items.some((it) => it.title === "Estimated paycheque" && it.estimated === true && it.amount === 2100),
+    "Day +16 contains Estimated paycheque item with estimated: true"
+  );
+
+  // 4. Test 2: A recurring bi-weekly series -> estimatedIncome === null, no estimated items
+  const recurringSeriesRes = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Recurring Paycheque Series",
+    amount: 2100,
+    payment_date: getOffsetDate(2),
+    recurrence: "bi-weekly",
+  });
+  const forecastRecRes = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
+  assert(forecastRecRes.body.estimatedIncome === null, "Recurring bi-weekly series results in estimatedIncome === null");
+  const hasAnyEstimated = forecastRecRes.body.days.some((d) => d.items.some((it) => it.estimated === true));
+  assert(!hasAnyEstimated, "No days contain estimated items when recurring series exists");
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + recurringSeriesRes.body.id, method: "DELETE", headers: authHeaders });
+
+  // 5. Test 3: A real one-off paycheque 2 days after a projected date -> that date is skipped (±3-day rule)
+  const realP18Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Real Paycheque +18",
+    amount: 2100,
+    payment_date: getOffsetDate(18),
+  });
+  const forecastSkipRes = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
+  assert(!forecastSkipRes.body.estimatedIncome?.dates?.includes(getOffsetDate(16)), "+16 is skipped when real paycheque exists at +18");
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + realP18Res.body.id, method: "DELETE", headers: authHeaders });
+
+  // 6. Test 4: forecast_estimate_income = "false" -> estimatedIncome === null
+  const disableSettingRes = await request({ hostname: "localhost", port: 8000, path: "/api/settings/forecast-estimate-income", method: "PUT", headers: authHeaders }, { enabled: false });
+  assert(disableSettingRes.status === 200 && disableSettingRes.body.enabled === false, "PUT /api/settings/forecast-estimate-income sets enabled to false");
+  const forecastDisabledRes = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
+  assert(forecastDisabledRes.body.estimatedIncome === null, "When forecast_estimate_income is false, estimatedIncome is null");
+  // Re-enable setting
+  await request({ hostname: "localhost", port: 8000, path: "/api/settings/forecast-estimate-income", method: "PUT", headers: authHeaders }, { enabled: true });
+
+  // Clean up the 3 one-off paycheques
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + p1Res.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + p2Res.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + p3Res.body.id, method: "DELETE", headers: authHeaders });
+
+  // 7. Test 5: Irregular incomes (gaps of 5, 20 and 40 days) -> no estimates
+  const irr1 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Irr 1",
+    amount: 1500,
+    payment_date: getOffsetDate(-65),
+  });
+  const irr2 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Irr 2",
+    amount: 1500,
+    payment_date: getOffsetDate(-25),
+  });
+  const irr3 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Irr 3",
+    amount: 1500,
+    payment_date: getOffsetDate(-5),
+  });
+  const irr4 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
+    name: "Irr 4",
+    amount: 1500,
+    payment_date: getOffsetDate(0),
+  });
+  const forecastIrrRes = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
+  assert(forecastIrrRes.body.estimatedIncome === null, "Irregular income gaps result in estimatedIncome === null");
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + irr1.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + irr2.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + irr3.body.id, method: "DELETE", headers: authHeaders });
+  await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + irr4.body.id, method: "DELETE", headers: authHeaders });
+
+  // 8. Test 6: Bills only, no income history -> unchanged from today (estimatedIncome === null)
+  const forecastNoIncRes = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
+  assert(forecastNoIncRes.body.estimatedIncome === null, "Bills only with no income history leaves estimatedIncome === null");
+
   // 26. Morning Push Notifications & Daily Digest Tests (Phase F)
   console.log("\n--- Suite 26: Morning Push Notifications & Daily Digest (Phase F) ---");
 

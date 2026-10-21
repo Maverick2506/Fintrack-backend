@@ -29,4 +29,26 @@ router.put(
   })
 );
 
+router.get(
+  "/forecast-estimate-income",
+  asyncHandler(async (req, res) => {
+    const record = await Setting.findByPk("forecast_estimate_income");
+    const enabled = record ? record.value !== "false" : true;
+    res.json({ enabled });
+  })
+);
+
+router.put(
+  "/forecast-estimate-income",
+  validateBody(schemas.setForecastEstimateIncome),
+  asyncHandler(async (req, res) => {
+    const enabled = Boolean(req.body.enabled);
+    await Setting.upsert({
+      key: "forecast_estimate_income",
+      value: String(enabled),
+    });
+    res.json({ enabled });
+  })
+);
+
 module.exports = router;

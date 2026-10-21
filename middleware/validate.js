@@ -180,6 +180,13 @@ const schemas = {
     balance: z.coerce.number(),
   }),
 
+  setForecastEstimateIncome: z.object({
+    enabled: z.union([
+      z.boolean(),
+      z.enum(["true", "false"]).transform((v) => v === "true"),
+    ]),
+  }),
+
   setForecastBuffer: z.object({
     buffer: z.coerce.number().min(0, "Buffer must be non-negative"),
   }),

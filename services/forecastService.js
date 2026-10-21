@@ -15,6 +15,72 @@ const addCalendarDays = (baseDateStr, daysToAdd) => {
   return `${yy}-${mm}-${dd}`;
 };
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const dayDiff = (a, b) => {
+  const [y1, m1, d1] = a.split("-").map(Number);
+  const [y2, m2, d2] = b.split("-").map(Number);
+  return Math.round((Date.UTC(y1, m1 - 1, d1) - Date.UTC(y2, m2 - 1, d2)) / DAY_MS);
+};
+const median = (nums) => {
+  const s = [...nums].sort((x, y) => x - y);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+};
+
+/**
+ * Adds "Estimated paycheque" income items on projected paydays when the user's
+ * income isn't a recurring series (e.g. paycheques logged one at a time).
+ * Cadence comes from the gaps between recent paycheques; amount is their median.
+ * A projected date is skipped when any real or recurring income is within 3 days.
+ */
+const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, dbTx }) => {
+  const setting = await Setting.findByPk("forecast_estimate_income", { transaction: dbTx });
+  if (setting && setting.value === "false") return null;
+
+  const recent = await Transaction.findAll({
+    where: {
+      type: "INCOME",
+      date: { [Op.lte]: endDateStr },
+      [Op.or]: [{ toAccountId: checkingId }, { toAccountId: null }],
+    },
+    order: [["date", "DESC"]],
+    limit: 6,
+    transaction: dbTx,
+  });
+  if (recent.length < 2) return null;
+
+  // A recurring series is already projected by step 3
+  if (recent[0].recurrence && recent[0].recurrence !== "none") return null;
+
+  const gaps = [];
+  for (let i = 0; i < recent.length - 1; i++) gaps.push(dayDiff(recent[i].date, recent[i + 1].date));
+  const gap = median(gaps);
+  let cadence = null;
+  if (gap >= 6 && gap <= 8) cadence = "weekly";
+  else if (gap >= 12 && gap <= 17) cadence = "bi-weekly";
+  else if (gap >= 27 && gap <= 35) cadence = "monthly";
+  if (!cadence) return null; // irregular income: don't guess
+
+  const amount = Math.round(median(recent.map((t) => parseFloat(t.amount) || 0)) * 100) / 100;
+  if (amount <= 0) return null;
+
+  const hasIncomeNear = (dateStr) =>
+    Object.values(daysMap).some(
+      (d) => Math.abs(dayDiff(d.date, dateStr)) <= 3 && d.items.some((it) => it.amount > 0)
+    );
+
+  const dates = [];
+  for (let step = 1; step <= 60; step++) {
+    const next = getNextOccurrenceDate(recent[0].date, cadence, step);
+    if (!next || next > endDateStr) break;
+    if (next <= todayStr || !daysMap[next] || hasIncomeNear(next)) continue;
+    daysMap[next].items.push({ title: "Estimated paycheque", amount, type: "income", estimated: true });
+    dates.push(next);
+  }
+
+  return dates.length ? { amount, cadence, basedOn: recent.length, dates } : null;
+};
+
 /**
  * Computes a day-by-day cashflow forecast for checking account over N days.
  *
@@ -250,6 +316,9 @@ const getForecast = async (daysCount = 60, dbTx = null) => {
     }
   }
 
+  // 3b. Estimated paycheques: fill future paydays when income isn't set up as a recurring series
+  const estimatedIncome = await estimatePaycheques({ daysMap, todayStr, endDateStr, checkingId, dbTx });
+
   // 4. Auto-Pay Debts
   const autoPayDebts = await Account.findAll({
     where: {
@@ -329,6 +398,7 @@ const getForecast = async (daysCount = 60, dbTx = null) => {
       items: dayBucket.items.map((it) => ({
         title: it.title,
         amount: Math.round(it.amount * 100) / 100,
+        ...(it.estimated ? { estimated: true } : {}),
       })),
     };
     days.push(dayObj);
@@ -366,6 +436,7 @@ const getForecast = async (daysCount = 60, dbTx = null) => {
     safeToSpend,
     lowestPoint: lowestPoint || { date: todayStr, balance: Math.round(startBalance * 100) / 100 },
     days,
+    estimatedIncome,
   };
 };
 
