@@ -8,3 +8,4 @@ yarn-error.log*
 *.sqlite3
 *.db
 local-database.sqlite
+test-database.sqlite

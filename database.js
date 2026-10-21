@@ -33,11 +33,11 @@ if (shouldUseRemoteDb) {
     },
   });
 } else {
-  // Local Development Fallback (isolated from live site data)
-  console.log("🛠️ Using local development database (isolated from live production site)...");
+  // Local Development / Test Fallback (isolated from live site data)
+  console.log(`🛠️ Using local ${isTest ? "test" : "development"} database (isolated from live production site)...`);
   sequelize = new Sequelize({
     dialect: "sqlite",
-    storage: path.join(__dirname, "local-database.sqlite"),
+    storage: path.join(__dirname, isTest ? "test-database.sqlite" : "local-database.sqlite"),
     logging: false,
   });
 }

@@ -1,6 +1,10 @@
+// The test process must never touch a remote database.
+process.env.NODE_ENV = "test"; // database.js -> always local SQLite
+delete process.env.USE_PRODUCTION_DB;
+delete process.env.DATABASE_URL;
 process.env.RELAX_RATE_LIMIT = "true";
 const { Sequelize, Op } = require("sequelize");
-const { Account, Transaction, Setting, Budget, NetWorthSnapshot } = require("../models");
+const { sequelize, Account, Transaction, Setting, Budget, NetWorthSnapshot } = require("../models");
 const { restoreBackup } = require("../scripts/restore");
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -18,6 +22,13 @@ const getTorontoOffsetDate = (days) => {
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
 };
 
+
+
+// Hard stop safety verification for the test process itself
+if (require("../database").isProductionDb) {
+  console.error("❌ Test process is connected to a remote database. Aborting.");
+  process.exit(1);
+}
 
 function request(options, body = null) {
   return new Promise((resolve, reject) => {
@@ -76,6 +87,7 @@ async function runTestSuite() {
     "Target server verified running on safe local development database (isolated from live site)"
   );
   // Reset test database to clean slate for reproducible runs
+  await sequelize.sync();
   await Transaction.destroy({ where: {} });
   await Account.destroy({ where: { name: { [Op.ne]: "Primary Checking" } } });
   await Account.findOrCreate({
