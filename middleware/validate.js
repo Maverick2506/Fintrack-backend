@@ -208,13 +208,21 @@ const schemas = {
 
   chatAdvisor: z.object({
     message: z.string().trim().min(1, "Message is required").max(2000, "Message is too long (max 2000 characters)"),
-    history: z.array(
-      z.object({
-        role: z.enum(["user", "model"]),
-        text: z.string().max(4000).optional(),
-        content: z.string().max(4000).optional(),
-      })
-    ).max(8).default([]),
+    history: z
+      .array(
+        z.object({
+          role: z.enum(["user", "model"]),
+          text: z.string().optional(),
+          content: z.string().optional(),
+        })
+      )
+      .default([])
+      .transform((h) =>
+        h
+          .slice(-8)
+          .map((m) => ({ role: m.role, text: (m.text ?? m.content ?? "").trim().slice(0, 4000) }))
+          .filter((m) => m.text)
+      ),
   }),
 
   financialAdvice: z.object({

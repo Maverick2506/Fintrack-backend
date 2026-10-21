@@ -4,7 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/runTests.js"
+    "test": "node test/geminiUnit.test.js && node test/runTests.js"
   },
   "keywords": [],
   "author": "",

@@ -4505,7 +4505,7 @@ async function runTestSuite() {
       history: Array(9).fill({ role: "user", text: "hi" }),
     }
   );
-  assert(chatHistoryOversized.status === 400, "POST /api/chat-advisor rejects history > 8 entries with HTTP 400");
+  assert(chatHistoryOversized.status === 503, "POST /api/chat-advisor gracefully trims history > 8 entries without 400 error (C1)");
 
   // 5. Smart History & Normalized Matching (G8)
   const pastTxRecord = await Transaction.create({

@@ -96,7 +96,7 @@ const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, d
  *   days: Array<{ date: string, balance: number, items: Array<{ title: string, amount: number }> }>
  * }>}
  */
-const getForecast = async (daysCount = 60, dbTx = null) => {
+const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
   const horizonDays = Math.min(Math.max(parseInt(daysCount, 10) || 60, 1), 365);
   const todayStr = getTodayString();
   const endDateStr = addCalendarDays(todayStr, horizonDays - 1);
@@ -370,6 +370,20 @@ const getForecast = async (daysCount = 60, dbTx = null) => {
         }
       }
       curDue = getNextDueDate(curDue, debt.paymentFrequency || "monthly");
+    }
+  }
+
+  // 4b. Inject hypothetical simulated items (e.g. for simulatePurchase S1)
+  if (Array.isArray(extraItems) && extraItems.length > 0) {
+    for (const item of extraItems) {
+      const d = item.date || todayStr;
+      if (daysMap[d]) {
+        daysMap[d].items.push({
+          title: item.title || "Simulated Item",
+          amount: parseFloat(item.amount) || 0,
+          simulated: true,
+        });
+      }
     }
   }
 

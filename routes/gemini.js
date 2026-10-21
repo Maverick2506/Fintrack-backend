@@ -8,8 +8,8 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { getForecast } = require("../services/forecastService");
 const { getBalancesSummary } = require("../services/netWorthService");
-const { getPaychequeProjection } = require("../services/projectionService");
 const { getCalculatedCheckingBalance } = require("../services/checkingService");
+const { getRegisteredAccountsSummary } = require("../services/registeredAccountService");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { normalizeMerchantName } = require("../utils/merchantNormalizer");
 const {
@@ -78,7 +78,7 @@ async function generateWithRetry(ai, params, maxRetries = 1, delayMs = 1000) {
   }
 }
 
-// Persistent merchant categorization cache in Setting table (G8)
+// Persistent merchant categorization cache in Setting table (G8, m2)
 const SETTING_CAT_CACHE = "ai_category_cache";
 
 const getCachedCategory = async (normName) => {
@@ -107,6 +107,15 @@ const setCachedCategory = async (normName, category) => {
       cache = {};
     }
     cache[normName] = category;
+
+    // Cap cache at 1,000 entries (m2)
+    const keys = Object.keys(cache);
+    if (keys.length > 1000) {
+      for (let i = 0; i < 200; i++) {
+        delete cache[keys[i]];
+      }
+    }
+
     record.value = JSON.stringify(cache);
     await record.save();
   } catch (err) {
@@ -114,7 +123,7 @@ const setCachedCategory = async (normName, category) => {
   }
 };
 
-// Advice cache in Setting table (G15)
+// Advice cache in Setting table (G15, S5)
 const SETTING_LAST_ADVICE = "last_ai_advice";
 
 const getCachedAdvice = async (currentHash) => {
@@ -160,7 +169,7 @@ const setCachedAdvice = async (snapshotHash, advice, structured) => {
 
 router.use(["/financial-advice", "/categorize-expense", "/chat-advisor"], authMiddleware);
 
-// --- 1. STRUCTURED FINANCIAL ADVICE (G1, G2, G3, G4, G5, G6, G7, G10, G14, G15) ---
+// --- 1. STRUCTURED FINANCIAL ADVICE (G1, G2, G3, G4, G5, G6, G7, G10, G14, G15, C3, S5) ---
 router.post(
   "/financial-advice",
   validateBody(schemas.financialAdvice),
@@ -175,7 +184,6 @@ router.post(
 
       const nowZoned = toZonedTime(new Date(), TIMEZONE);
       const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
-      const currentMonthPrefix = todayStr.slice(0, 7);
       const [year, month] = todayStr.split("-").map(Number);
       const startOfMonth = `${year}-${String(month).padStart(2, "0")}-01`;
       const lastDay = new Date(year, month, 0).getDate();
@@ -191,6 +199,7 @@ router.post(
         upcomingBills,
         budgets,
         clearedExpensesList,
+        registeredSummariesList,
       ] = await Promise.all([
         getForecast(60),
         getBalancesSummary(null, todayStr),
@@ -226,6 +235,7 @@ router.post(
           },
           attributes: ["category", "amount"],
         }),
+        getRegisteredAccountsSummary(), // Accurate C3 calculation
       ]);
 
       const clearedIncome = parseFloat(monthIncomeSum || 0);
@@ -272,15 +282,14 @@ router.post(
       const debts = accounts.filter(
         (a) => a.type === "DEBT" && parseFloat(a.initialBalance || 0) > 0 && a.isActive !== false
       );
-      const savingsGoals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
 
-      // Registered Accounts room (G14)
-      const registeredAccounts = savingsGoals.filter((g) => g.registeredType);
-      const registeredSummaries = registeredAccounts.map((g) => {
-        const room = parseFloat(g.contributionRoom || 0);
-        const saved = parseFloat(g.initialBalance || 0);
-        const roomLeft = Math.max(0, room - saved);
-        return `${g.registeredType} (${g.name}): $${saved.toFixed(2)} saved, $${roomLeft.toFixed(2)} room left`;
+      // Registered Accounts room (C3, G14)
+      const registeredDescriptions = registeredSummariesList.map((r) => {
+        return `${r.registeredType} (${r.name}): $${r.contributedThisYear.toFixed(
+          2
+        )} contributed of $${(r.contributionRoom || 0).toFixed(2)} limit ($${(
+          r.roomLeft || 0
+        ).toFixed(2)} room left for ${r.roomYear})`;
       });
 
       // Upcoming bills summary
@@ -289,7 +298,7 @@ router.post(
         0
       );
 
-      // Snapshot hash for caching (G15)
+      // Comprehensive snapshot hash for caching (G15, S5)
       const hashInput = JSON.stringify({
         todayStr,
         checking: balancesSummary.checking,
@@ -298,6 +307,12 @@ router.post(
         clearedIncome,
         clearedSpending,
         upcomingBillsTotal,
+        totalDebt: balancesSummary.debt,
+        totalCC: balancesSummary.cards,
+        totalSavings: balancesSummary.savings,
+        budgets: budgets.map((b) => ({ c: b.category, l: b.monthlyLimit })),
+        debts: debts.map((d) => ({ id: d.id, b: d.initialBalance })),
+        registered: registeredSummariesList.map((r) => ({ id: r.id, room: r.roomLeft })),
       });
       const snapshotHash = crypto.createHash("sha256").update(hashInput).digest("hex");
 
@@ -308,7 +323,7 @@ router.post(
         }
       }
 
-      // Build data-delimited prompt (G10, G14)
+      // Build data-delimited prompt (G10, G14, C3, S3)
       const prompt = `
 You are Maverick's premier personal financial strategist inside FinTrack.
 Analyze this financial snapshot for the current month and deliver high-impact, encouraging, and tactical advice.
@@ -342,7 +357,7 @@ ${
           (c) =>
             `  * ${c.name}: Balance $${parseFloat(c.initialBalance || 0).toFixed(2)} / Limit $${parseFloat(
               c.creditLimit || 0
-            ).toFixed(2)} ${c.interestRate ? `(APR: ${c.interestRate}%)` : ""}`
+            ).toFixed(2)} (APR: ${c.interestRate ? c.interestRate + "%" : "not set"})`
         )
         .join("\n")
     : "  * No credit cards"
@@ -355,15 +370,15 @@ ${
           (d) =>
             `  * ${d.name}: Balance $${parseFloat(d.initialBalance || 0).toFixed(2)}, Min Pay $${parseFloat(
               d.minimumPayment || 0
-            ).toFixed(2)} ${d.interestRate ? `(APR: ${d.interestRate}%)` : ""}`
+            ).toFixed(2)} (APR: ${d.interestRate ? d.interestRate + "%" : "not set"})`
         )
         .join("\n")
     : "  * No active debts"
 }
 Savings & Registered Accounts:
 ${
-  registeredSummaries.length > 0
-    ? registeredSummaries.map((r) => `  * ${r}`).join("\n")
+  registeredDescriptions.length > 0
+    ? registeredDescriptions.map((r) => `  * ${r}`).join("\n")
     : "  * No registered accounts"
 }
 </financial_data>
@@ -441,7 +456,7 @@ INSTRUCTIONS:
   }
 );
 
-// --- 2. SMART AUTO-CATEGORIZATION (G4, G5, G6, G7, G8) ---
+// --- 2. SMART AUTO-CATEGORIZATION (G4, G5, G6, G7, G8, C4, m2) ---
 router.post(
   "/categorize-expense",
   validateBody(schemas.categorizeExpense),
@@ -454,19 +469,31 @@ router.post(
     const normalized = normalizeMerchantName(rawName);
 
     try {
-      // Step 1: User's past transaction history (exact or starts-with match on normalized title) (G8)
+      // Step 1: User's past transaction history (C4 fix)
+      // Only use starts-with match when normalized name is >= 4 chars and contains a space
+      const allowStartsWith = normalized.length >= 4 && normalized.includes(" ");
+      const historyConditions = [
+        sequelize.where(
+          sequelize.fn("LOWER", sequelize.col("title")),
+          rawName.toLowerCase()
+        ),
+        sequelize.where(
+          sequelize.fn("LOWER", sequelize.col("title")),
+          normalized
+        ),
+      ];
+      if (allowStartsWith) {
+        historyConditions.push(
+          sequelize.where(
+            sequelize.fn("LOWER", sequelize.col("title")),
+            { [Op.like]: `${normalized}%` }
+          )
+        );
+      }
+
       const pastTx = await Transaction.findOne({
         where: {
-          [Op.or]: [
-            sequelize.where(
-              sequelize.fn("LOWER", sequelize.col("title")),
-              rawName.toLowerCase()
-            ),
-            sequelize.where(
-              sequelize.fn("LOWER", sequelize.col("title")),
-              { [Op.like]: `${normalized}%` }
-            ),
-          ],
+          [Op.or]: historyConditions,
           category: { [Op.in]: EXPENSE_CATEGORIES },
         },
         order: [["createdAt", "DESC"]],
@@ -546,7 +573,7 @@ Expense: "${rawName}"`;
   }
 );
 
-// --- 3. INTERACTIVE FINANCIAL CHAT ASSISTANT WITH FUNCTION CALLING (G5, G6, G7, G10, G12, G13, G14) ---
+// --- 3. INTERACTIVE FINANCIAL CHAT ASSISTANT WITH MULTI-ROUND FUNCTION CALLING (G5, G6, G7, G10, G12, G13, G14, C2, S1, S3) ---
 
 // Tool Declarations for Gemini Function Calling (G13)
 const simulatePurchaseDeclaration = {
@@ -612,52 +639,59 @@ const getDebtPayoffDeclaration = {
   },
 };
 
-// Tool Execution Handlers
+// Tool Execution Handlers (S1 exact math)
 async function executeTool(name, args, todayStr) {
   if (name === "simulatePurchase") {
     const amount = Math.abs(parseFloat(args.amount) || 0);
     const purchaseDate = args.date || todayStr;
     const accountType = (args.account || "checking").toLowerCase();
 
-    const forecast = await getForecast(60);
-    const currentSafe = forecast.safeToSpend;
-    const currentLowest = forecast.lowestPoint?.balance ?? 0;
-    const buffer = forecast.buffer;
+    const baseline = await getForecast(60);
+    const currentSafe = baseline.safeToSpend;
+    const currentLowest = baseline.lowestPoint?.balance ?? 0;
+    const buffer = baseline.buffer;
 
     if (accountType.includes("credit") || accountType.includes("card")) {
       const cards = await Account.findAll({ where: { type: "CREDIT_CARD" } });
       const totalCC = cards.reduce((sum, c) => sum + parseFloat(c.initialBalance || 0), 0);
+      const targetCard = cards.find((c) =>
+        accountType.includes(c.name.toLowerCase())
+      ) || cards[0];
+      const dueDateNote = targetCard?.dueDate
+        ? `Payment due on ${targetCard.dueDate}.`
+        : "Payment will be due on your next card statement.";
+
       return {
         purchaseAmount: amount,
         account: "credit_card",
+        cardName: targetCard?.name || "Credit Card",
         currentCardBalance: totalCC,
         newCardBalance: totalCC + amount,
-        impactOnCheckingFloat: "None immediately (charged to card). Will need repayment on statement due date.",
+        impactOnCheckingFloat: `Checking Safe to Spend ($${currentSafe.toFixed(
+          2
+        )}) is not reduced today. ${dueDateNote} It will deduct liquid checking cash when you pay the statement balance.`,
         safeToSpend: currentSafe,
       };
     }
 
-    // Checking debit simulation
-    let simulatedLowest = currentLowest;
-    let foundDate = false;
-    for (const d of forecast.days) {
-      if (d.date >= purchaseDate) {
-        foundDate = true;
-        const newBal = d.balance - amount;
-        if (newBal < simulatedLowest) simulatedLowest = newBal;
-      }
-    }
-    if (!foundDate) {
-      simulatedLowest = currentLowest - amount;
-    }
+    // Checking simulation: exact forecast calculation with extra item (S1)
+    const simulated = await getForecast(60, null, [
+      { date: purchaseDate, amount: -amount, title: "Simulated Purchase" },
+    ]);
 
-    const simulatedSafeToSpend = Math.max(0, Math.round((currentSafe - amount) * 100) / 100);
+    const simulatedSafeToSpend = simulated.safeToSpend;
+    const simulatedLowest = simulated.lowestPoint?.balance ?? 0;
     const willDipBelowBuffer = simulatedLowest < buffer;
-    const verdict = willDipBelowBuffer
-      ? "No / High Risk (projected balance dips below emergency buffer)"
-      : simulatedSafeToSpend < 100
-      ? "Caution (tight margin before payday)"
-      : "Yes (affordable within safe float)";
+    const isAfterNextPayday = Boolean(
+      baseline.nextPayday && purchaseDate > baseline.nextPayday
+    );
+
+    let verdict = "Yes (affordable within safe float)";
+    if (willDipBelowBuffer) {
+      verdict = "No / High Risk (projected balance dips below emergency buffer)";
+    } else if (simulatedSafeToSpend < 100) {
+      verdict = "Caution (tight margin remaining before next payday)";
+    }
 
     return {
       purchaseAmount: amount,
@@ -667,7 +701,10 @@ async function executeTool(name, args, todayStr) {
       simulatedSafeToSpend,
       buffer,
       currentLowestPoint: currentLowest,
-      simulatedLowestPoint: Math.round(simulatedLowest * 100) / 100,
+      simulatedLowestPoint: simulatedLowest,
+      simulatedLowestDate: simulated.lowestPoint?.date,
+      nextPayday: baseline.nextPayday,
+      purchaseIsAfterNextPayday: isAfterNextPayday,
       willDipBelowBuffer,
       verdict,
     };
@@ -765,6 +802,7 @@ router.post(
         monthIncome,
         upcomingBills,
         budgets,
+        registeredList,
       ] = await Promise.all([
         getForecast(60),
         Account.findAll({ order: [["type", "ASC"], ["name", "ASC"]] }),
@@ -799,6 +837,7 @@ router.post(
           limit: 10,
         }),
         Budget.findAll(),
+        getRegisteredAccountsSummary(), // Accurate C3
       ]);
 
       const checking = accounts.find((a) => a.type === "CHECKING");
@@ -827,15 +866,19 @@ Month Cleared Income: $${(parseFloat(monthIncome) || 0).toFixed(2)}
 Month Cleared Spending: $${(parseFloat(monthExpenses) || 0).toFixed(2)}
 Credit Cards:
 ${
-  cards.map((c) => `  * ${c.name}: Balance $${parseFloat(c.initialBalance || 0).toFixed(2)} / Limit $${parseFloat(c.creditLimit || 0).toFixed(2)}`).join("\n") || "  None"
+  cards.map((c) => `  * ${c.name}: Balance $${parseFloat(c.initialBalance || 0).toFixed(2)} / Limit $${parseFloat(c.creditLimit || 0).toFixed(2)} (APR: ${c.interestRate ? c.interestRate + "%" : "not set"})`).join("\n") || "  None"
 }
 Debts:
 ${
-  debts.map((d) => `  * ${d.name}: Balance $${parseFloat(d.initialBalance || 0).toFixed(2)}, Min Pay $${parseFloat(d.minimumPayment || 0).toFixed(2)}, APR: ${d.interestRate || "N/A"}%`).join("\n") || "  None"
+  debts.map((d) => `  * ${d.name}: Balance $${parseFloat(d.initialBalance || 0).toFixed(2)}, Min Pay $${parseFloat(d.minimumPayment || 0).toFixed(2)}, APR: ${d.interestRate ? d.interestRate + "%" : "not set"}`).join("\n") || "  None"
 }
 Savings Goals:
 ${
   goals.map((g) => `  * ${g.name}: $${parseFloat(g.initialBalance || 0).toFixed(2)} saved / Target $${parseFloat(g.targetAmount || 0).toFixed(2)}`).join("\n") || "  None"
+}
+Registered Accounts (TFSA/RRSP):
+${
+  registeredList.map((r) => `  * ${r.registeredType} (${r.name}): $${r.contributedThisYear.toFixed(2)} contributed of $${(r.contributionRoom || 0).toFixed(2)} limit ($${(r.roomLeft || 0).toFixed(2)} room left)`).join("\n") || "  None"
 }
 Upcoming Unpaid Bills:
 ${
@@ -857,22 +900,10 @@ BEHAVIOR GUIDELINES:
 4. Format responses using clean GitHub markdown (bold key numbers, concise bullets).
 `;
 
-      const contents = [
-        {
-          role: "user",
-          parts: [{ text: systemPrompt + "\n\nPlease confirm you understand your role." }],
-        },
-        {
-          role: "model",
-          parts: [
-            {
-              text: "Understood! I'm Maverick's personal financial co-pilot with live access to their numbers and mathematical simulation tools. How can I help optimize your money today?",
-            },
-          ],
-        },
-      ];
+      // Build conversation contents (C1 & C2)
+      const contents = [];
 
-      for (const msg of conversationHistory.slice(-8)) {
+      for (const msg of conversationHistory) {
         if (msg.role === "user" || msg.role === "model") {
           contents.push({
             role: msg.role,
@@ -898,46 +929,45 @@ BEHAVIOR GUIDELINES:
         },
       ];
 
-      // Round 1: Generate response or function call (G13)
+      // Multi-round tool calling loop handling parallel calls and multi-turn chains (C2)
       let response = await generateWithRetry(ai, {
         model: models.chat,
         contents,
         config: {
+          systemInstruction: systemPrompt,
           tools: toolsConfig,
           temperature: 0.4,
           abortSignal: AbortSignal.timeout(20000),
         },
       });
 
-      // Handle tool calling loop if model requests tools
-      const functionCalls = response.functionCalls;
-      if (Array.isArray(functionCalls) && functionCalls.length > 0) {
-        // Append model turn with function calls
+      for (let round = 0; round < 3; round++) {
+        const calls = response.functionCalls;
+        if (!Array.isArray(calls) || calls.length === 0) break;
+
+        // Keep model turn with function calls & thought signatures
         if (response.candidates?.[0]?.content) {
           contents.push(response.candidates[0].content);
         }
 
-        // Execute all requested functions
-        for (const call of functionCalls) {
-          const result = await executeTool(call.name, call.args, todayStr);
-          contents.push({
-            role: "user",
-            parts: [
-              {
-                functionResponse: {
-                  name: call.name,
-                  response: { output: result },
-                },
-              },
-            ],
+        // Collect all function responses into ONE user turn (C2)
+        const parts = [];
+        for (const call of calls) {
+          const output = await executeTool(call.name, call.args || {}, todayStr);
+          parts.push({
+            functionResponse: {
+              name: call.name,
+              response: { output },
+            },
           });
         }
+        contents.push({ role: "user", parts });
 
-        // Round 2: Generate final natural language response based on verified arithmetic
         response = await generateWithRetry(ai, {
           model: models.chat,
           contents,
           config: {
+            systemInstruction: systemPrompt,
             tools: toolsConfig,
             temperature: 0.4,
             abortSignal: AbortSignal.timeout(20000),
@@ -945,7 +975,11 @@ BEHAVIOR GUIDELINES:
         });
       }
 
-      res.json({ reply: response.text || "" });
+      const reply =
+        response.text ||
+        "I ran the numbers but couldn't summarize them — please ask again.";
+
+      res.json({ reply });
     } catch (error) {
       if (error.status === 504) {
         return res.status(504).json({ error: error.message });
