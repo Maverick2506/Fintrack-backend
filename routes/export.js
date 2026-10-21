@@ -6,6 +6,16 @@ const { Op } = require("sequelize");
 const { sequelize, Account, Transaction, Setting } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
 const { getPaychequeProjection } = require("../services/projectionService");
+const { feedLimiter } = require("../middleware/rateLimit");
+
+// Helper: Timing-safe token comparison
+const constantTimeCompare = (a, b) => {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+};
 
 const router = express.Router();
 const TIMEZONE = "America/Toronto";
@@ -397,6 +407,8 @@ You have continuous access to Maverick's live FinTrack financial data connected 
 `;
 };
 
+router.use(["/financial-feed.csv", "/financial-feed.md"], feedLimiter);
+
 // --- PUBLIC TOKEN-AUTHENTICATED CSV FEED ---
 router.get("/financial-feed.csv", async (req, res) => {
   const token = req.query.key;
@@ -405,7 +417,7 @@ router.get("/financial-feed.csv", async (req, res) => {
   }
 
   const storedToken = await getOrCreateFeedToken();
-  if (token !== storedToken) {
+  if (!constantTimeCompare(token, storedToken)) {
     return res.status(401).send("Error: Invalid or revoked feed key.");
   }
 
@@ -433,7 +445,7 @@ router.get("/financial-feed.md", async (req, res) => {
   }
 
   const storedToken = await getOrCreateFeedToken();
-  if (token !== storedToken) {
+  if (!constantTimeCompare(token, storedToken)) {
     return res.status(401).send("Error: Invalid or revoked feed key.");
   }
 

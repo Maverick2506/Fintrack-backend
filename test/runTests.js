@@ -4387,6 +4387,189 @@ async function runTestSuite() {
 
 
 
+
+  // --- Suite 32: Gemini Integration Modernization (Phases G1 - G16) ---
+  console.log("\n--- Suite 32: Gemini Integration & Modernized AI Features (Phases G1 - G16) ---");
+
+  // 1. Health check exposes AI status (G5)
+  const healthCheck = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/health",
+    method: "GET",
+  });
+  assert(healthCheck.status === 200, "GET /api/health returns HTTP 200");
+  assert(typeof healthCheck.body.ai === "boolean", "GET /api/health exposes ai boolean flag");
+  assert(healthCheck.body.ai === false, "AI is reported as false when GEMINI_API_KEY is not configured");
+
+  // 2. Missing key returns HTTP 503 instead of 500 (G5)
+  const adviceNoKey = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/financial-advice",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {}
+  );
+  assert(adviceNoKey.status === 503, "POST /api/financial-advice returns HTTP 503 when AI service is not configured");
+  assert(adviceNoKey.body.error === "AI service is not configured.", "Returns clear 503 error message");
+
+  const chatNoKey = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/chat-advisor",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { message: "Can I afford $300?" }
+  );
+  assert(chatNoKey.status === 503, "POST /api/chat-advisor returns HTTP 503 when AI service is not configured");
+
+  // 3. Categorize fallback without API key (G5)
+  const catNoKey = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/categorize-expense",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { name: "Brand New Unique Merchant XYZ" }
+  );
+  assert(catNoKey.status === 200, "POST /api/categorize-expense returns HTTP 200");
+  assert(catNoKey.body.category === "Other", "Defaults to 'Other' when unconfigured and not in history");
+  assert(catNoKey.body.source === "default", "Reports source as default");
+
+  // 4. Input Validation & Capping via Zod (G7)
+  const catEmpty = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/categorize-expense",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { name: "" }
+  );
+  assert(catEmpty.status === 400, "POST /api/categorize-expense rejects empty name with HTTP 400");
+
+  const catOversized = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/categorize-expense",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { name: "A".repeat(101) }
+  );
+  assert(catOversized.status === 400, "POST /api/categorize-expense rejects name > 100 chars with HTTP 400");
+
+  const chatEmpty = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/chat-advisor",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { message: "" }
+  );
+  assert(chatEmpty.status === 400, "POST /api/chat-advisor rejects empty message with HTTP 400");
+
+  const chatOversized = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/chat-advisor",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { message: "A".repeat(2001) }
+  );
+  assert(chatOversized.status === 400, "POST /api/chat-advisor rejects message > 2000 chars with HTTP 400");
+
+  const chatHistoryOversized = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/chat-advisor",
+      method: "POST",
+      headers: authHeaders,
+    },
+    {
+      message: "Hello",
+      history: Array(9).fill({ role: "user", text: "hi" }),
+    }
+  );
+  assert(chatHistoryOversized.status === 400, "POST /api/chat-advisor rejects history > 8 entries with HTTP 400");
+
+  // 5. Smart History & Normalized Matching (G8)
+  const pastTxRecord = await Transaction.create({
+    title: "Tim Hortons",
+    amount: 5.75,
+    type: "EXPENSE",
+    category: "Food & Drink",
+    date: getTorontoToday(),
+    isCleared: true,
+  });
+
+  const catHistoryMatch = await request(
+    {
+      hostname: "localhost",
+      port: 8000,
+      path: "/api/categorize-expense",
+      method: "POST",
+      headers: authHeaders,
+    },
+    { name: "Tim Hortons #4812" }
+  );
+  assert(catHistoryMatch.status === 200, "POST /api/categorize-expense matches normalized history");
+  assert(catHistoryMatch.body.category === "Food & Drink", "Returns matched category 'Food & Drink'");
+  assert(catHistoryMatch.body.source === "history", "Attributes source to history (0ms latency, zero API cost)");
+
+  await pastTxRecord.destroy();
+
+  // 6. Export Feed Key Hardening & Timing-Safe Check (G11)
+  const configRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/gemini-config",
+    method: "GET",
+    headers: authHeaders,
+  });
+  assert(configRes.status === 200, "GET /api/export/gemini-config returns HTTP 200");
+  assert(Boolean(configRes.body.feedKey), "Returns valid feedKey");
+
+  const badFeedRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/financial-feed.csv?key=invalid_feed_key_123",
+    method: "GET",
+  });
+  assert(badFeedRes.status === 401, "GET /api/export/financial-feed.csv rejects invalid key with HTTP 401");
+
+  const goodFeedRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/financial-feed.csv?key=" + configRes.body.feedKey,
+    method: "GET",
+  });
+  assert(goodFeedRes.status === 200, "GET /api/export/financial-feed.csv returns HTTP 200 with valid key");
+  assert(goodFeedRes.headers["content-type"].includes("text/csv"), "Returns text/csv content type");
+
+  const goodMdFeedRes = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: "/api/export/financial-feed.md?key=" + configRes.body.feedKey,
+    method: "GET",
+  });
+  assert(goodMdFeedRes.status === 200, "GET /api/export/financial-feed.md returns HTTP 200 with valid key");
+  assert(goodMdFeedRes.headers["content-type"].includes("text/markdown"), "Returns text/markdown content type");
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

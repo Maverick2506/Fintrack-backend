@@ -20,6 +20,14 @@ const aiLimiter = rateLimit({
   message: { error: "AI rate limit exceeded. Slow down." },
 });
 
+const feedLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: isRelaxed ? 1000 : 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Feed rate limit exceeded. Try again later." },
+});
+
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: isRelaxed ? 2000 : 300,
@@ -28,4 +36,4 @@ const apiLimiter = rateLimit({
   message: { error: "Too many requests. Try again shortly." },
 });
 
-module.exports = { loginLimiter, aiLimiter, apiLimiter };
+module.exports = { loginLimiter, aiLimiter, feedLimiter, apiLimiter };

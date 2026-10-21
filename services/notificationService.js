@@ -2,6 +2,7 @@ const { Account, Transaction, Setting, Budget } = require("../models");
 const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { addCalendarDays, getForecast } = require("./forecastService");
+const { toZonedTime } = require("date-fns-tz");
 
 /**
  * Builds the morning notification digest for ntfy.
@@ -163,6 +164,33 @@ const buildMorningDigest = async (dbTx = null) => {
           sections.push(`  • ${ob.category} has exceeded its monthly limit`);
         }
       }
+    }
+  }
+
+  // 7. Sunday Weekly AI Summary (G16)
+  const torontoNow = toZonedTime(new Date(), "America/Toronto");
+  const isSunday = torontoNow.getDay() === 0;
+  if (isSunday && process.env.GEMINI_API_KEY && sections.length > 0) {
+    try {
+      const { GoogleGenAI } = require("@google/genai");
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      const prompt = `Maverick has received their morning digest with these points:
+${sections.join("\n")}
+Provide a 2-sentence encouraging weekly wrap-up highlighting their top focus for this week. Keep it very punchy and concise. No markdown headers or disclaimers.`;
+      const aiRes = await ai.models.generateContent({
+        model: process.env.GEMINI_MODEL_FAST || "gemini-2.5-flash-lite",
+        contents: prompt,
+        config: {
+          abortSignal: AbortSignal.timeout(6000),
+          temperature: 0.3,
+        },
+      });
+      const summaryText = (aiRes.text || "").trim();
+      if (summaryText) {
+        sections.push(`💡 Weekly Focus: ${summaryText}`);
+      }
+    } catch (err) {
+      console.error("Sunday AI digest summary error:", err.message);
     }
   }
 

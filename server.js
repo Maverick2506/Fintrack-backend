@@ -92,14 +92,16 @@ app.use("/api", apiLimiter);
 // --- HEALTH CHECK ---
 app.get("/api/health", (req, res) => {
   const isProd = process.env.NODE_ENV === "production";
+  const hasAi = Boolean(process.env.GEMINI_API_KEY);
   if (isProd) {
-    return res.json({ status: "ok" });
+    return res.json({ status: "ok", ai: hasAi });
   }
   res.json({
     status: "ok",
     environment: process.env.NODE_ENV || "development",
     dialect: sequelize.getDialect(),
     isProductionDb: Boolean(sequelize.isProductionDb),
+    ai: hasAi,
   });
 });
 

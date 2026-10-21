@@ -201,6 +201,27 @@ const schemas = {
       message: "Monthly limit is required and must be greater than 0",
       path: ["monthlyLimit"],
     }),
+
+  categorizeExpense: z.object({
+    name: z.string().trim().min(1, "Name is required").max(100, "Name must be at most 100 characters"),
+  }),
+
+  chatAdvisor: z.object({
+    message: z.string().trim().min(1, "Message is required").max(2000, "Message is too long (max 2000 characters)"),
+    history: z.array(
+      z.object({
+        role: z.enum(["user", "model"]),
+        text: z.string().max(4000).optional(),
+        content: z.string().max(4000).optional(),
+      })
+    ).max(8).default([]),
+  }),
+
+  financialAdvice: z.object({
+    month: z.coerce.number().int().min(1).max(12).optional(),
+    year: z.coerce.number().int().min(2000).max(2100).optional(),
+    force: z.boolean().optional(),
+  }).passthrough().optional().default({}),
 };
 
 module.exports = {
