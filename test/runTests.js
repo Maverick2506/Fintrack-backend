@@ -1,5 +1,5 @@
 process.env.RELAX_RATE_LIMIT = "true";
-const { Sequelize } = require("sequelize");
+const { Sequelize, Op } = require("sequelize");
 const { Account, Transaction, Setting, Budget, NetWorthSnapshot } = require("../models");
 const { restoreBackup } = require("../scripts/restore");
 const { execSync } = require("child_process");
@@ -9,6 +9,15 @@ const http = require("http");
 const { getBalancesSummary } = require("../services/netWorthService");
 const { getNextOccurrenceDate, getNextDueDate } = require("../routes/recurring");
 const { toZonedTime, format } = require("date-fns-tz");
+const TIMEZONE = "America/Toronto";
+const getTorontoToday = () =>
+  format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", { timeZone: TIMEZONE });
+const getTorontoOffsetDate = (days) => {
+  const [y, m, d] = getTorontoToday().split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+};
+
 
 function request(options, body = null) {
   return new Promise((resolve, reject) => {
@@ -66,6 +75,14 @@ async function runTestSuite() {
     healthRes.status === 200 && healthRes.body.isProductionDb === false,
     "Target server verified running on safe local development database (isolated from live site)"
   );
+  // Reset test database to clean slate for reproducible runs
+  await Transaction.destroy({ where: {} });
+  await Account.destroy({ where: { name: { [Op.ne]: "Primary Checking" } } });
+  await Account.findOrCreate({
+    where: { name: "Primary Checking" },
+    defaults: { type: "CHECKING", initialBalance: 0.0 },
+  });
+
 
   // 1. Auth & Security Tests
   console.log("\n--- Suite 1: Authentication & Security ---");
@@ -91,6 +108,56 @@ async function runTestSuite() {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${token}`,
   };
+  // R1 Safety Guard: Verify all registered routes reject unauthenticated requests
+  const routeAuthRouters = [
+    { prefix: "/api/auth", r: require("../routes/auth") },
+    { prefix: "/api/export", r: require("../routes/export") },
+    { prefix: "/api/cron", r: require("../routes/cron") },
+    { prefix: "/api/recurring", r: require("../routes/recurring") },
+    { prefix: "/api", r: require("../routes/expenses") },
+    { prefix: "/api", r: require("../routes/debts") },
+    { prefix: "/api", r: require("../routes/savingsGoals") },
+    { prefix: "/api", r: require("../routes/dashboard") },
+    { prefix: "/api", r: require("../routes/gemini") },
+    { prefix: "/api", r: require("../routes/creditCards") },
+    { prefix: "/api", r: require("../routes/paycheques") },
+    { prefix: "/api/budgets", r: require("../routes/budgets") },
+    { prefix: "/api/forecast", r: require("../routes/forecast") },
+    { prefix: "/api/settings", r: require("../routes/settings") },
+    { prefix: "/api/net-worth-history", r: require("../routes/netWorthHistory") },
+    { prefix: "/api/subscriptions", r: require("../routes/subscriptions") },
+  ];
+  const publicAllowlist = [
+    /^\/api\/health/,
+    /^\/api\/auth\/login/,
+    /^\/api\/cron/,
+    /^\/api\/digest/,
+    /^\/api\/daily-check/,
+    /^\/api\/export/,
+  ];
+  for (const { prefix, r } of routeAuthRouters) {
+    const stack = r.stack || [];
+    for (const layer of stack) {
+      if (layer.route) {
+        const fullPath = (prefix === "/" ? "" : prefix) + (layer.route.path === "/" ? "" : layer.route.path);
+        if (publicAllowlist.some((re) => re.test(fullPath))) continue;
+        const testPath = fullPath.replace(/:[a-zA-Z_]+/g, "test-id");
+        for (const m of Object.keys(layer.route.methods)) {
+          const res = await request({
+            hostname: "localhost",
+            port: 8000,
+            path: testPath,
+            method: m.toUpperCase() === "_ALL" ? "GET" : m.toUpperCase(),
+          });
+          assert(
+            res.status === 401,
+            `Endpoint ${m.toUpperCase()} ${fullPath} rejects unauthenticated request with HTTP 401`
+          );
+        }
+      }
+    }
+  }
+
 
   // 2. Cron & Schedulers Tests
   console.log("\n--- Suite 2: Cron Jobs & Scheduled Sweeps ---");
@@ -1901,7 +1968,6 @@ async function runTestSuite() {
 
   // Verify atomic concurrency claim mechanism on this row
   const { Setting: DBSetting, Account: DBAccount, sequelize: DBSequelize } = require("../models");
-  const { Op } = require("sequelize");
   const claimKey = `remed_unpaid_transfer_${s16Pre6bTrx.id}`;
   
   // Instance 1 claims
@@ -2413,7 +2479,6 @@ async function runTestSuite() {
   // 19. Hardening: Production Auth Enforcement & Recurring Group Idempotency (Unique Index)
   console.log("\n--- Suite 19: Production Auth Enforcement & Recurring Group Idempotency ---");
   const { assertAuthConfiguration } = require("../config/auth");
-  const { Transaction } = require("../models");
   const { createRecurringExpenses } = require("../routes/recurring");
 
   // 19.1: Verify assertAuthConfiguration in production mode
@@ -3018,15 +3083,9 @@ async function runTestSuite() {
   assert(testCardRes.status === 201, "Creates test card for Phase D with $500 balance");
   const testCardId = testCardRes.body.id;
 
-  const dYesterday = new Date();
-  dYesterday.setDate(dYesterday.getDate() - 1);
-  const yesterdayStr = dYesterday.toISOString().split("T")[0];
-
-  const dFiveDaysAgo = new Date();
-  dFiveDaysAgo.setDate(dFiveDaysAgo.getDate() - 5);
-  const fiveDaysAgoStr = dFiveDaysAgo.toISOString().split("T")[0];
-
-  const todayIso = new Date().toISOString().split("T")[0];
+  const yesterdayStr = getTorontoOffsetDate(-1);
+  const fiveDaysAgoStr = getTorontoOffsetDate(-5);
+  const todayIso = getTorontoToday();
 
   // 1. Past-dated card charge with applyToBalance: true
   const pastAppliedExp = await request({
@@ -3179,10 +3238,7 @@ async function runTestSuite() {
 
   // Determine dates using calendar arithmetic
   const now = new Date();
-  const getOffsetDate = (days) => {
-    const d = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-    return d.toISOString().split("T")[0];
-  };
+  const getOffsetDate = (days) => getTorontoOffsetDate(days);
 
   const day1Str = getOffsetDate(1);
   const day2Str = getOffsetDate(2);
@@ -3394,8 +3450,8 @@ async function runTestSuite() {
   assert(emptyDigestRes.status === 204, "GET /api/cron/digest returns HTTP 204 when there is nothing to report");
 
   // 3. Verify 3-day boundary: Bill on Day 4 is excluded (returns 204), Bill on Day 3 is included (returns 200)
-  const d3Str = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-  const d4Str = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+  const d3Str = getTorontoOffsetDate(3);
+  const d4Str = getTorontoOffsetDate(4);
 
   const billDay4Res = await request({
     hostname: "localhost",
@@ -4052,12 +4108,13 @@ async function runTestSuite() {
   await subCancelPast.destroy();
 
   // Cleanup Suite 30
-  await netflix1.destroy();
-  await netflix2.destroy();
-  await netflix3.destroy();
-  await gym1.destroy();
-  await prime1.destroy();
-  await cancelled1.destroy();
+  await Transaction.destroy({
+    where: {
+      recurringGroupId: {
+        [Op.in]: [netflixGroupId, gymGroupId, primeGroupId, cancelledGroupId, cancelTestGroupId],
+      },
+    },
+  });
   await request({
     hostname: "localhost",
     port: 8000,
