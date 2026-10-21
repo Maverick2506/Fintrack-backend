@@ -54,6 +54,7 @@ Render free instances spin down after 15 minutes of inactivity. To keep the serv
 2. Restore into local development SQLite database:
    ```bash
    node scripts/restore.js backup.json
+   rm backup.json # Delete plaintext financial data after restore
    ```
    If the database already contains records, `--force` is required to overwrite:
    ```bash
@@ -62,14 +63,21 @@ Render free instances spin down after 15 minutes of inactivity. To keep the serv
 3. To restore to remote PostgreSQL (disaster recovery only):
    ```bash
    USE_PRODUCTION_DB=true DATABASE_URL="<connection-string>" node scripts/restore.js backup.json --force --production
+   rm backup.json
    ```
    *(Note: The `--production` flag is strictly required when targeting a remote production database to prevent accidental data erasure).*
 
 ## Continuous Integration & Testing
 
 - Automated GitHub Actions CI workflow (`.github/workflows/ci.yml`) runs on every push and pull request to `main`.
-- Tests run against an isolated local SQLite test database, strictly isolated from production (`isProductionDb` guard).
+- Tests run against an isolated local SQLite test database (`test-database.sqlite`), strictly isolated from production (`isProductionDb` guard) and separated from development data (`local-database.sqlite`).
 - Run tests locally:
+  Start the server in test mode, then run the test runner:
   ```bash
+  # Terminal 1: Start backend in test mode
+  NODE_ENV=test npm start
+
+  # Terminal 2: Run test suite
   npm test
   ```
+  *(Note: Starting the server with `NODE_ENV=test` ensures tests run against `test-database.sqlite`, keeping your `local-database.sqlite` development data completely intact).*

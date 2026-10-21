@@ -82,9 +82,13 @@ async function runTestSuite() {
     console.error("Test execution aborted immediately to protect live production financial records.\n");
     process.exit(1);
   }
+  if (healthRes.body?.environment !== "test") {
+    console.error("\n❌ The server on localhost:8000 is not in test mode. Start it with NODE_ENV=test (uses test-database.sqlite) and re-run.\n");
+    process.exit(1);
+  }
   assert(
-    healthRes.status === 200 && healthRes.body.isProductionDb === false,
-    "Target server verified running on safe local development database (isolated from live site)"
+    healthRes.status === 200 && healthRes.body.isProductionDb === false && healthRes.body.environment === "test",
+    "Target server verified running in test mode on safe test database (test-database.sqlite)"
   );
   // Reset test database to clean slate for reproducible runs
   await sequelize.sync();
