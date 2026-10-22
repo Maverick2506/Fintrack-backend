@@ -1,9 +1,33 @@
+const { Op } = require("sequelize");
 const { Transaction } = require("../models");
 const { getNextOccurrenceDate } = require("../routes/recurring");
 
+// Projects income still to come this month (B8).
+// 1. Uncleared INCOME rows already in the database for the rest of the month (recurring generation
+//    creates these ahead of time) are counted as they are.
+// 2. Only dates after the newest existing INCOME row are extrapolated, so nothing is counted twice.
 const getPaychequeProjection = async (todayStr, currentMonthPrefix, dbTx = null) => {
   let totalProjectedIncome = 0;
-  let projectedPaychequeDates = [];
+  const projectedPaychequeDates = [];
+
+  const [year, month] = currentMonthPrefix.split("-").map(Number);
+  const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  const endOfMonth = `${currentMonthPrefix}-${String(lastDay).padStart(2, "0")}`;
+
+  const upcomingIncome = await Transaction.findAll({
+    where: {
+      type: "INCOME",
+      isCleared: false,
+      date: { [Op.gt]: todayStr, [Op.lte]: endOfMonth },
+    },
+    order: [["date", "ASC"]],
+    transaction: dbTx,
+  });
+
+  for (const row of upcomingIncome) {
+    totalProjectedIncome += parseFloat(row.amount) || 0;
+    projectedPaychequeDates.push(row.date);
+  }
 
   const recentPaycheques = await Transaction.findAll({
     where: { type: "INCOME" },

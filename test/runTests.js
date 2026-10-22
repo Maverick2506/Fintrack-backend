@@ -2432,7 +2432,7 @@ async function runTestSuite() {
     "Auto-pay automatically turns off when debt balance reaches zero"
   );
 
-  // 18b. Editing a TRANSFER to target a DEBT account re-derives type as EXPENSE
+  // 18b. Editing a TRANSFER to target a DEBT account keeps it a TRANSFER (debt payments are transfers, C5)
   const s18Card = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
     { name: "Suite 18 Card", currentBalance: 300.0, creditLimit: 1000.0, dueDate: "2026-11-20" }
@@ -2464,8 +2464,8 @@ async function runTestSuite() {
     }
   );
   assert(
-    s18RetargetDebt.status === 200 && s18RetargetDebt.body.type === "EXPENSE",
-    "Editing transfer to target a DEBT account re-derives type as EXPENSE"
+    s18RetargetDebt.status === 200 && s18RetargetDebt.body.type === "TRANSFER",
+    "Editing transfer to target a DEBT account keeps type TRANSFER"
   );
   assert(
     s18RetargetDebt.body.category === "Debt",
@@ -2500,6 +2500,7 @@ async function runTestSuite() {
   // 19.1: Verify assertAuthConfiguration in production mode
   const origNodeEnv = process.env.NODE_ENV;
   const origPassword = process.env.SUPER_SECRET_PASSWORD;
+  const origJwtSecret = process.env.JWT_SECRET;
 
   try {
     process.env.NODE_ENV = "production";
@@ -2528,15 +2529,67 @@ async function runTestSuite() {
       "assertAuthConfiguration() refuses to start when NODE_ENV is production and SUPER_SECRET_PASSWORD is 'maverick'"
     );
 
-    // With password set in production
+    // Password set but no JWT_SECRET: production must not derive the signing key from the password (C2)
     process.env.SUPER_SECRET_PASSWORD = "test-prod-password-123";
+    delete process.env.JWT_SECRET;
+    let jwtMissingError = null;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      jwtMissingError = err;
+    }
+    assert(
+      jwtMissingError !== null && jwtMissingError.message.includes("JWT_SECRET must be set"),
+      "assertAuthConfiguration() refuses to start in production when JWT_SECRET is unset"
+    );
+
+    process.env.JWT_SECRET = "too-short";
+    let jwtShortError = null;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      jwtShortError = err;
+    }
+    assert(
+      jwtShortError !== null && jwtShortError.message.includes("JWT_SECRET must be set"),
+      "assertAuthConfiguration() refuses to start in production when JWT_SECRET is shorter than 32 characters"
+    );
+
+    // With password and JWT_SECRET set in production
+    process.env.JWT_SECRET = "a".repeat(48);
     let prodSuccess = true;
     try {
       assertAuthConfiguration();
     } catch (err) {
       prodSuccess = false;
     }
-    assert(prodSuccess, "assertAuthConfiguration() succeeds in production when SUPER_SECRET_PASSWORD is provided");
+    assert(prodSuccess, "assertAuthConfiguration() succeeds in production when SUPER_SECRET_PASSWORD and JWT_SECRET are provided");
+
+    // Hashed password in production (C2)
+    const { hashPassword, verifyPassword } = require("../config/auth");
+    delete process.env.SUPER_SECRET_PASSWORD;
+    process.env.SUPER_SECRET_PASSWORD_HASH = hashPassword("hashed-prod-password");
+    let hashSuccess = true;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      hashSuccess = false;
+    }
+    assert(hashSuccess, "assertAuthConfiguration() succeeds in production with SUPER_SECRET_PASSWORD_HASH and no plaintext password");
+    assert(verifyPassword("hashed-prod-password") === true, "verifyPassword() accepts the password matching SUPER_SECRET_PASSWORD_HASH");
+    assert(verifyPassword("wrong-password") === false, "verifyPassword() rejects a password not matching SUPER_SECRET_PASSWORD_HASH");
+
+    process.env.SUPER_SECRET_PASSWORD_HASH = "scrypt$nothex$bad";
+    let malformedError = null;
+    try {
+      assertAuthConfiguration();
+    } catch (err) {
+      malformedError = err;
+    }
+    assert(
+      malformedError !== null && malformedError.message.includes("SUPER_SECRET_PASSWORD_HASH is malformed"),
+      "assertAuthConfiguration() refuses to start in production with a malformed SUPER_SECRET_PASSWORD_HASH"
+    );
   } finally {
     process.env.NODE_ENV = origNodeEnv;
     if (origPassword !== undefined) {
@@ -2544,6 +2597,12 @@ async function runTestSuite() {
     } else {
       delete process.env.SUPER_SECRET_PASSWORD;
     }
+    if (origJwtSecret !== undefined) {
+      process.env.JWT_SECRET = origJwtSecret;
+    } else {
+      delete process.env.JWT_SECRET;
+    }
+    delete process.env.SUPER_SECRET_PASSWORD_HASH;
   }
 
   // 19.2: Unique Index on (recurringGroupId, date) prevents duplicate transactions
@@ -4569,6 +4628,108 @@ async function runTestSuite() {
   });
   assert(goodMdFeedRes.status === 200, "GET /api/export/financial-feed.md returns HTTP 200 with valid key");
   assert(goodMdFeedRes.headers["content-type"].includes("text/markdown"), "Returns text/markdown content type");
+
+  // 33. Code review remediation (C5, B2, B3, B6, B11, B13, B14, B15, B17, S4)
+  console.log("\n--- Suite 33: Code Review Remediation ---");
+  const s33 = (method, path, body = null, headers = authHeaders) =>
+    request({ hostname: "localhost", port: 8000, path, method, headers }, body);
+  const s33Today = getTorontoToday();
+  const [s33Year, s33Month] = s33Today.split("-").map(Number);
+  const s33Spending = async () => {
+    const dash = await s33("GET", `/api/dashboard?year=${s33Year}&month=${s33Month}`);
+    return parseFloat(dash.body.monthlySummary.totalSpending) || 0;
+  };
+
+  // C5: debt payments are TRANSFERs and do not count as spending
+  const s33Debt = await s33("POST", "/api/debts", { name: "Suite 33 Loan", total_amount: 400.0, monthly_payment: 20.0, next_due_date: "2026-12-01" });
+  assert(s33Debt.status === 201, "Creates Suite 33 debt");
+  const s33DebtId = s33Debt.body.id;
+  const s33SpendBefore = await s33Spending();
+  const s33Pay = await s33("POST", `/api/debts/${s33DebtId}/pay`, { amount: 40.0 });
+  assert(s33Pay.status === 200, "Pays $40 toward Suite 33 debt");
+  const s33Ledger = await s33("GET", "/api/expenses/all");
+  const s33PayRow = (s33Ledger.body || []).find((r) => r.name === "Payment for Suite 33 Loan");
+  assert(s33PayRow && s33PayRow.type === "transfer", "Debt payment via /debts/:id/pay is stored as a TRANSFER (C5)");
+  const s33SpendAfter = await s33Spending();
+  assert(Math.abs(s33SpendAfter - s33SpendBefore) < 0.01, "Debt payment does not change monthly totalSpending (C5)");
+
+  const s33LedgerPay = await s33("POST", "/api/expenses", { name: "Loan top-up", amount: 10.0, category: "Debt", targetAccountId: s33DebtId, due_date: s33Today, is_paid: true });
+  assert(s33LedgerPay.status === 201 && s33LedgerPay.body.type === "TRANSFER", "Debt payment via /expenses is stored as a TRANSFER (C5)");
+
+  // Removing the target from a debt payment turns it into ordinary spending
+  const s33Unlink = await s33("PUT", `/api/expenses/${s33LedgerPay.body.id}`, { name: "Groceries", amount: 10.0, category: "Groceries", is_paid: true, targetAccountId: null });
+  assert(s33Unlink.status === 200 && s33Unlink.body.type === "EXPENSE" && s33Unlink.body.toAccountId === null, "Unlinking a debt payment re-derives it as an EXPENSE");
+  await s33("DELETE", `/api/expenses/${s33LedgerPay.body.id}`);
+
+  // B6: explicit "General Debt Expense" (null target) is not re-linked by name
+  const s33General = await s33("POST", "/api/expenses", { name: "Suite 33 Loan", amount: 5.0, category: "Debt", targetAccountId: null, due_date: s33Today, is_paid: true });
+  assert(s33General.status === 201 && s33General.body.toAccountId === null, "Explicit null target on a Debt expense stays unlinked even when the title matches a debt (B6)");
+  const s33Matched = await s33("POST", "/api/expenses", { name: "Suite 33 Loan", amount: 5.0, category: "Debt", due_date: s33Today, is_paid: true });
+  assert(s33Matched.status === 201 && s33Matched.body.toAccountId === s33DebtId, "Omitted target on a Debt expense still links by exact name (quick add)");
+  await s33("DELETE", `/api/expenses/${s33General.body.id}`);
+  await s33("DELETE", `/api/expenses/${s33Matched.body.id}`);
+
+  // B2: the ledger returns tax fields
+  const s33Tax = await s33("POST", "/api/expenses", { name: "Suite 33 Taxed", amount: 100.0, category: "Shopping", due_date: s33Today, is_paid: true, isTaxExclusive: true, taxRate: 13 });
+  assert(s33Tax.status === 201, "Creates tax-exclusive expense");
+  const s33Ledger2 = await s33("GET", "/api/expenses/all");
+  const s33TaxRow = (s33Ledger2.body || []).find((r) => r.id === s33Tax.body.id);
+  assert(
+    s33TaxRow && s33TaxRow.isTaxExclusive === true && s33TaxRow.taxRate === 13 && s33TaxRow.baseAmount === 100 && s33TaxRow.taxApplied === true,
+    "/expenses/all returns isTaxExclusive, taxRate, baseAmount and taxApplied (B2)"
+  );
+  await s33("DELETE", `/api/expenses/${s33Tax.body.id}`);
+
+  // B3: setting a recurring row to "none" stops the series
+  const s33Series = await s33("POST", "/api/expenses", { name: "Suite 33 Streaming", amount: 15.0, category: "Entertainment", due_date: s33Today, is_paid: true, recurrence: "weekly" });
+  assert(s33Series.status === 201 && s33Series.body.recurringGroupId, "Creates weekly recurring series");
+  const s33GroupId = s33Series.body.recurringGroupId;
+  const s33SeriesRows = await Transaction.findAll({ where: { recurringGroupId: s33GroupId } });
+  assert(s33SeriesRows.length > 1, "Recurring generation creates future occurrences for the series");
+  const s33Stop = await s33("PUT", `/api/expenses/${s33Series.body.id}`, { recurrence: "none" });
+  assert(s33Stop.status === 200, "Sets the series' current row to recurrence none");
+  await s33("GET", "/api/recurring/trigger-recurring");
+  const s33AfterStop = await Transaction.findAll({ where: { recurringGroupId: s33GroupId } });
+  assert(
+    s33AfterStop.length === 1 && s33AfterStop.every((t) => t.recurrence === "none"),
+    "Stopping a series removes its unpaid future rows and generation does not recreate them (B3)"
+  );
+  await Transaction.destroy({ where: { recurringGroupId: s33GroupId } });
+
+  // B11: upcoming bills are returned once
+  const s33Dash = await s33("GET", `/api/dashboard?year=${s33Year}&month=${s33Month}`);
+  assert(s33Dash.body.allUpcomingBills === undefined && Array.isArray(s33Dash.body.upcomingBills), "Dashboard returns upcomingBills once (B11)");
+
+  // B13: missing query params are a 400, not a 500
+  const s33NoQuery = await s33("GET", "/api/expenses/monthly");
+  assert(s33NoQuery.status === 400, "GET /expenses/monthly without year/month returns 400 (B13)");
+  const s33WithQuery = await s33("GET", `/api/expenses/monthly?year=${s33Year}&month=${s33Month}`);
+  assert(s33WithQuery.status === 200 && Array.isArray(s33WithQuery.body), "GET /expenses/monthly with year/month still returns 200");
+
+  // B14: non-UUID ids are rejected with 400
+  const s33BadId = await s33("PUT", "/api/expenses/not-a-uuid", { name: "x" });
+  assert(s33BadId.status === 400, "PUT /expenses/:id with a non-UUID id returns 400 (B14)");
+  const s33BadDebtId = await s33("DELETE", "/api/debts/123");
+  assert(s33BadDebtId.status === 400, "DELETE /debts/:id with a non-UUID id returns 400 (B14)");
+  const s33BadTarget = await s33("POST", "/api/expenses", { name: "Bad target", amount: 1, targetAccountId: "abc" });
+  assert(s33BadTarget.status === 400, "POST /expenses with a non-UUID targetAccountId returns 400 (B14)");
+
+  // B15: bulk delete validates its payload
+  const s33BulkBad = await s33("POST", "/api/expenses/bulk-delete", { ids: ["not-a-uuid"] });
+  assert(s33BulkBad.status === 400, "Bulk delete rejects non-UUID ids (B15)");
+  const s33BulkEmpty = await s33("POST", "/api/expenses/bulk-delete", { ids: [] });
+  assert(s33BulkEmpty.status === 400, "Bulk delete rejects an empty id list (B15)");
+
+  // B17: card due date must be YYYY-MM-DD
+  const s33BadCard = await s33("POST", "/api/credit-cards", { name: "Suite 33 Card", creditLimit: 500, dueDate: 15 });
+  assert(s33BadCard.status === 400, "Credit card dueDate as a day number is rejected (B17)");
+
+  // S4: rejected CORS origins get 403, not 500
+  const s33Cors = await s33("GET", "/api/health", null, { Origin: "https://evil.example.com" });
+  assert(s33Cors.status === 403, "Requests from a disallowed CORS origin return 403 (S4)");
+
+  await s33("DELETE", `/api/debts/${s33DebtId}`);
+  await Transaction.destroy({ where: { title: "Payment for Suite 33 Loan" } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

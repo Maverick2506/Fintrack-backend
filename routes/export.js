@@ -77,7 +77,8 @@ const getFinancialData = async () => {
       }),
       Transaction.findAll({
         where: {
-          type: "EXPENSE",
+          // Card and debt payments are TRANSFERs but still leave checking, so include them
+          type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
           isCleared: false,
           date: { [Op.gte]: todayStr },
         },
@@ -504,14 +505,25 @@ function refreshFinTrack() {
 };
 
 // --- JWT-AUTHENTICATED CONFIGURATION ENDPOINT (FOR FINTRACK UI) ---
+// Feed URLs end up in spreadsheets, so production never builds them from request headers (S7)
+const getPublicBaseUrl = (req) => {
+  if (process.env.PUBLIC_BACKEND_URL) {
+    return process.env.PUBLIC_BACKEND_URL.replace(/\/+$/, "");
+  }
+  if (process.env.NODE_ENV === "production") return null;
+  return `${req.protocol}://${req.get("host") || "localhost:8000"}`;
+};
+
+const MISSING_PUBLIC_URL_ERROR =
+  "PUBLIC_BACKEND_URL is not configured on the server, so the feed URL cannot be built.";
+
 router.get("/gemini-config", authMiddleware, async (req, res) => {
   try {
+    const baseUrl = getPublicBaseUrl(req);
+    if (!baseUrl) {
+      return res.status(503).json({ error: MISSING_PUBLIC_URL_ERROR });
+    }
     const feedKey = await getOrCreateFeedToken();
-    const host = req.get("host") || "localhost:8000";
-    const protocol = req.protocol === "https" || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
-    
-    // In production on Render or custom domain, build canonical URL
-    const baseUrl = process.env.PUBLIC_BACKEND_URL || `${protocol}://${host}`;
     const feedUrl = `${baseUrl}/api/export/financial-feed.csv?key=${feedKey}`;
     const sheetFormula = `=IMPORTDATA("${feedUrl}&t=" & TEXT(NOW(), "yyyyMMddhhmm"))`;
 
@@ -538,10 +550,11 @@ router.get("/gemini-config", authMiddleware, async (req, res) => {
 // --- JWT-AUTHENTICATED KEY REGENERATION ---
 router.post("/regenerate-key", authMiddleware, async (req, res) => {
   try {
+    const baseUrl = getPublicBaseUrl(req);
+    if (!baseUrl) {
+      return res.status(503).json({ error: MISSING_PUBLIC_URL_ERROR });
+    }
     const newKey = await regenerateFeedToken();
-    const host = req.get("host") || "localhost:8000";
-    const protocol = req.protocol === "https" || req.headers["x-forwarded-proto"] === "https" ? "https" : "http";
-    const baseUrl = process.env.PUBLIC_BACKEND_URL || `${protocol}://${host}`;
     const feedUrl = `${baseUrl}/api/export/financial-feed.csv?key=${newKey}`;
     const sheetFormula = `=IMPORTDATA("${feedUrl}&t=" & TEXT(NOW(), "yyyyMMddhhmm"))`;
     const appsScript = generateAppsScript(feedUrl);

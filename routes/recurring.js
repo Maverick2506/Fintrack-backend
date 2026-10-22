@@ -225,6 +225,8 @@ const createRecurringExpenses = async (dbTx = null) => {
     console.log("Recurring transactions job finished.");
   } catch (error) {
     console.error("Error creating recurring transactions:", error);
+    // Rethrow so cron endpoints and schedulers report the failure instead of success (B5)
+    throw error;
   }
 };
 

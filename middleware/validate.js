@@ -16,7 +16,38 @@ const validateBody = (schema) => (req, res, next) => {
   next();
 };
 
+const validateQuery = (schema) => (req, res, next) => {
+  const result = schema.safeParse(req.query);
+  if (!result.success) {
+    const details = (result.error.issues || []).map((e) => ({
+      field: e.path.join("."),
+      message: e.message,
+    }));
+    return res.status(400).json({
+      error: "Validation error: invalid query parameters.",
+      details,
+    });
+  }
+  // Express 5 exposes req.query as a getter, so keep parsed values on their own property
+  req.validatedQuery = result.data;
+  next();
+};
+
+// Rejects non-UUID :id params with 400 instead of a database "invalid input syntax for uuid" 500 (B14)
+const validateIdParam = (req, res, next, id) => {
+  if (!z.string().uuid().safeParse(id).success) {
+    return res.status(400).json({ error: "Invalid id: expected a UUID." });
+  }
+  next();
+};
+
 const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+
+// Account references: a UUID, or empty/null to clear (B14)
+const optionalAccountId = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.string().uuid("Invalid account id").nullable().optional()
+);
 
 const optionalNumber = (n) =>
   z.preprocess((v) => (v === "" || v === null ? undefined : v), n.optional());
@@ -34,9 +65,9 @@ const schemas = {
     payment_date: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").optional(),
     category: z.string().trim().max(100).optional(),
     is_paid: z.boolean().optional(),
-    creditCardId: z.union([z.string(), z.number()]).nullable().optional(),
-    targetAccountId: z.union([z.string(), z.number()]).nullable().optional(),
-    toAccountId: z.union([z.string(), z.number()]).nullable().optional(),
+    creditCardId: optionalAccountId,
+    targetAccountId: optionalAccountId,
+    toAccountId: optionalAccountId,
     recurrence: z
       .enum(["none", "weekly", "bi-weekly", "monthly", "yearly"])
       .optional()
@@ -57,9 +88,9 @@ const schemas = {
     payment_date: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").optional(),
     category: z.string().trim().max(100).optional(),
     is_paid: z.boolean().optional(),
-    creditCardId: z.union([z.string(), z.number()]).nullable().optional(),
-    targetAccountId: z.union([z.string(), z.number()]).nullable().optional(),
-    toAccountId: z.union([z.string(), z.number()]).nullable().optional(),
+    creditCardId: optionalAccountId,
+    targetAccountId: optionalAccountId,
+    toAccountId: optionalAccountId,
     recurrence: z
       .enum(["none", "weekly", "bi-weekly", "monthly", "yearly"])
       .optional(),
@@ -91,7 +122,7 @@ const schemas = {
     creditLimit: z.coerce.number().nonnegative("Credit limit cannot be negative"),
     currentBalance: z.coerce.number().optional().default(0),
     initialBalance: z.coerce.number().optional(),
-    dueDate: z.union([z.string(), z.number()]).nullable().optional(),
+    dueDate: optionalDate,
   }),
 
   updateCreditCard: z.object({
@@ -99,7 +130,7 @@ const schemas = {
     creditLimit: z.coerce.number().nonnegative().optional(),
     currentBalance: z.coerce.number().optional(),
     initialBalance: z.coerce.number().optional(),
-    dueDate: z.union([z.string(), z.number()]).nullable().optional(),
+    dueDate: optionalDate,
   }),
 
   createDebt: z.object({
@@ -225,6 +256,17 @@ const schemas = {
       ),
   }),
 
+  bulkDelete: z.object({
+    ids: z.array(z.string().uuid("Invalid transaction id")).min(1, "No transaction IDs provided.").max(500),
+  }),
+
+  monthQuery: z.object({
+    year: z.coerce.number().int().min(2000).max(2100),
+    month: z.coerce.number().int().min(1).max(12),
+    sortBy: z.string().optional(),
+    sortOrder: z.string().optional(),
+  }),
+
   financialAdvice: z.object({
     month: z.coerce.number().int().min(1).max(12).optional(),
     year: z.coerce.number().int().min(2000).max(2100).optional(),
@@ -234,5 +276,7 @@ const schemas = {
 
 module.exports = {
   validateBody,
+  validateQuery,
+  validateIdParam,
   schemas,
 };

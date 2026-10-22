@@ -25,6 +25,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const cron = require("node-cron");
 const { assertAuthConfiguration } = require("./config/auth");
 const { runDailySweep } = require("./services/dailySweepService");
+const { getPrimaryCheckingAccount } = require("./services/checkingService");
 const authRoutes = require("./routes/auth");
 const expenseRoutes = require("./routes/expenses");
 const debtRoutes = require("./routes/debts");
@@ -67,7 +68,9 @@ const corsOptions = {
     if (!origin || allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      callback(new Error("Not allowed by CORS"));
+      const corsError = new Error("Not allowed by CORS");
+      corsError.status = 403;
+      callback(corsError);
     }
   },
   methods: "GET,POST,PUT,DELETE,OPTIONS",
@@ -129,33 +132,44 @@ app.use(notFoundHandler);
 app.use(errorHandler);
 
 // --- Schedulers (Long-lived server environments) ---
-cron.schedule(
-  "0 0 * * *",
-  async () => {
-    try {
-      await runDailySweep();
-    } catch (err) {
-      console.error("Scheduled daily sweep error:", err);
-    }
-  },
-  {
-    timezone: "America/Toronto",
+// The backend is hosted on Render. The nightly GitHub Actions workflow is the primary trigger
+// because the free instance sleeps; node-cron is a backup while the instance is awake.
+// Set ENABLE_IN_PROCESS_CRON=false to rely on the workflow alone. Overlapping runs are safe:
+// the sweep takes a database advisory lock and recurring rows have a unique (group, date) index.
+const startSchedulers = () => {
+  if (process.env.ENABLE_IN_PROCESS_CRON === "false") {
+    console.log("In-process cron disabled (ENABLE_IN_PROCESS_CRON=false).");
+    return;
   }
-);
 
-cron.schedule(
-  "0 1 * * *",
-  async () => {
-    try {
-      await createRecurringExpenses();
-    } catch (err) {
-      console.error("Scheduled recurring generation error:", err);
+  cron.schedule(
+    "0 0 * * *",
+    async () => {
+      try {
+        await runDailySweep();
+      } catch (err) {
+        console.error("Scheduled daily sweep error:", err);
+      }
+    },
+    {
+      timezone: "America/Toronto",
     }
-  },
-  {
-    timezone: "America/Toronto",
-  }
-);
+  );
+
+  cron.schedule(
+    "0 1 * * *",
+    async () => {
+      try {
+        await createRecurringExpenses();
+      } catch (err) {
+        console.error("Scheduled recurring generation error:", err);
+      }
+    },
+    {
+      timezone: "America/Toronto",
+    }
+  );
+};
 
 // --- Initialize Server ---
 async function initialize() {
@@ -585,21 +599,65 @@ async function initialize() {
           value: "true",
         });
       }
+
+      // One-off reclassification (C5): debt payments were stored as EXPENSE and counted as spending,
+      // while card payments were TRANSFERs. Convert existing debt payments to TRANSFER to match.
+      // Balances are unaffected: both types reduce checking and apply the same paydown.
+      const debtTransfersSetting = await Setting.findByPk(
+        "debt_payments_as_transfers_v1"
+      );
+      if (!debtTransfersSetting || debtTransfersSetting.value !== "true") {
+        const debtAccounts = await Account.findAll({
+          where: { type: "DEBT" },
+          attributes: ["id"],
+        });
+        const debtIds = debtAccounts.map((a) => a.id);
+        if (debtIds.length > 0) {
+          const [convertedCount] = await Transaction.update(
+            { type: "TRANSFER" },
+            {
+              where: {
+                type: "EXPENSE",
+                toAccountId: { [Op.in]: debtIds },
+              },
+            }
+          );
+          if (convertedCount > 0) {
+            console.log(
+              `✅ Reclassified ${convertedCount} debt payment transactions from EXPENSE to TRANSFER.`
+            );
+          }
+        }
+        await Setting.upsert({
+          key: "debt_payments_as_transfers_v1",
+          value: "true",
+        });
+      }
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
     }
 
-    await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-    });
-    app.listen(port, () => {
-      console.log(`🚀 Server is running on http://localhost:${port}`);
-    });
+    await getPrimaryCheckingAccount();
   } catch (error) {
-    console.error("❌ Unable to start the server:", error);
-    process.exit(1);
+    console.error("❌ Unable to initialize the server:", error);
+    throw error;
   }
 }
 
-initialize();
+async function start() {
+  try {
+    await initialize();
+  } catch {
+    process.exit(1);
+  }
+  startSchedulers();
+  app.listen(port, () => {
+    console.log(`🚀 Server is running on http://localhost:${port}`);
+  });
+}
+
+if (require.main === module) {
+  start();
+}
+
+module.exports = { app, initialize, start };

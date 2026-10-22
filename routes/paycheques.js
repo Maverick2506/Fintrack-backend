@@ -2,10 +2,11 @@ const express = require("express");
 const { Transaction, Account } = require("../models");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
-const { validateBody, schemas } = require("../middleware/validate");
+const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
 const router = express.Router();
+router.param("id", validateIdParam);
 
 router.use("/paycheques", authMiddleware);
 

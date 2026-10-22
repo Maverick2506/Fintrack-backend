@@ -6,7 +6,20 @@ const { adjustAccountForTransaction } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 
 const TIMEZONE = "America/Toronto";
+// Arbitrary constant shared by every instance so only one sweep runs at a time across processes
+const SWEEP_ADVISORY_LOCK_KEY = 718203941;
 let isLocalSweepRunning = false;
+
+// Postgres: transaction-scoped advisory lock, released on commit or rollback.
+// SQLite (local/test) serializes writers already, so the in-process flag is enough there.
+const tryAcquireSweepLock = async (dbTx) => {
+  if (sequelize.getDialect() !== "postgres") return true;
+  const [rows] = await sequelize.query(
+    "SELECT pg_try_advisory_xact_lock(:key) AS locked",
+    { replacements: { key: SWEEP_ADVISORY_LOCK_KEY }, transaction: dbTx }
+  );
+  return Boolean(rows[0] && rows[0].locked);
+};
 
 const runDailySweep = async () => {
   if (isLocalSweepRunning) {
@@ -18,6 +31,12 @@ const runDailySweep = async () => {
   console.log("Running Daily Sweep (Credit Cards, Bills, & Auto-Pay Debts)...");
   const dbTx = await sequelize.transaction();
   try {
+    if (!(await tryAcquireSweepLock(dbTx))) {
+      await dbTx.rollback();
+      console.log("Daily sweep already executing in another instance. Skipping.");
+      return { skipped: true, reason: "advisory_lock" };
+    }
+
     const nowUtc = new Date();
     const nowZoned = toZonedTime(nowUtc, TIMEZONE);
     const todayString = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
@@ -187,7 +206,7 @@ const runDailySweep = async () => {
             title: `Auto-Pay for ${debt.name}`,
             amount: paymentAmount,
             date: todayString,
-            type: "EXPENSE",
+            type: "TRANSFER",
             category: "Debt",
             isCleared: true,
             balanceApplied: true,

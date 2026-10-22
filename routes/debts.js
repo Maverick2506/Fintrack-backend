@@ -3,9 +3,10 @@ const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
-const { validateBody, schemas } = require("../middleware/validate");
+const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
+router.param("id", validateIdParam);
 
 router.use("/debts", authMiddleware);
 
@@ -119,13 +120,13 @@ router.post(
       });
       await debt.reload({ transaction: dbTx });
 
-      // Record as EXPENSE under "Debt" category so it registers in both Monthly Expenses/Analytics AND Debt paydown
+      // Record as a TRANSFER to the debt (like card payments): it lowers checking and the debt, not spending (C5)
       await Transaction.create(
         {
           title: `Payment for ${debt.name}`,
           amount: paymentAmount,
           date: getTodayString(),
-          type: "EXPENSE",
+          type: "TRANSFER",
           category: "Debt",
           isCleared: true,
           balanceApplied: true,
