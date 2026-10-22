@@ -23,9 +23,9 @@ const TIMEZONE = "America/Toronto";
 
 // Configurable model targets via environment variables (G6)
 const getModels = () => ({
-  advice: process.env.GEMINI_MODEL_ADVICE || "gemini-2.5-flash",
-  chat: process.env.GEMINI_MODEL_CHAT || "gemini-2.5-flash",
-  categorize: process.env.GEMINI_MODEL_FAST || "gemini-2.5-flash-lite",
+  advice: process.env.GEMINI_MODEL_ADVICE || "gemini-3.5-flash",
+  chat: process.env.GEMINI_MODEL_CHAT || "gemini-3.5-flash",
+  categorize: process.env.GEMINI_MODEL_FAST || "gemini-3.5-flash",
 });
 
 // Resilient AI Client factory / singleton
@@ -410,7 +410,6 @@ INSTRUCTIONS:
             },
             required: ["headline", "summary", "tacticalActions"],
           },
-          temperature: 0.4,
           abortSignal: AbortSignal.timeout(20000),
         },
       });
@@ -522,10 +521,16 @@ router.post(
       )}.
 Expense: "${rawName}"`;
 
+      const modelName = models.categorize;
+      const isGemini3 = modelName.includes("3");
+      const thinkingConfig = isGemini3
+        ? { thinkingLevel: "LOW" }
+        : { thinkingBudget: 0 };
+
       const response = await generateWithRetry(
         ai,
         {
-          model: models.categorize,
+          model: modelName,
           contents: prompt,
           config: {
             responseMimeType: "application/json",
@@ -539,7 +544,7 @@ Expense: "${rawName}"`;
               },
               required: ["category"],
             },
-            thinkingConfig: { thinkingBudget: 0 },
+            thinkingConfig,
             abortSignal: AbortSignal.timeout(8000),
           },
         },
@@ -936,7 +941,6 @@ BEHAVIOR GUIDELINES:
         config: {
           systemInstruction: systemPrompt,
           tools: toolsConfig,
-          temperature: 0.4,
           abortSignal: AbortSignal.timeout(20000),
         },
       });
@@ -969,7 +973,6 @@ BEHAVIOR GUIDELINES:
           config: {
             systemInstruction: systemPrompt,
             tools: toolsConfig,
-            temperature: 0.4,
             abortSignal: AbortSignal.timeout(20000),
           },
         });

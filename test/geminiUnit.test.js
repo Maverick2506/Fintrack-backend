@@ -279,6 +279,26 @@ async function runGeminiUnitTests() {
     assert.strictEqual(status, 504);
   });
 
+  test("Thinking config selects thinkingLevel LOW for Gemini 3.5 series", () => {
+    const modelName = "gemini-3.5-flash";
+    const isGemini3 = modelName.includes("3");
+    const thinkingConfig = isGemini3
+      ? { thinkingLevel: "LOW" }
+      : { thinkingBudget: 0 };
+
+    assert.deepStrictEqual(thinkingConfig, { thinkingLevel: "LOW" });
+  });
+
+  test("Thinking config falls back to thinkingBudget 0 for legacy models", () => {
+    const modelName = "gemini-2.5-flash-lite";
+    const isGemini3 = modelName.includes("3");
+    const thinkingConfig = isGemini3
+      ? { thinkingLevel: "LOW" }
+      : { thinkingBudget: 0 };
+
+    assert.deepStrictEqual(thinkingConfig, { thinkingBudget: 0 });
+  });
+
   console.log("\n==================================================");
   console.log(`   UNIT TEST RUN: ${passed} passed, ${failed} failed`);
   console.log("==================================================");

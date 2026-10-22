@@ -178,11 +178,10 @@ const buildMorningDigest = async (dbTx = null) => {
 ${sections.join("\n")}
 Provide a 2-sentence encouraging weekly wrap-up highlighting their top focus for this week. Keep it very punchy and concise. No markdown headers or disclaimers.`;
       const aiRes = await ai.models.generateContent({
-        model: process.env.GEMINI_MODEL_FAST || "gemini-2.5-flash-lite",
+        model: process.env.GEMINI_MODEL_FAST || "gemini-3.5-flash",
         contents: prompt,
         config: {
           abortSignal: AbortSignal.timeout(6000),
-          temperature: 0.3,
         },
       });
       const summaryText = (aiRes.text || "").trim();
