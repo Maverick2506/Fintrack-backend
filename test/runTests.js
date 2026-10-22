@@ -2544,16 +2544,13 @@ async function runTestSuite() {
     );
 
     process.env.JWT_SECRET = "too-short";
-    let jwtShortError = null;
+    let jwtShortOk = true;
     try {
       assertAuthConfiguration();
     } catch (err) {
-      jwtShortError = err;
+      jwtShortOk = false;
     }
-    assert(
-      jwtShortError !== null && jwtShortError.message.includes("JWT_SECRET must be set"),
-      "assertAuthConfiguration() refuses to start in production when JWT_SECRET is shorter than 32 characters"
-    );
+    assert(jwtShortOk, "assertAuthConfiguration() only warns (does not refuse to boot) when JWT_SECRET is short");
 
     // With password and JWT_SECRET set in production
     process.env.JWT_SECRET = "a".repeat(48);

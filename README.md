@@ -9,11 +9,11 @@ The API runs on Render (long-running Node process), the frontend on Vercel, and 
 | Variable | Required in production | Purpose |
 | --- | --- | --- |
 | `DATABASE_URL` | Yes | Neon connection string |
-| `JWT_SECRET` | Yes (boot fails without it) | Random value of at least 32 characters, e.g. `openssl rand -hex 32`. Changing it signs everyone out. |
-| `SUPER_SECRET_PASSWORD_HASH` | One of these two | Login password hash. Generate with `node scripts/hash-password.js "<password>"`. Preferred. |
-| `SUPER_SECRET_PASSWORD` | One of these two | Plaintext login password (legacy; logs a warning). Ignored when the hash is set. |
+| `JWT_SECRET` | Yes (boot fails without it) | Random value, ideally 32+ characters (`openssl rand -hex 32`); shorter values log a warning. Changing it signs everyone out. |
+| `SUPER_SECRET_PASSWORD_HASH` | One of these two | Optional upgrade: login password hash from `node scripts/hash-password.js "<password>"`. |
+| `SUPER_SECRET_PASSWORD` | One of these two | Plaintext login password (still supported; logs a warning). Ignored when the hash is set. |
 | `CRON_SECRET` | Yes | Bearer token for the nightly GitHub Actions workflow |
-| `PUBLIC_BACKEND_URL` | For the Gemini / Sheets feed | e.g. `https://fintrack-backend-rzrh.onrender.com`. Feed URLs are never built from request headers in production. |
+| `PUBLIC_BACKEND_URL` | No | Overrides the feed base URL (defaults to `https://fintrack-backend-rzrh.onrender.com` in production). Feed URLs are never built from request headers in production. |
 | `ENABLE_IN_PROCESS_CRON` | No (default on) | Set to `false` to rely only on the GitHub Actions workflow. Overlapping runs are safe: the sweep takes a Postgres advisory lock. |
 
 ## Cold-Start Pinger (Render Free Tier)

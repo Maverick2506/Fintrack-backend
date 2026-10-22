@@ -92,9 +92,14 @@ const assertAuthConfiguration = () => {
   }
 
   const jwtSecret = process.env.JWT_SECRET;
-  if (!jwtSecret || jwtSecret.length < MIN_JWT_SECRET_LENGTH) {
+  if (!jwtSecret) {
     throw new Error(
-      `❌ FATAL CONFIGURATION ERROR: JWT_SECRET must be set to a random value of at least ${MIN_JWT_SECRET_LENGTH} characters in production. Refusing to derive it from the password.`
+      "❌ FATAL CONFIGURATION ERROR: JWT_SECRET must be set in production. Refusing to derive it from the password."
+    );
+  }
+  if (jwtSecret.length < MIN_JWT_SECRET_LENGTH) {
+    console.warn(
+      `⚠️ JWT_SECRET is shorter than ${MIN_JWT_SECRET_LENGTH} characters. Replace it with a random value (e.g. \`openssl rand -hex 32\`).`
     );
   }
 };

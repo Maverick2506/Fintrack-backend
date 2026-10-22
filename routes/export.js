@@ -505,12 +505,14 @@ function refreshFinTrack() {
 };
 
 // --- JWT-AUTHENTICATED CONFIGURATION ENDPOINT (FOR FINTRACK UI) ---
-// Feed URLs end up in spreadsheets, so production never builds them from request headers (S7)
+// Feed URLs end up in spreadsheets, so production never builds them from request headers (S7).
+// PUBLIC_BACKEND_URL overrides the Render default (e.g. for a custom domain).
+const DEFAULT_PRODUCTION_BACKEND_URL = "https://fintrack-backend-rzrh.onrender.com";
 const getPublicBaseUrl = (req) => {
   if (process.env.PUBLIC_BACKEND_URL) {
     return process.env.PUBLIC_BACKEND_URL.replace(/\/+$/, "");
   }
-  if (process.env.NODE_ENV === "production") return null;
+  if (process.env.NODE_ENV === "production") return DEFAULT_PRODUCTION_BACKEND_URL;
   return `${req.protocol}://${req.get("host") || "localhost:8000"}`;
 };
 
