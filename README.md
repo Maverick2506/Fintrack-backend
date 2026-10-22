@@ -2,6 +2,20 @@
 
 Personal financial tracking API powered by Express, Sequelize (PostgreSQL in production on Render / SQLite in testing/local), and automated scheduled tasks.
 
+## Hosting & Environment Variables
+
+The API runs on Render (long-running Node process), the frontend on Vercel, and PostgreSQL on Neon. Set these on the Render service:
+
+| Variable | Required in production | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | Yes | Neon connection string |
+| `JWT_SECRET` | Yes (boot fails without it) | Random value, ideally 32+ characters (`openssl rand -hex 32`); shorter values log a warning. Changing it signs everyone out. |
+| `SUPER_SECRET_PASSWORD_HASH` | One of these two | Optional upgrade: login password hash from `node scripts/hash-password.js "<password>"`. |
+| `SUPER_SECRET_PASSWORD` | One of these two | Plaintext login password (still supported; logs a warning). Ignored when the hash is set. |
+| `CRON_SECRET` | Yes | Bearer token for the nightly GitHub Actions workflow |
+| `PUBLIC_BACKEND_URL` | No | Overrides the feed base URL (defaults to `https://fintrack-backend-rzrh.onrender.com` in production). Feed URLs are never built from request headers in production. |
+| `ENABLE_IN_PROCESS_CRON` | No (default on) | Set to `false` to rely only on the GitHub Actions workflow. Overlapping runs are safe: the sweep takes a Postgres advisory lock. |
+
 ## Cold-Start Pinger (Render Free Tier)
 
 Render free instances spin down after 15 minutes of inactivity. To keep the service warm during daily waking hours while preserving free-tier monthly hours (~750 hours/month):

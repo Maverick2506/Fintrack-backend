@@ -3,9 +3,10 @@ const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
-const { validateBody, schemas } = require("../middleware/validate");
+const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const router = express.Router();
+router.param("id", validateIdParam);
 
 router.use("/credit-cards", authMiddleware);
 

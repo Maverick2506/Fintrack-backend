@@ -76,7 +76,6 @@ router.get(
       totalIncome,
       totalSpending,
       upcomingBills,
-      allUpcomingBills,
       debtSummary,
       savingsSummaryRaw,
       creditCardSummary,
@@ -109,7 +108,6 @@ router.get(
           date: { [Op.between]: [startOfMonth, cashFlowEndOfMonth] },
         },
       }),
-      upcomingBillsQuery,
       upcomingBillsQuery,
       Account.findAll({
         where: {
@@ -197,7 +195,6 @@ router.get(
         currentBalance: checkingCurrentBalance,
       },
       upcomingBills,
-      allUpcomingBills,
       debtSummary,
       savingsSummary,
       creditCardSummary,

@@ -4,7 +4,7 @@ const { sequelize, Transaction, Account } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
-const { validateBody, schemas } = require("../middleware/validate");
+const { validateBody, validateQuery, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
 const {
@@ -13,6 +13,7 @@ const {
   TIMEZONE,
 } = require("../services/accountBalanceService");
 const router = express.Router();
+router.param("id", validateIdParam);
 
 router.use("/expenses", authMiddleware);
 
@@ -73,8 +74,9 @@ const resolvePaydownTargetId = async (
 // Map old "monthly expenses" API shape
 router.get(
   "/expenses/monthly",
+  validateQuery(schemas.monthQuery),
   asyncHandler(async (req, res) => {
-    const { year, month, sortBy = "date", sortOrder = "ASC" } = req.query;
+    const { year, month, sortBy = "date", sortOrder = "ASC" } = req.validatedQuery;
     const { startDate, endDate } = getMonthDateRange(year, month);
 
     const allowedSortBy = ["date", "title", "amount"];
@@ -176,6 +178,13 @@ router.get(
       is_paid: t.isCleared,
       balanceApplied: Boolean(t.balanceApplied),
       recurrence: t.recurrence || "none",
+      recurringGroupId: t.recurringGroupId || null,
+      // Tax fields so editing from the Ledger keeps the tax setting and pre-tax amount (B2)
+      isTaxExclusive: Boolean(t.isTaxExclusive),
+      taxRate: t.taxRate !== null && t.taxRate !== undefined ? parseFloat(t.taxRate) : null,
+      baseAmount:
+        t.baseAmount !== null && t.baseAmount !== undefined ? parseFloat(t.baseAmount) : null,
+      taxApplied: Boolean(t.taxApplied),
       creditCardId:
         t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
           ? t.fromAccount.id
@@ -217,13 +226,21 @@ router.post(
         transaction: dbTx,
       });
 
-      // Resolve whether this expense pays down a specific Debt or Credit Card
-      const resolvedToAccountId = await resolvePaydownTargetId(
-        targetAccountId || toAccountId,
-        finalCategory,
-        name,
-        dbTx
-      );
+      // Resolve whether this expense pays down a specific Debt or Credit Card.
+      // Name matching only runs when the client sent no target field at all (e.g. quick add);
+      // an explicit null means the user chose "General Debt Expense" (B6).
+      const targetFieldSent =
+        targetAccountId !== undefined || toAccountId !== undefined;
+      const explicitTargetId = targetAccountId || toAccountId || null;
+      const resolvedToAccountId =
+        targetFieldSent && !explicitTargetId
+          ? null
+          : await resolvePaydownTargetId(
+              explicitTargetId,
+              finalCategory,
+              name,
+              dbTx
+            );
 
       let targetAccount = null;
       if (resolvedToAccountId) {
@@ -262,10 +279,13 @@ router.post(
         taxApplied = true;
       }
 
-      // If paying toward a credit card, treat as a TRANSFER so card purchases are not double-counted
+      // Payments toward a credit card or debt are TRANSFERs: they move money to an account you owe,
+      // so they are not spending (C5). Card purchases are already counted when charged.
       const isCreditCardPayment =
         targetAccount && targetAccount.type === "CREDIT_CARD";
-      const trxType = isCreditCardPayment ? "TRANSFER" : "EXPENSE";
+      const isDebtPayment = targetAccount && targetAccount.type === "DEBT";
+      const trxType =
+        isCreditCardPayment || isDebtPayment ? "TRANSFER" : "EXPENSE";
       const trxCategory =
         isCreditCardPayment && finalCategory === "Debt"
           ? "Credit Card Payment"
@@ -390,19 +410,15 @@ router.put(
         );
       } else if (hasExplicitTarget && !explicitTarget) {
         if (nextCategory === "Debt") {
-          nextToAccountId = await resolvePaydownTargetId(
-            null,
-            nextCategory,
-            nextTitle,
-            dbTx
-          );
+          // User explicitly chose "General Debt Expense": do not re-link by name (B6)
+          nextToAccountId = null;
         } else if (
           ["Credit Card Payment", "Savings Transfer", "Savings"].includes(
             nextCategory
           ) ||
-          trx.type === "TRANSFER"
+          (trx.type === "TRANSFER" && nextCategory === trx.category)
         ) {
-          // Preserve existing toAccountId for transfers and savings/card payments when target is unset
+          // Preserve existing toAccountId for savings/card payments, and for transfers whose category is unchanged, when target is unset
           nextToAccountId = trx.toAccountId;
         } else {
           nextToAccountId = null;
@@ -427,13 +443,27 @@ router.put(
         targetAccount && targetAccount.type === "CREDIT_CARD";
       const isDebtPayment =
         targetAccount && targetAccount.type === "DEBT";
-      const nextType = isCreditCardPayment
-        ? "TRANSFER"
-        : isDebtPayment
-        ? "EXPENSE"
-        : req.body.type
-        ? String(req.body.type).toUpperCase()
-        : trx.type;
+
+      // A former card/debt payment that no longer targets any account becomes ordinary spending.
+      // Other transfers (e.g. savings contributions) keep their type (C4).
+      let wasPaydown = false;
+      if (trx.type === "TRANSFER" && trx.toAccountId && !nextToAccountId) {
+        const prevTarget = await Account.findByPk(trx.toAccountId, {
+          transaction: dbTx,
+        });
+        wasPaydown = Boolean(
+          prevTarget && ["CREDIT_CARD", "DEBT"].includes(prevTarget.type)
+        );
+      }
+
+      const nextType =
+        isCreditCardPayment || isDebtPayment
+          ? "TRANSFER"
+          : req.body.type
+          ? String(req.body.type).toUpperCase()
+          : wasPaydown
+          ? "EXPENSE"
+          : trx.type;
 
       const nextIsCleared =
         req.body.is_paid !== undefined
@@ -511,6 +541,7 @@ router.put(
         nextRecurringGroupId = null;
       }
 
+      const prevRecurrence = trx.recurrence;
       await trx.update(
         {
           title: nextTitle,
@@ -534,6 +565,62 @@ router.put(
         { transaction: dbTx }
       );
 
+      // Stopping a recurring series (B3): the generator follows the newest row of a series, which is
+      // usually an already-generated future row. When the *current* occurrence (the newest row dated
+      // today or earlier, or the first row if none has come due) is set to "none", the series ends:
+      // its unpaid rows after this one are removed and the rest marked non-recurring. Setting any
+      // other occurrence to "none" changes only that row; it keeps its series id so generation
+      // does not recreate it.
+      let seriesEnded = false;
+      let removedUpcomingCount = 0;
+      const wasRecurring = prevRecurrence && prevRecurrence !== "none";
+      if (wasRecurring && nextRecurrence === "none" && nextRecurringGroupId) {
+        const todayStr = getTodayString();
+        const currentOccurrence =
+          (await Transaction.findOne({
+            where: {
+              recurringGroupId: nextRecurringGroupId,
+              date: { [Op.lte]: todayStr },
+            },
+            order: [
+              ["date", "DESC"],
+              ["createdAt", "DESC"],
+            ],
+            transaction: dbTx,
+          })) ||
+          (await Transaction.findOne({
+            where: { recurringGroupId: nextRecurringGroupId },
+            order: [
+              ["date", "ASC"],
+              ["createdAt", "ASC"],
+            ],
+            transaction: dbTx,
+          }));
+
+        if (currentOccurrence && currentOccurrence.id === trx.id) {
+          seriesEnded = true;
+          removedUpcomingCount = await Transaction.destroy({
+            where: {
+              recurringGroupId: nextRecurringGroupId,
+              id: { [Op.ne]: trx.id },
+              isCleared: false,
+              date: { [Op.gt]: trx.date },
+            },
+            transaction: dbTx,
+          });
+          await Transaction.update(
+            { recurrence: "none" },
+            {
+              where: {
+                recurringGroupId: nextRecurringGroupId,
+                id: { [Op.ne]: trx.id },
+              },
+              transaction: dbTx,
+            }
+          );
+        }
+      }
+
       // Apply updated transaction's effect on linked account, preserving applied status if it had already been applied
       // or if transitioning from unpaid to paid (e.g. overdue bill paid manually)
       await adjustAccountForTransaction(
@@ -550,7 +637,7 @@ router.put(
       }
 
       await dbTx.commit();
-      res.json(trx);
+      res.json({ ...trx.toJSON(), seriesEnded, removedUpcomingCount });
     } catch (error) {
       await dbTx.rollback();
       throw error;
@@ -560,14 +647,11 @@ router.put(
 
 router.post(
   "/expenses/bulk-delete",
+  validateBody(schemas.bulkDelete),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     try {
       const { ids } = req.body;
-      if (!Array.isArray(ids) || ids.length === 0) {
-        await dbTx.rollback();
-        return res.status(400).json({ error: "No transaction IDs provided." });
-      }
 
       const toDelete = await Transaction.findAll({
         where: { id: { [Op.in]: ids } },
