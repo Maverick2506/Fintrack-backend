@@ -17,6 +17,7 @@ const { normalizeMerchantName } = require("../utils/merchantNormalizer");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { simulate, comparePlans } = require("../services/debtPayoffService");
 const { schemas } = require("../middleware/validate");
+const { ThinkingLevel } = require("@google/genai");
 
 async function runGeminiUnitTests() {
   console.log("==================================================");
@@ -279,21 +280,30 @@ async function runGeminiUnitTests() {
     assert.strictEqual(status, 504);
   });
 
-  test("Thinking config selects thinkingLevel LOW for Gemini 3.5 series", () => {
-    const modelName = "gemini-3.5-flash";
-    const isGemini3 = modelName.includes("3");
-    const thinkingConfig = isGemini3
-      ? { thinkingLevel: "LOW" }
+  test("Thinking config selects ThinkingLevel.MINIMAL for Gemini 3.5 and future models (T1, m1)", () => {
+    const usesThinkingLevel = (m) => !/^gemini-(1|2)\./.test(m);
+    
+    // 3.5 model
+    assert.strictEqual(usesThinkingLevel("gemini-3.5-flash"), true);
+    // Future 4.x model
+    assert.strictEqual(usesThinkingLevel("gemini-4-flash"), true);
+
+    const thinkingConfig = usesThinkingLevel("gemini-3.5-flash")
+      ? { thinkingLevel: ThinkingLevel.MINIMAL }
       : { thinkingBudget: 0 };
 
-    assert.deepStrictEqual(thinkingConfig, { thinkingLevel: "LOW" });
+    assert.deepStrictEqual(thinkingConfig, { thinkingLevel: "MINIMAL" });
   });
 
-  test("Thinking config falls back to thinkingBudget 0 for legacy models", () => {
-    const modelName = "gemini-2.5-flash-lite";
-    const isGemini3 = modelName.includes("3");
-    const thinkingConfig = isGemini3
-      ? { thinkingLevel: "LOW" }
+  test("Thinking config falls back to thinkingBudget 0 for legacy 1.x and 2.x models including 003 releases (m1)", () => {
+    const usesThinkingLevel = (m) => !/^gemini-(1|2)\./.test(m);
+
+    assert.strictEqual(usesThinkingLevel("gemini-2.5-flash-lite"), false);
+    assert.strictEqual(usesThinkingLevel("gemini-2.5-flash-003"), false);
+    assert.strictEqual(usesThinkingLevel("gemini-1.5-pro"), false);
+
+    const thinkingConfig = usesThinkingLevel("gemini-2.5-flash-003")
+      ? { thinkingLevel: ThinkingLevel.MINIMAL }
       : { thinkingBudget: 0 };
 
     assert.deepStrictEqual(thinkingConfig, { thinkingBudget: 0 });

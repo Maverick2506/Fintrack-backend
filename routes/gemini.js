@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { GoogleGenAI, Type } = require("@google/genai");
+const { GoogleGenAI, Type, ThinkingLevel } = require("@google/genai");
 const { sequelize, Transaction, Account, Setting, Budget } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
@@ -20,6 +20,9 @@ const {
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
+
+// Helper to detect if model uses ThinkingLevel (Gemini 3+) or legacy thinkingBudget (Gemini 1/2) (m1)
+const usesThinkingLevel = (model) => !/^gemini-(1|2)\./.test(model);
 
 // Configurable model targets via environment variables (G6)
 const getModels = () => ({
@@ -522,9 +525,8 @@ router.post(
 Expense: "${rawName}"`;
 
       const modelName = models.categorize;
-      const isGemini3 = modelName.includes("3");
-      const thinkingConfig = isGemini3
-        ? { thinkingLevel: "LOW" }
+      const thinkingConfig = usesThinkingLevel(modelName)
+        ? { thinkingLevel: ThinkingLevel.MINIMAL }
         : { thinkingBudget: 0 };
 
       const response = await generateWithRetry(
