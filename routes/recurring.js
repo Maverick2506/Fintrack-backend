@@ -10,7 +10,9 @@ const router = express.Router();
 const TIMEZONE = "America/Toronto";
 
 // Pure calendar recurrence calculation helper (pure YYYY-MM-DD arithmetic, completely immune to server timezone or DST boundaries)
-const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1) => {
+// anchorDay (monthly/yearly only) is the day of month the series is meant to fall on, so a date clamped
+// to a short month (Jan 31 -> Feb 28) returns to the 31st afterwards instead of drifting (N4).
+const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1, anchorDay = null) => {
   if (!baseDateStr) return null;
   const parts = String(baseDateStr).split("T")[0].split("-").map(Number);
   if (parts.length !== 3 || parts.some(isNaN)) return null;
@@ -38,7 +40,7 @@ const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1) => {
       const targetYear = Math.floor(totalMonths / 12);
       const targetMonth = (totalMonths % 12) + 1; // 1-indexed
       const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
-      const targetDay = Math.min(baseDay, daysInTargetMonth);
+      const targetDay = Math.min(anchorDay || baseDay, daysInTargetMonth);
       const mm = String(targetMonth).padStart(2, "0");
       const dd = String(targetDay).padStart(2, "0");
       return `${targetYear}-${mm}-${dd}`;
@@ -46,7 +48,7 @@ const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1) => {
     case "yearly": {
       const targetYear = baseYear + step;
       const daysInTargetMonth = new Date(Date.UTC(targetYear, baseMonth, 0)).getUTCDate();
-      const targetDay = Math.min(baseDay, daysInTargetMonth);
+      const targetDay = Math.min(anchorDay || baseDay, daysInTargetMonth);
       const mm = String(baseMonth).padStart(2, "0");
       const dd = String(targetDay).padStart(2, "0");
       return `${targetYear}-${mm}-${dd}`;
@@ -54,6 +56,18 @@ const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1) => {
     default:
       return null;
   }
+};
+
+// Day of month a series is meant to land on. The newest row's day is used, unless that row sits on the
+// last day of its month and an earlier row of the series has a later day, i.e. the newest date was
+// clamped to a short month. A user who moved the series to another day keeps the new day.
+const getSeriesAnchorDay = (newestDateStr, earliestDateStr) => {
+  if (!newestDateStr) return null;
+  const [y, m, d] = String(newestDateStr).split("T")[0].split("-").map(Number);
+  if (!earliestDateStr) return d;
+  const earliestDay = Number(String(earliestDateStr).split("T")[0].split("-")[2]);
+  const lastDayOfMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return d === lastDayOfMonth && earliestDay > d ? earliestDay : d;
 };
 
 const getNextDueDate = (currentDate, recurrence) => {
@@ -93,6 +107,7 @@ const createRecurringExpenses = async (dbTx = null) => {
     });
 
     const latestOccurrences = {};
+    const earliestDates = {};
     for (const trx of allTransactions) {
       const key = trx.recurringGroupId
         ? `series:${trx.recurringGroupId}`
@@ -100,9 +115,11 @@ const createRecurringExpenses = async (dbTx = null) => {
       if (!latestOccurrences[key]) {
         latestOccurrences[key] = trx;
       }
+      // Rows are newest first, so the last one seen is the earliest
+      earliestDates[key] = trx.date;
     }
 
-    for (const baseTrx of Object.values(latestOccurrences)) {
+    for (const [seriesKey, baseTrx] of Object.entries(latestOccurrences)) {
       if (
         !baseTrx.recurrence ||
         !["weekly", "bi-weekly", "monthly", "yearly"].includes(
@@ -112,12 +129,14 @@ const createRecurringExpenses = async (dbTx = null) => {
         continue;
       }
 
+      const anchorDay = getSeriesAnchorDay(baseTrx.date, earliestDates[seriesKey]);
       let step = 1;
       while (true) {
         const nextDateStr = getNextOccurrenceDate(
           baseTrx.date,
           baseTrx.recurrence,
-          step
+          step,
+          anchorDay
         );
         if (!nextDateStr || nextDateStr > horizonString) {
           break;
@@ -181,6 +200,8 @@ const createRecurringExpenses = async (dbTx = null) => {
             balanceApplied: false,
             date: nextDateStr,
             recurringGroupId: seriesId,
+            // clientRef is unique (Quick Add idempotency); copying it made every insert fail as a "duplicate" (N1)
+            clientRef: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           };
@@ -240,4 +261,5 @@ module.exports = {
   createRecurringExpenses,
   getNextDueDate,
   getNextOccurrenceDate,
+  getSeriesAnchorDay,
 };

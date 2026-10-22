@@ -3,7 +3,7 @@ const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
-const { getNextOccurrenceDate, getNextDueDate } = require("../routes/recurring");
+const { getNextOccurrenceDate, getNextDueDate, getSeriesAnchorDay } = require("../routes/recurring");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
 const addCalendarDays = (baseDateStr, daysToAdd) => {
@@ -244,6 +244,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
   });
 
   const latestSeriesMap = {};
+  const earliestSeriesDates = {};
   for (const t of recurringTrxs) {
     const key = t.recurringGroupId
       ? `group:${t.recurringGroupId}`
@@ -251,15 +252,17 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
     if (!latestSeriesMap[key]) {
       latestSeriesMap[key] = t;
     }
+    earliestSeriesDates[key] = t.date;
   }
 
   for (const key of Object.keys(latestSeriesMap)) {
     const latest = latestSeriesMap[key];
     if (!latest.recurrence || latest.recurrence === "none") continue;
 
+    const anchorDay = getSeriesAnchorDay(latest.date, earliestSeriesDates[key]);
     let curDate = latest.date;
     while (true) {
-      const nextDate = getNextOccurrenceDate(curDate, latest.recurrence, 1);
+      const nextDate = getNextOccurrenceDate(curDate, latest.recurrence, 1, anchorDay);
       if (!nextDate || nextDate > endDateStr) break;
       curDate = nextDate;
 

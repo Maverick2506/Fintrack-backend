@@ -4743,6 +4743,64 @@ async function runTestSuite() {
   await s33("DELETE", `/api/debts/${s33DebtId}`);
   await Transaction.destroy({ where: { title: "Payment for Suite 33 Loan" } });
 
+  // 34. Post-merge review fixes (N1, N4)
+  console.log("\n--- Suite 34: Post-merge Review Fixes ---");
+  const s34Today = getTorontoToday();
+  // Started 10 days ago so next month's date falls inside the 30-day generation horizon
+  const s34Start = getTorontoOffsetDate(-10);
+  const s34NextMonth = getNextOccurrenceDate(s34Start, "monthly", 1);
+
+  // N1: a Quick Add row (with clientRef) that is later made recurring still generates
+  const s34Quick = await s33("POST", "/api/expenses", {
+    name: "Suite 34 Quick Gym", amount: 40, due_date: s34Start, category: "Other", is_paid: true,
+    recurrence: "none", clientRef: "7d8c1c1e-3a43-4b8e-9a51-0f2b1e9f5a34",
+  });
+  assert(s34Quick.status === 201, "Creates a Quick Add expense with a clientRef");
+  const s34QuickPut = await s33("PUT", `/api/expenses/${s34Quick.body.id}`, { recurrence: "monthly" });
+  assert(s34QuickPut.status === 200, "Makes the Quick Add expense monthly");
+  const s34QuickRows = await Transaction.findAll({ where: { recurringGroupId: s34QuickPut.body.recurringGroupId } });
+  const s34QuickNext = s34QuickRows.find((t) => t.date === s34NextMonth);
+  assert(s34QuickNext, "Next month's occurrence is generated for a series that started from Quick Add (N1)");
+  assert(s34QuickNext && s34QuickNext.clientRef === null, "Generated occurrence does not copy the original clientRef (N1)");
+  await Transaction.destroy({ where: { recurringGroupId: s34QuickPut.body.recurringGroupId } });
+
+  const s34Income = await s33("POST", "/api/paycheques", {
+    name: "Suite 34 Quick Income", amount: 100, payment_date: s34Start, recurrence: "none",
+    clientRef: "7d8c1c1e-3a43-4b8e-9a51-0f2b1e9f5a35",
+  });
+  assert(s34Income.status === 201, "Creates a Quick Add income with a clientRef");
+  const s34IncomePut = await s33("PUT", `/api/expenses/${s34Income.body.id}`, { recurrence: "monthly", payment_date: s34Start });
+  const s34IncomeRows = await Transaction.findAll({ where: { recurringGroupId: s34IncomePut.body.recurringGroupId } });
+  assert(s34IncomeRows.some((t) => t.date === s34NextMonth), "Quick Add income made monthly generates next month's paycheque (N1)");
+  await Transaction.destroy({ where: { recurringGroupId: s34IncomePut.body.recurringGroupId } });
+
+  // N4: month-end dates come back after a short month instead of drifting to the clamped day
+  assert(getNextOccurrenceDate("2026-02-28", "monthly", 1, 31) === "2026-03-31", "Monthly step with anchor day 31 returns from Feb 28 to Mar 31 (N4)");
+  assert(getNextOccurrenceDate("2026-01-31", "monthly", 1, 31) === "2026-02-28", "Monthly step with anchor day 31 still clamps to Feb 28 (N4)");
+  assert(getNextOccurrenceDate("2028-02-29", "yearly", 1) === "2029-02-28", "Yearly step clamps Feb 29 to Feb 28");
+  const { getSeriesAnchorDay } = require("../routes/recurring");
+  assert(getSeriesAnchorDay("2026-02-28", "2026-01-31") === 31, "A clamped month-end date keeps the series' original day (N4)");
+  assert(getSeriesAnchorDay("2026-03-15", "2026-01-31") === 15, "A series moved to another day keeps the new day (N4)");
+  assert(getSeriesAnchorDay("2026-03-31", null) === 31, "A single-row series uses its own day");
+
+  // Integration: a series on the 31st whose newest row was clamped to a 30-day month
+  const s34GroupId = "4b0b5f2e-6c1d-4a8e-9f3a-2d7c8e9f0a34";
+  const s34Clamped = getNextOccurrenceDate(s34Today, "monthly", -1, 31); // last month, on its last day or the 31st
+  const s34Earliest = getNextOccurrenceDate(s34Today, "monthly", -2, 31);
+  const s34Expected = getNextOccurrenceDate(s34Clamped, "monthly", 1, 31);
+  await Transaction.bulkCreate([
+    { title: "Suite 34 Month End Rent", amount: 10, date: s34Earliest, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34GroupId },
+    { title: "Suite 34 Month End Rent", amount: 10, date: s34Clamped, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34GroupId },
+  ]);
+  await s33("GET", "/api/recurring/trigger-recurring");
+  const s34RentRows = await Transaction.findAll({ where: { recurringGroupId: s34GroupId }, order: [["date", "ASC"]] });
+  const s34Generated = s34RentRows.filter((t) => t.date > s34Clamped).map((t) => t.date);
+  assert(
+    s34Generated.length > 0 && s34Generated[0] === s34Expected,
+    `Month-end series generates ${s34Expected} after ${s34Clamped} (N4), got ${s34Generated[0]}`
+  );
+  await Transaction.destroy({ where: { recurringGroupId: s34GroupId } });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
