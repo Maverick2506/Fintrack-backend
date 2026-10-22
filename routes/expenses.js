@@ -566,29 +566,59 @@ router.put(
       );
 
       // Stopping a recurring series (B3): the generator follows the newest row of a series, which is
-      // usually an already-generated future row. Remove the series' unpaid rows after this one and
-      // mark the rest non-recurring so the series ends here.
+      // usually an already-generated future row. When the *current* occurrence (the newest row dated
+      // today or earlier, or the first row if none has come due) is set to "none", the series ends:
+      // its unpaid rows after this one are removed and the rest marked non-recurring. Setting any
+      // other occurrence to "none" changes only that row; it keeps its series id so generation
+      // does not recreate it.
+      let seriesEnded = false;
+      let removedUpcomingCount = 0;
       const wasRecurring = prevRecurrence && prevRecurrence !== "none";
       if (wasRecurring && nextRecurrence === "none" && nextRecurringGroupId) {
-        await Transaction.destroy({
-          where: {
-            recurringGroupId: nextRecurringGroupId,
-            id: { [Op.ne]: trx.id },
-            isCleared: false,
-            date: { [Op.gt]: trx.date },
-          },
-          transaction: dbTx,
-        });
-        await Transaction.update(
-          { recurrence: "none" },
-          {
+        const todayStr = getTodayString();
+        const currentOccurrence =
+          (await Transaction.findOne({
+            where: {
+              recurringGroupId: nextRecurringGroupId,
+              date: { [Op.lte]: todayStr },
+            },
+            order: [
+              ["date", "DESC"],
+              ["createdAt", "DESC"],
+            ],
+            transaction: dbTx,
+          })) ||
+          (await Transaction.findOne({
+            where: { recurringGroupId: nextRecurringGroupId },
+            order: [
+              ["date", "ASC"],
+              ["createdAt", "ASC"],
+            ],
+            transaction: dbTx,
+          }));
+
+        if (currentOccurrence && currentOccurrence.id === trx.id) {
+          seriesEnded = true;
+          removedUpcomingCount = await Transaction.destroy({
             where: {
               recurringGroupId: nextRecurringGroupId,
               id: { [Op.ne]: trx.id },
+              isCleared: false,
+              date: { [Op.gt]: trx.date },
             },
             transaction: dbTx,
-          }
-        );
+          });
+          await Transaction.update(
+            { recurrence: "none" },
+            {
+              where: {
+                recurringGroupId: nextRecurringGroupId,
+                id: { [Op.ne]: trx.id },
+              },
+              transaction: dbTx,
+            }
+          );
+        }
       }
 
       // Apply updated transaction's effect on linked account, preserving applied status if it had already been applied
@@ -607,7 +637,7 @@ router.put(
       }
 
       await dbTx.commit();
-      res.json(trx);
+      res.json({ ...trx.toJSON(), seriesEnded, removedUpcomingCount });
     } catch (error) {
       await dbTx.rollback();
       throw error;

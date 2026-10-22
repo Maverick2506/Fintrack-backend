@@ -4681,10 +4681,25 @@ async function runTestSuite() {
   const s33Series = await s33("POST", "/api/expenses", { name: "Suite 33 Streaming", amount: 15.0, category: "Entertainment", due_date: s33Today, is_paid: true, recurrence: "weekly" });
   assert(s33Series.status === 201 && s33Series.body.recurringGroupId, "Creates weekly recurring series");
   const s33GroupId = s33Series.body.recurringGroupId;
-  const s33SeriesRows = await Transaction.findAll({ where: { recurringGroupId: s33GroupId } });
-  assert(s33SeriesRows.length > 1, "Recurring generation creates future occurrences for the series");
+  const s33SeriesRows = await Transaction.findAll({ where: { recurringGroupId: s33GroupId }, order: [["date", "ASC"]] });
+  assert(s33SeriesRows.length > 2, "Recurring generation creates future occurrences for the series");
+
+  // Making a later (not current) occurrence one-time changes only that row
+  const s33Middle = s33SeriesRows[1];
+  const s33MiddleRes = await s33("PUT", `/api/expenses/${s33Middle.id}`, { recurrence: "none" });
+  assert(s33MiddleRes.status === 200 && s33MiddleRes.body.seriesEnded === false, "Setting a later occurrence to none does not end the series (B3)");
+  await s33("GET", "/api/recurring/trigger-recurring");
+  const s33AfterMiddle = await Transaction.findAll({ where: { recurringGroupId: s33GroupId } });
+  const s33MiddleAfter = s33AfterMiddle.find((t) => t.id === s33Middle.id);
+  assert(
+    s33AfterMiddle.length >= s33SeriesRows.length && s33MiddleAfter && s33MiddleAfter.recurrence === "none" &&
+      s33AfterMiddle.filter((t) => t.date === s33Middle.date).length === 1,
+    "Other occurrences are kept, the edited one stays one-time, and generation does not duplicate its date (B3)"
+  );
+
   const s33Stop = await s33("PUT", `/api/expenses/${s33Series.body.id}`, { recurrence: "none" });
   assert(s33Stop.status === 200, "Sets the series' current row to recurrence none");
+  assert(s33Stop.body.seriesEnded === true && s33Stop.body.removedUpcomingCount > 0, "Setting the current occurrence to none ends the series and reports removed rows (B3)");
   await s33("GET", "/api/recurring/trigger-recurring");
   const s33AfterStop = await Transaction.findAll({ where: { recurringGroupId: s33GroupId } });
   assert(
