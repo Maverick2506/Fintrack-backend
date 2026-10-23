@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { Transaction } = require("../models");
+const { Transaction, Setting } = require("../models");
 const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
 const { toZonedTime, format } = require("date-fns-tz");
@@ -58,16 +58,41 @@ const getNextOccurrenceDate = (baseDateStr, recurrence, step = 1, anchorDay = nu
   }
 };
 
-// Day of month a series is meant to land on. The newest row's day is used, unless that row sits on the
-// last day of its month and an earlier row of the series has a later day, i.e. the newest date was
-// clamped to a short month. A user who moved the series to another day keeps the new day.
-const getSeriesAnchorDay = (newestDateStr, earliestDateStr) => {
-  if (!newestDateStr) return null;
-  const [y, m, d] = String(newestDateStr).split("T")[0].split("-").map(Number);
-  if (!earliestDateStr) return d;
-  const earliestDay = Number(String(earliestDateStr).split("T")[0].split("-")[2]);
-  const lastDayOfMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  return d === lastDayOfMonth && earliestDay > d ? earliestDay : d;
+// Day of month a series is meant to land on, from its dates newest first. A row on the last day of its
+// month may have been clamped from a later day (Jan 31 -> Feb 28), so month-end rows are skipped back to
+// the first row that is not a month end, and the largest day seen wins. A series moved to the 31st keeps
+// the 31st after a 30-day month; a series moved to an earlier day keeps the new day (N4).
+const getSeriesAnchorDay = (datesNewestFirst) => {
+  let anchor = null;
+  for (const dateStr of datesNewestFirst || []) {
+    const [y, m, d] = String(dateStr).split("T")[0].split("-").map(Number);
+    anchor = Math.max(anchor || 0, d);
+    const lastDayOfMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+    if (d !== lastDayOfMonth) break;
+  }
+  return anchor;
+};
+
+// Series started from Quick Add never generated before the N1 fix: every insert copied the unique
+// clientRef and failed. Without a guard, the first run after deploy would create every missed past
+// month (expenses unpaid, so they look overdue). The first run stores its date here, and occurrences
+// dated before it are skipped for any series whose newest row still carries a clientRef.
+const QUICK_ADD_CATCHUP_KEY = "recurring_quick_add_catchup_from";
+
+const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
+  try {
+    const [setting] = await Setting.findOrCreate({
+      where: { key: QUICK_ADD_CATCHUP_KEY },
+      defaults: { value: todayStr },
+      transaction: dbTx,
+    });
+    return setting.value;
+  } catch (err) {
+    // Another run created it at the same moment
+    const setting = await Setting.findByPk(QUICK_ADD_CATCHUP_KEY, { transaction: dbTx });
+    if (!setting) throw err;
+    return setting.value;
+  }
 };
 
 const getNextDueDate = (currentDate, recurrence) => {
@@ -80,12 +105,14 @@ const getNextDueDate = (currentDate, recurrence) => {
   return getNextOccurrenceDate(currentDate, recurrence, 1);
 };
 
-const createRecurringExpenses = async (dbTx = null) => {
+// options.todayStr overrides "today" (America/Toronto) so tests can use fixed dates.
+const createRecurringExpenses = async (dbTx = null, options = {}) => {
   console.log("Running advanced timezone-aware recurring job...");
   try {
-    const nowUtc = new Date();
-    const nowZoned = toZonedTime(nowUtc, TIMEZONE);
-    const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const todayStr =
+      options.todayStr ||
+      format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const quickAddCatchupFrom = await getQuickAddCatchupFrom(todayStr, dbTx);
     
     // Horizon is 30 calendar days from today in America/Toronto
     const [tY, tM, tD] = todayStr.split("-").map(Number);
@@ -107,16 +134,17 @@ const createRecurringExpenses = async (dbTx = null) => {
     });
 
     const latestOccurrences = {};
-    const earliestDates = {};
+    const seriesDates = {};
     for (const trx of allTransactions) {
       const key = trx.recurringGroupId
         ? `series:${trx.recurringGroupId}`
         : `${trx.type}:${trx.title.toLowerCase().trim()}`;
       if (!latestOccurrences[key]) {
         latestOccurrences[key] = trx;
+        seriesDates[key] = [];
       }
-      // Rows are newest first, so the last one seen is the earliest
-      earliestDates[key] = trx.date;
+      // Rows are newest first
+      seriesDates[key].push(trx.date);
     }
 
     for (const [seriesKey, baseTrx] of Object.entries(latestOccurrences)) {
@@ -129,7 +157,9 @@ const createRecurringExpenses = async (dbTx = null) => {
         continue;
       }
 
-      const anchorDay = getSeriesAnchorDay(baseTrx.date, earliestDates[seriesKey]);
+      const anchorDay = getSeriesAnchorDay(seriesDates[seriesKey]);
+      const skipBefore =
+        baseTrx.clientRef && baseTrx.date < quickAddCatchupFrom ? quickAddCatchupFrom : null;
       let step = 1;
       while (true) {
         const nextDateStr = getNextOccurrenceDate(
@@ -140,6 +170,10 @@ const createRecurringExpenses = async (dbTx = null) => {
         );
         if (!nextDateStr || nextDateStr > horizonString) {
           break;
+        }
+        if (skipBefore && nextDateStr < skipBefore) {
+          step++;
+          continue;
         }
 
         // When recurringGroupId is present, match strictly by recurringGroupId to avoid colliding distinct series with identical names
@@ -262,4 +296,5 @@ module.exports = {
   getNextDueDate,
   getNextOccurrenceDate,
   getSeriesAnchorDay,
+  QUICK_ADD_CATCHUP_KEY,
 };

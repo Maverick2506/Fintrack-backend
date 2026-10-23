@@ -244,22 +244,23 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
   });
 
   const latestSeriesMap = {};
-  const earliestSeriesDates = {};
+  const seriesDates = {};
   for (const t of recurringTrxs) {
     const key = t.recurringGroupId
       ? `group:${t.recurringGroupId}`
       : `${t.type}:${t.title.toLowerCase().trim()}`;
     if (!latestSeriesMap[key]) {
       latestSeriesMap[key] = t;
+      seriesDates[key] = [];
     }
-    earliestSeriesDates[key] = t.date;
+    seriesDates[key].push(t.date);
   }
 
   for (const key of Object.keys(latestSeriesMap)) {
     const latest = latestSeriesMap[key];
     if (!latest.recurrence || latest.recurrence === "none") continue;
 
-    const anchorDay = getSeriesAnchorDay(latest.date, earliestSeriesDates[key]);
+    const anchorDay = getSeriesAnchorDay(seriesDates[key]);
     let curDate = latest.date;
     while (true) {
       const nextDate = getNextOccurrenceDate(curDate, latest.recurrence, 1, anchorDay);
