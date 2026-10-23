@@ -5516,6 +5516,33 @@ async function runTestSuite() {
   const s37CheckingImpact = await s33("POST", `/api/accounts/${s37Checking.id}/final-payment`, {});
   assert(s37CheckingImpact.status === 404, "Final payment refuses Primary Checking (404)");
 
+  // 37.8 Ledger edits and deletes cannot change an archived account's balance (it left net worth at $0)
+  const s37ArchivedMove = await Transaction.findOne({ where: { title: "Moved from Suite 37 Car" } });
+  const s37ArchivedNetBefore = (await getBalancesSummary()).netWorth;
+  const s37ArchivedGoalBalance = async () => parseFloat((await Account.findByPk(s37Goal2Id)).initialBalance);
+  const s37DelArchived = await s33("DELETE", `/api/expenses/${s37ArchivedMove.id}`);
+  assert(
+    s37DelArchived.status === 409 && /archived/i.test(s37DelArchived.body?.error || ""),
+    `Deleting "Moved from" an archived goal is refused with 409 (got ${s37DelArchived.status})`
+  );
+  assert(Boolean(await Transaction.findByPk(s37ArchivedMove.id)), "The refused delete keeps the row");
+  const s37BulkArchived = await s33("POST", "/api/expenses/bulk-delete", { ids: [s37ArchivedMove.id] });
+  assert(s37BulkArchived.status === 409, `Bulk delete of a row on an archived goal is refused with 409 (got ${s37BulkArchived.status})`);
+  const s37EditArchived = await s33("PUT", `/api/expenses/${s37ArchivedMove.id}`, { amount: 50 });
+  assert(s37EditArchived.status === 409, `Changing the amount of a row on an archived goal is refused with 409 (got ${s37EditArchived.status})`);
+  assert(
+    parseFloat((await Transaction.findByPk(s37ArchivedMove.id)).amount) === 120,
+    "The refused edit keeps the row's amount"
+  );
+  const s37RenameArchived = await s33("PUT", `/api/expenses/${s37ArchivedMove.id}`, { name: "Moved from Suite 37 Car (old car)", category: "Other" });
+  assert(s37RenameArchived.status === 200, `Renaming a row on an archived goal is still allowed (got ${s37RenameArchived.status})`);
+  const s37AdjustRow = await Transaction.findOne({ where: { title: { [Op.like]: "Balance adjustment: Suite 37 Store Card%" } } });
+  const s37DelAdjust = await s33("DELETE", `/api/expenses/${s37AdjustRow.id}`);
+  assert(s37DelAdjust.status === 409, `Deleting the Adjustment row of an archived card is refused with 409 (got ${s37DelAdjust.status})`);
+  assert((await s37ArchivedGoalBalance()) === 0, "The archived goal stays at $0");
+  assert(parseFloat((await Account.findByPk(s37Card5Id)).initialBalance) === 0, "The archived card stays at $0");
+  assert((await getBalancesSummary()).netWorth === s37ArchivedNetBefore, "Refused Ledger changes leave net worth unchanged");
+
   await Transaction.destroy({
     where: {
       [Op.or]: [

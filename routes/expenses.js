@@ -9,6 +9,10 @@ const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
 const { isClientRefConflict } = require("../services/clientRefService");
 const {
+  snapshotArchivedBalances,
+  assertArchivedBalancesUnchanged,
+} = require("../services/accountArchiveService");
+const {
   adjustAccountForTransaction,
   getTodayString,
   TIMEZONE,
@@ -400,6 +404,7 @@ router.put(
         return res.status(404).json({ error: "Transaction not found" });
       }
 
+      const archivedBefore = await snapshotArchivedBalances(dbTx);
       const wasCleared = Boolean(trx.isCleared);
       const wasBalanceApplied = Boolean(trx.balanceApplied);
       // Reverse old transaction's effect on any linked credit card / debt / savings account
@@ -659,6 +664,7 @@ router.put(
         dbTx,
         wasBalanceApplied || (!wasCleared && nextIsCleared)
       );
+      await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
 
       await dbTx.commit();
       updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount };
@@ -687,9 +693,11 @@ router.post(
         transaction: dbTx,
       });
 
+      const archivedBefore = await snapshotArchivedBalances(dbTx);
       for (const trx of toDelete) {
         await adjustAccountForTransaction(trx, -1, dbTx);
       }
+      await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
 
       const deletedCount = await Transaction.destroy({
         where: { id: { [Op.in]: ids } },
@@ -718,7 +726,9 @@ router.delete(
         return res.status(404).json({ error: "Transaction not found" });
       }
 
+      const archivedBefore = await snapshotArchivedBalances(dbTx);
       await adjustAccountForTransaction(trx, -1, dbTx);
+      await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
       await trx.destroy({ transaction: dbTx });
 
       await dbTx.commit();

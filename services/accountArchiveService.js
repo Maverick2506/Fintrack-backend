@@ -313,6 +313,37 @@ const adjustBalanceToZero = async (account, reason, dbTx) => {
   return trx;
 };
 
+// Archived accounts only leave net worth at $0, so a Ledger edit or delete must not move their
+// balance afterwards. Take a snapshot before the change and check it again before commit.
+const snapshotArchivedBalances = async (dbTx) => {
+  const archived = await Account.findAll({
+    where: { isActive: false },
+    attributes: ["id", "name", "initialBalance"],
+    transaction: dbTx,
+  });
+  return new Map(archived.map((a) => [a.id, round2(parseFloat(a.initialBalance) || 0)]));
+};
+
+// Throws 409 when an archived account's balance differs from the snapshot; the caller rolls back
+const assertArchivedBalancesUnchanged = async (snapshot, dbTx) => {
+  if (snapshot.size === 0) return;
+  const archived = await Account.findAll({
+    where: { id: [...snapshot.keys()] },
+    attributes: ["id", "name", "initialBalance"],
+    transaction: dbTx,
+  });
+  const changed = archived.find(
+    (a) => round2(parseFloat(a.initialBalance) || 0) !== snapshot.get(a.id)
+  );
+  if (changed) {
+    throw new HttpError(
+      409,
+      `This row belongs to the archived account "${changed.name}". Changing its amount or account, or deleting it, would change that account's balance.`,
+      { accountId: changed.id }
+    );
+  }
+};
+
 module.exports = {
   getDeleteImpact,
   retireAccount,
@@ -321,4 +352,6 @@ module.exports = {
   recordFinalPayment,
   adjustBalanceToZero,
   ADJUSTMENT_REASONS,
+  snapshotArchivedBalances,
+  assertArchivedBalancesUnchanged,
 };
