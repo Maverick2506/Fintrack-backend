@@ -4980,6 +4980,229 @@ async function runTestSuite() {
   assert((await s35Balances()) === s35BalancesBefore, "Losing the clientRef race changes no account balance");
   await Transaction.destroy({ where: { clientRef: s35RaceRef } });
 
+  // 36. Gemini Gem feed v2: forecast, paid-only recent rows, accounts, payees, monthly categories
+  console.log("\n--- Suite 36: Gemini Gem Feed v2 ---");
+  const { normalizePayeeTitle } = require("../utils/payeeNormalizer");
+  const s36 = (path, headers = {}) => request({ hostname: "localhost", port: 8000, path, method: "GET", headers });
+  // Small CSV parser (quoted fields, doubled quotes) for reading the feed back
+  const s36ParseCsv = (text) =>
+    text.split("\n").map((line) => {
+      const out = [];
+      let cur = "";
+      let quoted = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (quoted) {
+          if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+          else if (ch === '"') quoted = false;
+          else cur += ch;
+        } else if (ch === '"') quoted = true;
+        else if (ch === ",") { out.push(cur); cur = ""; }
+        else cur += ch;
+      }
+      out.push(cur);
+      return out;
+    });
+
+  // Maverick's rule: drop dates and reference numbers, keep digits that belong to the name
+  const s36NormCases = [
+    ["7-Eleven #2231", "7-eleven"],
+    ["Hydro Oct", "hydro"],
+    ["hydro", "hydro"],
+    [" HYDRO 10/15 ", "hydro"],
+    ["Hydro Oct 22", "hydro"],
+    ["COSTCO WHOLESALE 1234", "costco wholesale"],
+    ["99 Ranch Market", "99 ranch market"],
+    ["Rent 2026-10-01", "rent"],
+    ["Netflix.com", "netflix.com"],
+    ["3M", "3m"],
+    ["A&W", "a&w"],
+    ["POS 000123 Tim Hortons", "pos tim hortons"],
+    ["Store #4521 Walmart", "store walmart"],
+    ["Gym no. 12", "gym"],
+    ["Visa ref 88912", "visa"],
+    ["No Frills", "no frills"],
+    ["Bell Sept. bill", "bell bill"],
+    ["Café Nero", "cafe nero"],
+    ["Marché Jean-Talon", "marche jean-talon"],
+  ];
+  const s36NormWrong = s36NormCases.filter(([raw, want]) => normalizePayeeTitle(raw) !== want);
+  assert(
+    s36NormWrong.length === 0,
+    `Payee titles drop dates and reference numbers but keep digits in names (wrong: ${
+      s36NormWrong.map(([raw, want]) => `${raw} -> ${normalizePayeeTitle(raw)} (want ${want})`).join("; ") || "none"
+    })`
+  );
+
+  const s36Today = getTorontoToday();
+  const s36Card = await Account.create({ name: "Suite 36 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 1000 });
+  const s36Rows = await Transaction.bulkCreate([
+    { title: "Hydro Oct", amount: 80, date: getTorontoOffsetDate(-10), type: "EXPENSE", category: "Essentials", isCleared: true },
+    { title: "hydro", amount: 70, date: getTorontoOffsetDate(-40), type: "EXPENSE", category: "Essentials", isCleared: true },
+    { title: "Suite 36 Unpaid Past", amount: 33, date: getTorontoOffsetDate(-2), type: "EXPENSE", category: "Other", isCleared: false },
+    { title: "Suite 36 Future Paid", amount: 44, date: getTorontoOffsetDate(3), type: "EXPENSE", category: "Other", isCleared: true },
+    // Gives checking money so SAFE_TO_SPEND is a real number, not the 0 floor
+    { title: "Suite 36 Pay", amount: 5000, date: s36Today, type: "INCOME", category: "Income", isCleared: true },
+    // A card payment whose card was deleted (toAccountId set to NULL by the FK)
+    { title: "Payment for Suite 36 Gone Card", amount: 61, date: getTorontoOffsetDate(-1), type: "TRANSFER", category: "Debt", isCleared: true, toAccountId: null },
+    { title: "Suite 36 Upcoming Bill", amount: 55, date: getTorontoOffsetDate(5), type: "EXPENSE", category: "Essentials", isCleared: false },
+  ]);
+  // Created last, dated today: first row of RECENT_TRANSACTIONS
+  const s36CardRow = await Transaction.create({
+    title: "Suite 36 Card Lunch", amount: 12.5, date: s36Today, type: "EXPENSE", category: "Food & Drink",
+    isCleared: true, fromAccountId: s36Card.id,
+  });
+
+  const s36Config = await s36("/api/export/gemini-config", authHeaders);
+  const s36Key = s36Config.body.feedKey;
+  const [s36CsvRes, s36MdRes, s36ForecastRes] = await Promise.all([
+    s36(`/api/export/financial-feed.csv?key=${s36Key}`),
+    s36(`/api/export/financial-feed.md?key=${s36Key}`),
+    s36("/api/forecast", authHeaders),
+  ]);
+  assert(s36CsvRes.status === 200 && s36MdRes.status === 200 && s36ForecastRes.status === 200, "Feed (CSV, MD) and GET /forecast return HTTP 200");
+  const s36Csv = s36ParseCsv(s36CsvRes.raw);
+  const s36Section = (name) => s36Csv.filter((r) => r[0] === name);
+
+  assert(
+    s36Csv[0][0] === "SNAPSHOT_AT" && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(s36Csv[0][1]) && s36Csv[0][1].startsWith(s36Today),
+    `CSV first row is SNAPSHOT_AT with today's Toronto date and time (got ${s36Csv[0].join(",")})`
+  );
+  const s36Sections = ["FORECAST", "OVERVIEW", "ACCOUNTS", "UPCOMING_BILLS", "RECENT_TRANSACTIONS", "PAYEES", "MONTHLY_CATEGORIES"];
+  const s36Missing = s36Sections.filter((name) => s36Section(name).length === 0);
+  assert(s36Missing.length === 0, `CSV feed has every section (missing: ${s36Missing.join(", ") || "none"})`);
+  const s36MdMissing = ["Forecast", "Executive Summary", "Accounts & Liabilities", "Upcoming Unpaid Bills", "Recent Transactions", "Payees", "Monthly Categories"]
+    .filter((h) => !new RegExp(`^## (\\d+\\. )?${h}`, "m").test(s36MdRes.raw));
+  assert(s36MdMissing.length === 0, `Markdown feed has every section (missing: ${s36MdMissing.join(", ") || "none"})`);
+
+  const s36Forecast = Object.fromEntries(s36Section("FORECAST").map((r) => [r[1], r[2]]));
+  const s36Metrics = ["SAFE_TO_SPEND", "UNTIL", "BUFFER", "LOWEST_BALANCE", "LOWEST_DATE", "NEXT_PAYDAY", "ESTIMATED_INCOME_INCLUDED"];
+  assert(s36Metrics.every((m) => m in s36Forecast), "FORECAST section has every metric");
+  const s36Api = s36ForecastRes.body;
+  assert(
+    s36Api.safeToSpend > 0 && parseFloat(s36Forecast.SAFE_TO_SPEND) === s36Api.safeToSpend,
+    `CSV SAFE_TO_SPEND equals GET /forecast safeToSpend (${s36Forecast.SAFE_TO_SPEND} vs ${s36Api.safeToSpend})`
+  );
+  assert(
+    s36MdRes.raw.includes(`**SAFE_TO_SPEND:** **$${s36Api.safeToSpend.toFixed(2)}**`),
+    "Markdown SAFE_TO_SPEND equals GET /forecast safeToSpend"
+  );
+  assert(
+    parseFloat(s36Forecast.BUFFER) === s36Api.buffer &&
+      parseFloat(s36Forecast.LOWEST_BALANCE) === s36Api.lowestPoint.balance &&
+      s36Forecast.LOWEST_DATE === s36Api.lowestPoint.date &&
+      s36Forecast.NEXT_PAYDAY === (s36Api.nextPayday || "") &&
+      s36Forecast.ESTIMATED_INCOME_INCLUDED === (s36Api.estimatedIncome ? "YES" : "NO"),
+    "FORECAST BUFFER, LOWEST_BALANCE, LOWEST_DATE, NEXT_PAYDAY, ESTIMATED_INCOME_INCLUDED match GET /forecast"
+  );
+
+  const s36RecentHeader = s36Csv.find((r) => r[0] === "SECTION" && r[1] === "DATE" && r[2] === "TYPE");
+  const s36Recent = s36Section("RECENT_TRANSACTIONS");
+  const s36RecentIds = s36Recent.map((r) => r[4]);
+  const s36RecentDb = await Transaction.findAll({ where: { title: { [Op.in]: s36RecentIds } }, attributes: ["title", "amount", "isCleared", "date"] });
+  const s36RecentPaid = s36Recent.every((r) =>
+    s36RecentDb.some((t) => t.title === r[4] && t.date === r[1] && parseFloat(t.amount).toFixed(2) === r[5] && t.isCleared === true)
+  );
+  assert(
+    s36Recent.length > 0 && s36Recent.length <= 50 && s36Recent.every((r) => r[1] <= s36Today) && s36RecentPaid,
+    `RECENT_TRANSACTIONS has at most 50 rows, all paid and dated today or earlier (${s36Recent.length} rows)`
+  );
+  assert(
+    !s36RecentIds.includes("Suite 36 Unpaid Past") && !s36RecentIds.includes("Suite 36 Future Paid") &&
+      !s36RecentIds.includes("Suite 36 Upcoming Bill"),
+    "RECENT_TRANSACTIONS leaves out unpaid rows and rows dated after today"
+  );
+  assert(s36Section("UPCOMING_BILLS").some((r) => r[2] === "Suite 36 Upcoming Bill"), "Upcoming bills stay in their own UPCOMING_BILLS section");
+  assert(
+    s36RecentHeader && s36RecentHeader[6] === "ACCOUNT" &&
+      s36Recent[0][4] === "Suite 36 Card Lunch" && s36Recent[0][6] === "Suite 36 Visa",
+    `RECENT_TRANSACTIONS has an ACCOUNT column naming the card (got ${s36Recent[0] && s36Recent[0].join(",")})`
+  );
+  const s36HydroRecent = s36Recent.find((r) => r[4] === "Hydro Oct");
+  assert(s36HydroRecent && s36HydroRecent[6] === "Primary Checking", "ACCOUNT is the checking account for a checking expense");
+  assert(s36MdRes.raw.includes("| Suite 36 Card Lunch | $12.50 | Suite 36 Visa |"), "Markdown recent ledger shows the ACCOUNT");
+  const s36Gone = s36Recent.find((r) => r[4] === "Payment for Suite 36 Gone Card");
+  assert(
+    s36Gone && s36Gone[6] === "Primary Checking → Suite 36 Gone Card (deleted)",
+    `A transfer to a deleted card names the card as deleted, not checking (got ${s36Gone && s36Gone[6]})`
+  );
+
+  const s36Payees = s36Section("PAYEES");
+  const s36PayeeHeader = s36Csv.find((r) => r[0] === "SECTION" && r[1] === "TITLE");
+  assert(
+    s36PayeeHeader && s36PayeeHeader.slice(1).join(",") === "TITLE,CATEGORY,ACCOUNT,LAST_PAID_DATE,LAST_AMOUNT,TIMES_12M,TOTAL_12M,TOTAL_YTD",
+    "PAYEES has the TITLE, CATEGORY, ACCOUNT, LAST_PAID_DATE, LAST_AMOUNT, TIMES_12M, TOTAL_12M, TOTAL_YTD columns"
+  );
+  const s36Hydro = s36Payees.find((r) => r[1] === "hydro");
+  assert(
+    s36Hydro && s36Hydro[2] === "Essentials" && s36Hydro[3] === "Primary Checking" &&
+      s36Hydro[4] === getTorontoOffsetDate(-10) && s36Hydro[5] === "80.00" && s36Hydro[6] === "2" && s36Hydro[7] === "150.00" &&
+      !s36Payees.some((r) => r[1] === "hydro oct"),
+    `PAYEES groups "Hydro Oct" with "hydro" on one row (got ${s36Hydro && s36Hydro.join(",")})`
+  );
+  const s36Ytd = [getTorontoOffsetDate(-10), getTorontoOffsetDate(-40)]
+    .filter((dt) => dt >= `${s36Today.slice(0, 4)}-01-01`)
+    .reduce((sum, dt) => sum + (dt === getTorontoOffsetDate(-10) ? 80 : 70), 0);
+  assert(s36Hydro && parseFloat(s36Hydro[8]) === s36Ytd, `PAYEES TOTAL_YTD counts this year only (${s36Hydro && s36Hydro[8]} vs ${s36Ytd})`);
+  const s36Totals = s36Payees.map((r) => parseFloat(r[7]));
+  assert(
+    s36Payees.length <= 300 && s36Totals.every((v, i) => i === 0 || s36Totals[i - 1] >= v) &&
+      !s36Payees.some((r) => r[1].includes("unpaid past") || r[1].includes("future paid")),
+    "PAYEES is capped at 300, ordered by TOTAL_12M, and counts only paid rows up to today"
+  );
+
+  const s36Monthly = s36Section("MONTHLY_CATEGORIES");
+  const s36Months = [...new Set(s36Monthly.map((r) => r[1]))];
+  assert(s36Months.length === 12 && s36Months[0] === s36Today.slice(0, 7), `MONTHLY_CATEGORIES covers the last 12 months, newest first (got ${s36Months.length})`);
+  const s36HydroMonth = getTorontoOffsetDate(-10).slice(0, 7);
+  const [s36My, s36Mm] = s36HydroMonth.split("-").map(Number);
+  const s36MonthEnd = `${s36HydroMonth}-${String(new Date(s36My, s36Mm, 0).getDate()).padStart(2, "0")}`;
+  const s36EssentialsSpent = await Transaction.sum("amount", {
+    where: { type: "EXPENSE", isCleared: true, category: "Essentials", date: { [Op.between]: [`${s36HydroMonth}-01`, s36MonthEnd < s36Today ? s36MonthEnd : s36Today] } },
+  });
+  const s36EssRow = s36Monthly.find((r) => r[1] === s36HydroMonth && r[2] === "Essentials");
+  const s36EssBudget = await Budget.findOne({ where: { category: "Essentials" } });
+  assert(
+    s36EssRow && parseFloat(s36EssRow[3]) === Math.round((s36EssentialsSpent || 0) * 100) / 100 &&
+      s36EssRow[4] === (s36EssBudget ? parseFloat(s36EssBudget.monthlyLimit).toFixed(2) : ""),
+    `MONTHLY_CATEGORIES SPENT and BUDGET match the database (got ${s36EssRow && s36EssRow.join(",")})`
+  );
+
+  const s36Instr = s36Config.body.instructions || "";
+  assert(
+    s36Instr.includes("SAFE_TO_SPEND") && s36Instr.includes("NEVER compute") && !s36Instr.includes("Determine the remaining Safe Liquid Float"),
+    "Gem instructions use SAFE_TO_SPEND for affordability and never compute it"
+  );
+  assert(
+    s36Instr.includes("PAYEES") && s36Instr.includes("MONTHLY_CATEGORIES") && s36Instr.includes("say so") && s36Instr.includes("Data as of"),
+    "Gem instructions cover history questions and stale data"
+  );
+  assert(
+    s36Instr.includes("https://fintrack-frontend-jet.vercel.app/quick?text=") && s36Instr.includes("NEVER say or imply that something was saved"),
+    "Gem instructions answer add/record/log with a Quick Add link and never claim a save"
+  );
+  assert(
+    s36Instr.includes("as %2B") && s36Instr.includes("/quick?text=23.40%20lunch%20visa%0A%2B2100%20paycheque"),
+    "Gem instructions encode the income + as %2B and show an income item in the link example"
+  );
+  const s36Script = s36Config.body.appsScript || "";
+  assert(
+    s36Script.includes("function installTrigger()") && s36Script.includes("everyHours(1)") &&
+      s36Script.includes("deleteTrigger") && s36Script.includes("function onOpen()"),
+    "Apps Script has installTrigger (hourly, removes duplicates) and keeps onOpen"
+  );
+  assert(
+    s36Script.includes('getSheetByName("FinTrack") || ss.insertSheet("FinTrack")') && !s36Script.includes("getSheets()[0]"),
+    "Apps Script writes to its own FinTrack tab, not whichever tab is first"
+  );
+  assert(
+    !s36CsvRes.raw.includes("Expected on: None") && s36CsvRes.raw.includes("For the next payday use FORECAST NEXT_PAYDAY"),
+    "OVERVIEW income projection is labelled context only and points to FORECAST NEXT_PAYDAY"
+  );
+
+  await Transaction.destroy({ where: { id: [...s36Rows.map((t) => t.id), s36CardRow.id] } });
+  await s36Card.destroy();
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
