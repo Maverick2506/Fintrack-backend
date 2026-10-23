@@ -5022,6 +5022,8 @@ async function runTestSuite() {
     { title: "Suite 36 Future Paid", amount: 44, date: getTorontoOffsetDate(3), type: "EXPENSE", category: "Other", isCleared: true },
     // Gives checking money so SAFE_TO_SPEND is a real number, not the 0 floor
     { title: "Suite 36 Pay", amount: 5000, date: s36Today, type: "INCOME", category: "Income", isCleared: true },
+    // A card payment whose card was deleted (toAccountId set to NULL by the FK)
+    { title: "Payment for Suite 36 Gone Card", amount: 61, date: getTorontoOffsetDate(-1), type: "TRANSFER", category: "Debt", isCleared: true, toAccountId: null },
     { title: "Suite 36 Upcoming Bill", amount: 55, date: getTorontoOffsetDate(5), type: "EXPENSE", category: "Essentials", isCleared: false },
   ]);
   // Created last, dated today: first row of RECENT_TRANSACTIONS
@@ -5098,6 +5100,11 @@ async function runTestSuite() {
   const s36HydroRecent = s36Recent.find((r) => r[4] === "Hydro Oct");
   assert(s36HydroRecent && s36HydroRecent[6] === "Primary Checking", "ACCOUNT is the checking account for a checking expense");
   assert(s36MdRes.raw.includes("| Suite 36 Card Lunch | $12.50 | Suite 36 Visa |"), "Markdown recent ledger shows the ACCOUNT");
+  const s36Gone = s36Recent.find((r) => r[4] === "Payment for Suite 36 Gone Card");
+  assert(
+    s36Gone && s36Gone[6] === "Primary Checking → Suite 36 Gone Card (deleted)",
+    `A transfer to a deleted card names the card as deleted, not checking (got ${s36Gone && s36Gone[6]})`
+  );
 
   const s36Payees = s36Section("PAYEES");
   const s36PayeeHeader = s36Csv.find((r) => r[0] === "SECTION" && r[1] === "TITLE");
@@ -5153,11 +5160,23 @@ async function runTestSuite() {
     s36Instr.includes("https://fintrack-frontend-jet.vercel.app/quick?text=") && s36Instr.includes("NEVER say or imply that something was saved"),
     "Gem instructions answer add/record/log with a Quick Add link and never claim a save"
   );
+  assert(
+    s36Instr.includes("as %2B") && s36Instr.includes("/quick?text=23.40%20lunch%20visa%0A%2B2100%20paycheque"),
+    "Gem instructions encode the income + as %2B and show an income item in the link example"
+  );
   const s36Script = s36Config.body.appsScript || "";
   assert(
     s36Script.includes("function installTrigger()") && s36Script.includes("everyHours(1)") &&
       s36Script.includes("deleteTrigger") && s36Script.includes("function onOpen()"),
     "Apps Script has installTrigger (hourly, removes duplicates) and keeps onOpen"
+  );
+  assert(
+    s36Script.includes('getSheetByName("FinTrack") || ss.insertSheet("FinTrack")') && !s36Script.includes("getSheets()[0]"),
+    "Apps Script writes to its own FinTrack tab, not whichever tab is first"
+  );
+  assert(
+    !s36CsvRes.raw.includes("Expected on: None") && s36CsvRes.raw.includes("For the next payday use FORECAST NEXT_PAYDAY"),
+    "OVERVIEW income projection is labelled context only and points to FORECAST NEXT_PAYDAY"
   );
 
   await Transaction.destroy({ where: { id: [...s36Rows.map((t) => t.id), s36CardRow.id] } });

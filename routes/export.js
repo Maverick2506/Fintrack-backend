@@ -294,7 +294,13 @@ const getFinancialData = async () => {
     const from = name(t.fromAccount, t.fromAccountId);
     const to = name(t.toAccount, t.toAccountId);
     if (t.type === "INCOME") return to;
-    if (t.type === "TRANSFER") return `${from} → ${to}`;
+    if (t.type === "TRANSFER") {
+      // Transfers always name both accounts, and deleting a card, debt or goal nulls the id,
+      // so a missing one is a deleted account. Its name is usually still in the title.
+      if (t.toAccount || t.toAccountId) return `${from} → ${to}`;
+      const titled = /^(?:payment for|auto-pay for|contribution to)\s+(.+)$/i.exec(t.title || "");
+      return `${from} → ${titled ? `${titled[1]} (deleted)` : "Deleted account"}`;
+    }
     return from;
   };
 
@@ -372,8 +378,8 @@ const generateCSV = (d) => {
   rows.push(["OVERVIEW", "Cash Flow", "Month Cleared Income", `$${d.clearedIncome.toFixed(2)}`, "Total deposits cleared this month"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Cash Flow", "Month Cleared Spending", `$${d.clearedExpenses.toFixed(2)}`, "Total paid spending this month"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Cash Flow", "Current Net Cash Flow", `$${d.netFlow.toFixed(2)}`, "Cleared Income minus Cleared Spending"].map(csvEscape).join(","));
-  rows.push(["OVERVIEW", "Projections", "Projected Upcoming Income", `$${d.totalProjectedIncome.toFixed(2)}`, `Expected on: ${d.projectedPaychequeDates.join("; ") || "None"}`].map(csvEscape).join(","));
-  rows.push(["OVERVIEW", "Projections", "Upcoming Unpaid Bills Total", `$${d.upcomingBillsTotal.toFixed(2)}`, "All unpaid bills remaining this month"].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Projected Upcoming Income", `$${d.totalProjectedIncome.toFixed(2)}`, `Context only, this month only: ${d.projectedPaychequeDates.join("; ") || "none this month"}. For the next payday use FORECAST NEXT_PAYDAY.`].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Upcoming Unpaid Bills Total", `$${d.upcomingBillsTotal.toFixed(2)}`, "Context only: unpaid bills left this month"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Projections", "Upcoming Bills (From Checking)", `$${d.upcomingCheckingBillsTotal.toFixed(2)}`, "Bills directly deducting liquid cash from Primary Checking"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Projections", "Upcoming Bills (On Credit Cards)", `$${d.upcomingCCBillsTotal.toFixed(2)}`, "Bills charged to credit cards (adds to card balance)"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Projections", "Projected End-of-Month Float", `$${d.endOfMonthFloat.toFixed(2)}`, "Context only, rest of this month. For affordability use FORECAST SAFE_TO_SPEND."].map(csvEscape).join(","));
@@ -467,7 +473,7 @@ const generateMarkdown = (d) => {
 - **Current Month Cleared Income:** $${d.clearedIncome.toFixed(2)}
 - **Current Month Cleared Spending:** $${d.clearedExpenses.toFixed(2)}
 - **Current Net Cash Flow:** $${d.netFlow.toFixed(2)}
-- **Projected Upcoming Income:** $${d.totalProjectedIncome.toFixed(2)} (${d.projectedPaychequeDates.length} upcoming paycheques)
+- **Projected Upcoming Income (this month, context only):** $${d.totalProjectedIncome.toFixed(2)} (${d.projectedPaychequeDates.length} paycheques left this month; for the next payday use NEXT_PAYDAY above)
 - **Upcoming Unpaid Bills Total:** $${d.upcomingBillsTotal.toFixed(2)}
 - **Projected End-of-Month Float (context only):** $${d.endOfMonthFloat.toFixed(2)}
 
@@ -621,7 +627,7 @@ You have continuous access to Maverick's live FinTrack financial data connected 
    - Reply with a link Maverick taps to review and save it in FinTrack: ${frontendUrl}/quick?text=<url-encoded Quick Add text>
    - Quick Add format, one line per item: \`amount description [card] [due MM/DD]\`. Use \`+amount\` for income. Add the card name only for card purchases, and "due MM/DD" only for a bill that is not paid yet.
    - Examples: "23.40 lunch visa", "120 hydro due 11/05", "+2100 paycheque".
-   - URL-encode the text (spaces as %20, a new line between items as %0A). Example: ${frontendUrl}/quick?text=23.40%20lunch%20visa%0A4.50%20coffee
+   - URL-encode the text: spaces as %20, a new line between items as %0A, and the income \`+\` as %2B (a bare + in a link turns into a space and the income becomes an expense). Example with an expense and an income: ${frontendUrl}/quick?text=23.40%20lunch%20visa%0A%2B2100%20paycheque
 6. **Debt Strategy & Paid-Off Debts:**
    - Only consider debts with STATUS "ACTIVE" as active liabilities requiring payment.
    - Debts with STATUS "PAID_OFF" or listed under "Paid Off & Cleared Debts" are 100% paid off ($0 balance, $0 payment due).
@@ -699,6 +705,7 @@ const generateAppsScript = (feedUrl) => {
  * FinTrack Auto-Sync Script for Google Sheets
  * - Run installTrigger() once: it refreshes the sheet every hour, even when it's closed.
  * - Adds a "FinTrack > 🔄 Refresh Data Now" menu for 1-click sync.
+ * - Writes to its own "FinTrack" tab (created if missing); other tabs are left alone.
  * - The first row (SNAPSHOT_AT) is the date and time of the data, in Toronto time.
  * - Bypasses Google formula proxy caching for 100% real-time accuracy.
  */
@@ -737,8 +744,9 @@ function refreshFinTrack() {
         while (row.length < width) row.push("");
         return row;
       });
-      // The first tab, so the hourly trigger (which has no open tab) writes to the same place
-      const sheet = ss.getSheets()[0];
+      // Its own tab, so the hourly trigger (which has no open tab) writes to the same place
+      // and never clears a tab Maverick uses for something else
+      const sheet = ss.getSheetByName("FinTrack") || ss.insertSheet("FinTrack");
       sheet.clearContents();
       sheet.getRange(1, 1, values.length, width).setValues(values);
       ss.toast("FinTrack numbers synchronized successfully!", "Live Sync", 3);
