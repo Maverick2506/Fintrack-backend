@@ -4862,6 +4862,124 @@ async function runTestSuite() {
   assert(s34MonthlyDates.includes(s34NextMonth), "Next month's row is generated after the save commits (N5)");
   await Transaction.destroy({ where: { recurringGroupId: s34Monthly.body.recurringGroupId } });
 
+  console.log("\n--- Suite 35: Simultaneous Retries With the Same clientRef ---");
+  const { isClientRefConflict } = require("../services/clientRefService");
+  const s35Post = (path, body) =>
+    request({ hostname: "localhost", port: 8000, path, method: "POST", headers: authHeaders }, body);
+
+  // A retry that reaches the server together with the first save: one row is
+  // created and every other request gets that row back as a duplicate (not 409/500).
+  let s35CleanRounds = 0;
+  const s35Rounds = 5;
+  for (let round = 0; round < s35Rounds; round++) {
+    const ref = crypto.randomUUID();
+    const body = { name: "Suite 35 Pay", amount: 100, payment_date: "2026-04-15", clientRef: ref };
+    const results = await Promise.all([0, 1, 2].map(() => s35Post("/api/paycheques", body)));
+    const created = results.filter((r) => r.status === 201);
+    const dups = results.filter((r) => r.status === 200 && r.body.isDuplicate === true);
+    const rows = await Transaction.count({ where: { clientRef: ref } });
+    if (
+      created.length === 1 &&
+      dups.length === 2 &&
+      dups.every((r) => r.body.id === created[0].body.id && r.body.name === "Suite 35 Pay") &&
+      rows === 1
+    ) {
+      s35CleanRounds++;
+    } else {
+      console.error("    Suite 35 round statuses:", results.map((r) => r.status).join(", "), "rows:", rows);
+    }
+    await Transaction.destroy({ where: { clientRef: ref } });
+  }
+  assert(
+    s35CleanRounds === s35Rounds,
+    "Simultaneous POST /paycheques with one clientRef: one 201, the rest 200 isDuplicate with the same row"
+  );
+
+  // The expenses route runs inside a transaction. On Postgres the race loser fails on the
+  // clientRef unique index; SQLite (tests) locks instead, so check the detection directly.
+  const s35Ref = crypto.randomUUID();
+  const s35Row = { title: "Suite 35 Coffee", amount: 4, date: "2026-04-15", type: "EXPENSE", category: "Food & Drink" };
+  await Transaction.create({ ...s35Row, clientRef: s35Ref });
+  let s35SqliteErr = null;
+  try {
+    await Transaction.create({ ...s35Row, clientRef: s35Ref });
+  } catch (err) {
+    s35SqliteErr = err;
+  }
+  await Transaction.destroy({ where: { clientRef: s35Ref } });
+  assert(isClientRefConflict(s35SqliteErr), "A duplicate clientRef insert on SQLite is recognised as a clientRef conflict");
+  // Shape of the error Postgres (Neon) raises for the same race, as Sequelize reports it
+  const s35PgErr = Object.assign(new Error("Validation error"), {
+    name: "SequelizeUniqueConstraintError",
+    fields: { clientRef: s35Ref },
+    parent: { code: "23505", constraint: "transactions_client_ref_unique" },
+    original: { code: "23505", constraint: "transactions_client_ref_unique" },
+  });
+  assert(isClientRefConflict(s35PgErr), "A duplicate clientRef insert on Postgres is recognised as a clientRef conflict");
+  const s35RecurringErr = Object.assign(new Error("Validation error"), {
+    name: "SequelizeUniqueConstraintError",
+    fields: { recurringGroupId: s35Ref, date: "2026-04-15" },
+    parent: { code: "23505", constraint: "transactions_recurring_group_date_unique" },
+  });
+  assert(!isClientRefConflict(s35RecurringErr), "Other unique conflicts (recurring series date) are not treated as clientRef duplicates");
+  assert(!isClientRefConflict(new Error("SQLITE_BUSY: database is locked")), "Non-unique errors are not treated as clientRef duplicates");
+
+  // POST /expenses race branch, end to end. SQLite locks before two live requests reach the
+  // index, so run the real route in-process and make its first lookup miss, as when the other
+  // request commits between this request's lookup and its insert. The insert then fails on the
+  // real clientRef unique index and the route must answer with the saved row.
+  const s35Express = require("express");
+  const { JWT_SECRET } = require("../config/auth");
+  const { errorHandler: s35ErrorHandler } = require("../middleware/errorHandler");
+  const s35App = s35Express();
+  s35App.use(s35Express.json());
+  s35App.use("/api", require("../routes/expenses"));
+  s35App.use(s35ErrorHandler);
+  const s35Server = await new Promise((resolve) => {
+    const srv = s35App.listen(0, () => resolve(srv));
+  });
+  const s35Token = require("jsonwebtoken").sign({ user: "Maverick" }, JWT_SECRET, { expiresIn: "5m" });
+  const s35RaceRef = crypto.randomUUID();
+  const s35Winner = await Transaction.create({
+    ...s35Row, title: "Suite 35 Race Coffee", isCleared: true, clientRef: s35RaceRef,
+  });
+  const s35Balances = async () =>
+    JSON.stringify((await Account.findAll({ order: [["id", "ASC"]] })).map((a) => [a.id, a.initialBalance]));
+  const s35BalancesBefore = await s35Balances();
+  const s35OrigFindOne = Transaction.findOne;
+  let s35LookupMissed = false;
+  Transaction.findOne = function (opts, ...rest) {
+    if (!s35LookupMissed && opts && opts.where && opts.where.clientRef === s35RaceRef && opts.transaction) {
+      s35LookupMissed = true;
+      return Promise.resolve(null);
+    }
+    return s35OrigFindOne.call(this, opts, ...rest);
+  };
+  let s35Race;
+  try {
+    s35Race = await request(
+      {
+        hostname: "localhost",
+        port: s35Server.address().port,
+        path: "/api/expenses",
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${s35Token}` },
+      },
+      { name: "Suite 35 Race Coffee", amount: 4, due_date: "2026-04-15", category: "Food & Drink", is_paid: true, applyToBalance: true, clientRef: s35RaceRef }
+    );
+  } finally {
+    Transaction.findOne = s35OrigFindOne;
+    await new Promise((resolve) => s35Server.close(resolve));
+  }
+  assert(s35LookupMissed, "Race test reached the POST /expenses clientRef lookup");
+  assert(
+    s35Race.status === 200 && s35Race.body.isDuplicate === true && s35Race.body.id === s35Winner.id,
+    `POST /expenses that loses the clientRef race returns the saved row with 200 isDuplicate (got ${s35Race.status})`
+  );
+  assert((await Transaction.count({ where: { clientRef: s35RaceRef } })) === 1, "Losing the clientRef race stores no second row");
+  assert((await s35Balances()) === s35BalancesBefore, "Losing the clientRef race changes no account balance");
+  await Transaction.destroy({ where: { clientRef: s35RaceRef } });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");
