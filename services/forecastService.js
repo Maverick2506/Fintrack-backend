@@ -4,6 +4,7 @@ const { getTodayString } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
 const { getNextOccurrenceDate, getNextDueDate, getSeriesAnchorDay } = require("../routes/recurring");
+const { usesArchivedAccount } = require("./accountArchiveService");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
 const addCalendarDays = (baseDateStr, daysToAdd) => {
@@ -145,6 +146,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
 
   // Process existing DB transactions
   for (const trx of dbTransactions) {
+    if (usesArchivedAccount(trx)) continue;
     const amt = parseFloat(trx.amount) || 0;
     const isPast = trx.date < todayStr;
     const isToday = trx.date === todayStr;
@@ -259,6 +261,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
   for (const key of Object.keys(latestSeriesMap)) {
     const latest = latestSeriesMap[key];
     if (!latest.recurrence || latest.recurrence === "none") continue;
+    if (usesArchivedAccount(latest)) continue;
 
     const anchorDay = getSeriesAnchorDay(seriesDates[key]);
     let curDate = latest.date;

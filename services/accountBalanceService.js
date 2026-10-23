@@ -78,6 +78,20 @@ const adjustAccountForTransaction = async (
       }
     }
 
+    // 3. Cleared TRANSFER out of a Savings Goal (money moved back to checking).
+    //    Only the archive, final-payment and adjust-to-$0 flows (accountArchiveService) create these rows.
+    if (trx.type === "TRANSFER" && trx.fromAccountId) {
+      const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
+      if (fromAcc && fromAcc.type === "SAVINGS_GOAL") {
+        await Account.increment("initialBalance", {
+          by: -amount,
+          where: { id: trx.fromAccountId },
+          transaction: dbTx,
+        });
+        applied = true;
+      }
+    }
+
     if (applied) {
       trx.balanceApplied = true;
       await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
@@ -114,6 +128,18 @@ const adjustAccountForTransaction = async (
             transaction: dbTx,
           });
         }
+      }
+    }
+
+    // 3. Reverse TRANSFER out of a Savings Goal
+    if (trx.type === "TRANSFER" && trx.fromAccountId) {
+      const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
+      if (fromAcc && fromAcc.type === "SAVINGS_GOAL") {
+        await Account.increment("initialBalance", {
+          by: amount,
+          where: { id: trx.fromAccountId },
+          transaction: dbTx,
+        });
       }
     }
 

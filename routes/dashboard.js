@@ -25,6 +25,7 @@ const {
   getPrimaryCheckingAccount,
   getCheckingActivity,
 } = require("../services/checkingService");
+const { usesArchivedAccount } = require("../services/accountArchiveService");
 
 router.get(
   "/dashboard",
@@ -194,7 +195,7 @@ router.get(
         initialBalance: parseFloat(checking.initialBalance) || 0,
         currentBalance: checkingCurrentBalance,
       },
-      upcomingBills,
+      upcomingBills: upcomingBills.filter((b) => !usesArchivedAccount(b)),
       debtSummary,
       savingsSummary,
       creditCardSummary,

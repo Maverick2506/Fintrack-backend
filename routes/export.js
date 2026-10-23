@@ -9,6 +9,7 @@ const { getPaychequeProjection } = require("../services/projectionService");
 const { getForecast } = require("../services/forecastService");
 const { normalizePayeeTitle } = require("../utils/payeeNormalizer");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
+const { usesArchivedAccount } = require("../services/accountArchiveService");
 const { feedLimiter } = require("../middleware/rateLimit");
 
 // Helper: Timing-safe token comparison
@@ -164,10 +165,10 @@ const getFinancialData = async () => {
   ];
 
   const [
-    accounts,
+    allAccounts,
     monthExpensesSum,
     monthIncomeSum,
-    upcomingBills,
+    allUpcomingBills,
     recentTransactions,
     historyRows,
     budgets,
@@ -234,6 +235,10 @@ const getFinancialData = async () => {
       // Same numbers as the app's Safe to Spend card (G1)
       getForecast(FORECAST_DAYS),
     ]);
+
+  // Archived cards, debts and goals are left out of the feed (history rows keep their names)
+  const accounts = allAccounts.filter((a) => a.isActive !== false);
+  const upcomingBills = allUpcomingBills.filter((b) => !usesArchivedAccount(b));
 
   const balancesSummary = await getBalancesSummary(null, todayStr);
   const checkingBalance = balancesSummary.checking;

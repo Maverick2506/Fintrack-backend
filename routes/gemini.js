@@ -281,10 +281,7 @@ router.post(
       }
 
       // Debts and cards (G14)
-      const cards = accounts.filter((a) => a.type === "CREDIT_CARD");
-      const debts = accounts.filter(
-        (a) => a.type === "DEBT" && parseFloat(a.initialBalance || 0) > 0 && a.isActive !== false
-      );
+      const { cards, debts } = getContextAccounts(accounts);
 
       // Registered Accounts room (C3, G14)
       const registeredDescriptions = registeredSummariesList.map((r) => {
@@ -646,6 +643,16 @@ const getDebtPayoffDeclaration = {
   },
 };
 
+// Accounts the AI may see. Archived cards, debts and goals are left out (R7).
+const getContextAccounts = (accounts) => {
+  const active = accounts.filter((a) => a.isActive !== false);
+  return {
+    cards: active.filter((a) => a.type === "CREDIT_CARD"),
+    debts: active.filter((a) => a.type === "DEBT" && parseFloat(a.initialBalance || 0) > 0),
+    goals: active.filter((a) => a.type === "SAVINGS_GOAL"),
+  };
+};
+
 // Tool Execution Handlers (S1 exact math)
 async function executeTool(name, args, todayStr) {
   if (name === "simulatePurchase") {
@@ -659,7 +666,9 @@ async function executeTool(name, args, todayStr) {
     const buffer = baseline.buffer;
 
     if (accountType.includes("credit") || accountType.includes("card")) {
-      const cards = await Account.findAll({ where: { type: "CREDIT_CARD" } });
+      const { cards } = getContextAccounts(
+        await Account.findAll({ where: { type: "CREDIT_CARD" } })
+      );
       const totalCC = cards.reduce((sum, c) => sum + parseFloat(c.initialBalance || 0), 0);
       const targetCard = cards.find((c) =>
         accountType.includes(c.name.toLowerCase())
@@ -851,11 +860,7 @@ router.post(
       const checkingBalance = checking
         ? await getCalculatedCheckingBalance(checking, todayStr)
         : 0;
-      const cards = accounts.filter((a) => a.type === "CREDIT_CARD");
-      const debts = accounts.filter(
-        (a) => a.type === "DEBT" && parseFloat(a.initialBalance || 0) > 0 && a.isActive !== false
-      );
-      const goals = accounts.filter((a) => a.type === "SAVINGS_GOAL");
+      const { cards, debts, goals } = getContextAccounts(accounts);
 
       const systemPrompt = `
 You are Maverick's elite personal financial strategist and money architect inside FinTrack.
@@ -996,3 +1001,4 @@ BEHAVIOR GUIDELINES:
 );
 
 module.exports = router;
+module.exports.getContextAccounts = getContextAccounts;

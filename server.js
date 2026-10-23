@@ -41,6 +41,7 @@ const forecastRoutes = require("./routes/forecast");
 const settingsRoutes = require("./routes/settings");
 const netWorthHistoryRoutes = require("./routes/netWorthHistory");
 const subscriptionRoutes = require("./routes/subscriptions");
+const accountRoutes = require("./routes/accounts");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -120,6 +121,7 @@ app.use("/api", savingsGoalRoutes);
 app.use("/api", dashboardRoutes);
 app.use("/api", geminiRoutes);
 app.use("/api", creditCardRoutes);
+app.use("/api", accountRoutes);
 app.use("/api", paychequeRoutes);
 app.use("/api/budgets", budgetRoutes);
 app.use("/api/forecast", forecastRoutes);
