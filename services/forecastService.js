@@ -3,8 +3,14 @@ const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
-const { getNextOccurrenceDate, getNextDueDate, getSeriesAnchorDay } = require("../routes/recurring");
+const { getNextOccurrenceDate, getSeriesAnchorDay } = require("../routes/recurring");
 const { usesArchivedAccount } = require("./accountArchiveService");
+const {
+  DEBT_INTEREST_START_KEY,
+  interestClientRef,
+  isDebtInterestEnabled,
+  projectDebtSchedule,
+} = require("./debtInterestService");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
 const addCalendarDays = (baseDateStr, daysToAdd) => {
@@ -97,9 +103,10 @@ const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, d
  *   days: Array<{ date: string, balance: number, items: Array<{ title: string, amount: number }> }>
  * }>}
  */
-const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
+const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options = {}) => {
   const horizonDays = Math.min(Math.max(parseInt(daysCount, 10) || 60, 1), 365);
-  const todayStr = getTodayString();
+  // options.todayStr overrides "today" (America/Toronto) so tests can use fixed dates
+  const todayStr = options.todayStr || getTodayString();
   const endDateStr = addCalendarDays(todayStr, horizonDays - 1);
 
   // Initialize day buckets
@@ -326,58 +333,65 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
   // 3b. Estimated paycheques: fill future paydays when income isn't set up as a recurring series
   const estimatedIncome = await estimatePaycheques({ daysMap, todayStr, endDateStr, checkingId, dbTx });
 
-  // 4. Auto-Pay Debts
-  const autoPayDebts = await Account.findAll({
-    where: {
-      type: "DEBT",
-      autoPay: true,
-      isActive: { [Op.ne]: false },
-      initialBalance: { [Op.gt]: 0 },
-    },
-    transaction: dbTx,
-  });
+  // 4. Debts: interest on each due date, then auto-pay, projected exactly as the daily sweep runs them
+  //    (debtInterestService.projectDebtSchedule). Only auto-pay leaves Checking; interest changes how
+  //    much is owed, and so the size of the last payment. Non-auto-pay debts are projected for `debts`.
+  const [interestEnabled, interestStartSetting, activeDebts] = await Promise.all([
+    isDebtInterestEnabled(Setting, dbTx),
+    Setting.findByPk(DEBT_INTEREST_START_KEY, { transaction: dbTx }),
+    Account.findAll({
+      where: {
+        type: "DEBT",
+        isActive: { [Op.ne]: false },
+        initialBalance: { [Op.gt]: 0 },
+        dueDate: { [Op.ne]: null },
+      },
+      order: [["createdAt", "ASC"]],
+      transaction: dbTx,
+    }),
+  ]);
+  // Before the first sweep with interest has run, it will start from its own run date (today or later)
+  const interestStartDate = interestStartSetting ? interestStartSetting.value : todayStr;
+  const debtProjections = [];
 
-  for (const debt of autoPayDebts) {
-    let rem = parseFloat(debt.initialBalance) || 0;
+  for (const debt of activeDebts) {
     const minPay = parseFloat(debt.minimumPayment) || 0;
-    if (rem <= 0 || minPay <= 0 || !debt.dueDate) continue;
+    const autoPay = Boolean(debt.autoPay) && minPay > 0;
+    const schedule = projectDebtSchedule({
+      balance: debt.initialBalance,
+      apr: debt.interestRate,
+      minimumPayment: minPay,
+      autoPay,
+      dueDate: debt.dueDate,
+      dueDay: debt.dueDay,
+      frequency: debt.paymentFrequency || "monthly",
+      fromDate: debt.dueDate,
+      toDate: endDateStr,
+      interestEnabled,
+      interestStartDate,
+      // Rows the sweep already recorded for a due date. An overdue due date is paid today.
+      handledFor: (dueDate) => {
+        const payDate = dueDate < todayStr ? todayStr : dueDate;
+        return {
+          interest: dbTransactions.some((t) => t.clientRef === interestClientRef(debt.id, dueDate)),
+          payment: dbTransactions.some((t) => t.toAccountId === debt.id && t.date === payDate),
+        };
+      },
+    });
 
-    let curDue = debt.dueDate;
-
-    // Overdue auto-pay: due on Day 0 (today)
-    if (curDue < todayStr) {
-      const alreadyHasTodayPay = dbTransactions.some(
-        (t) => t.toAccountId === debt.id && t.date === todayStr
-      );
-      if (!alreadyHasTodayPay) {
-        const payAmt = Math.min(rem, minPay);
-        daysMap[todayStr].items.push({
-          title: `Auto-Pay for ${debt.name}`,
-          amount: -payAmt,
-          type: "debt",
-        });
-        rem = Math.round(Math.max(0, rem - payAmt) * 100) / 100;
-      }
-      curDue = getNextDueDate(curDue, debt.paymentFrequency || "monthly");
-    }
-
-    while (curDue && curDue <= endDateStr && rem > 0) {
-      if (curDue >= todayStr && daysMap[curDue]) {
-        const alreadyHasPay = dbTransactions.some(
-          (t) => t.toAccountId === debt.id && t.date === curDue
-        );
-        if (!alreadyHasPay) {
-          const payAmt = Math.min(rem, minPay);
-          daysMap[curDue].items.push({
+    for (const step of schedule) {
+      if (step.payment > 0) {
+        const payDate = step.date < todayStr ? todayStr : step.date;
+        if (daysMap[payDate]) {
+          daysMap[payDate].items.push({
             title: `Auto-Pay for ${debt.name}`,
-            amount: -payAmt,
+            amount: -step.payment,
             type: "debt",
           });
-          rem = Math.round(Math.max(0, rem - payAmt) * 100) / 100;
         }
       }
-      curDue = getNextDueDate(curDue, debt.paymentFrequency || "monthly");
     }
+    debtProjections.push({ id: debt.id, name: debt.name, schedule });
   }
 
   // 4b. Inject hypothetical simulated items (e.g. for simulatePurchase S1)
@@ -458,6 +472,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = []) => {
     lowestPoint: lowestPoint || { date: todayStr, balance: Math.round(startBalance * 100) / 100 },
     days,
     estimatedIncome,
+    debts: debtProjections,
   };
 };
 

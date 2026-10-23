@@ -3,6 +3,8 @@
  * Ported from Phase H frontend debtMath for Gemini Function Calling & backend intelligence.
  */
 
+const { computePeriodInterest } = require("./debtInterestService");
+
 function normalizeMonthlyPayment(payment, frequency = "monthly") {
   const p = parseFloat(payment) || 0;
   const freq = (frequency || "monthly").toLowerCase();
@@ -125,8 +127,8 @@ function simulate(
 
     // 1. Accrue interest
     for (const debt of activeDebts) {
-      const r = getMonthlyRate(debt.apr);
-      const interest = Math.round(debt.balance * r * 100) / 100;
+      // Same formula and rounding as the daily sweep's interest rows, so plan and balances agree
+      const interest = computePeriodInterest(debt.balance, debt.apr, "monthly");
       debt.balance = Math.round((debt.balance + interest) * 100) / 100;
       debt.totalInterest = Math.round((debt.totalInterest + interest) * 100) / 100;
       totalInterest = Math.round((totalInterest + interest) * 100) / 100;

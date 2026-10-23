@@ -8,6 +8,7 @@ const {
   recordFinalPayment,
   adjustBalanceToZero,
 } = require("../services/accountArchiveService");
+const { reconcileAccount } = require("../services/reconcileService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -59,6 +60,28 @@ settleRoute("/accounts/:id/final-payment", schemas.finalPayment, (account, body,
 // Brings the balance to $0 with one Adjustment row (written off, closed by bank, spent)
 settleRoute("/accounts/:id/adjust-to-zero", schemas.adjustToZero, (account, body, dbTx) =>
   adjustBalanceToZero(account, body.reason, dbTx)
+);
+
+// Sync with statement (F4): one cleared Interest or Adjustment row for the difference
+router.post(
+  "/accounts/:id/reconcile",
+  validateBody(schemas.reconcile),
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    try {
+      const account = await Account.findByPk(req.params.id, { transaction: dbTx });
+      if (!account) {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Account not found" });
+      }
+      const result = await reconcileAccount(account, req.body, dbTx);
+      await dbTx.commit();
+      res.status(201).json(result);
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
+    }
+  })
 );
 
 module.exports = router;

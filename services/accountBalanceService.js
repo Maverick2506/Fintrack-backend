@@ -44,10 +44,10 @@ const adjustAccountForTransaction = async (
     }
 
     let applied = false;
-    // 1. Cleared expense charged FROM a Credit Card
+    // 1. Cleared expense charged FROM a Credit Card, or interest/adjustment charged to a Debt
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
-      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+      if (fromAcc && (fromAcc.type === "CREDIT_CARD" || fromAcc.type === "DEBT")) {
         await Account.increment("initialBalance", {
           by: amount,
           where: { id: trx.fromAccountId },
@@ -100,10 +100,10 @@ const adjustAccountForTransaction = async (
     // Only reverse if balance was actually applied!
     if (!trx.balanceApplied) return;
 
-    // 1. Reverse expense charged FROM a Credit Card
+    // 1. Reverse expense charged FROM a Credit Card or a Debt
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
-      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+      if (fromAcc && (fromAcc.type === "CREDIT_CARD" || fromAcc.type === "DEBT")) {
         await Account.increment("initialBalance", {
           by: -amount,
           where: { id: trx.fromAccountId },
