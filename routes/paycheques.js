@@ -5,10 +5,19 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
+const { isClientRefConflict } = require("../services/clientRefService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
 router.use("/paycheques", authMiddleware);
+
+// Response for a create whose clientRef was already saved (an idempotent retry)
+const duplicatePaychequeResponse = (existing) => ({
+  ...existing.toJSON(),
+  name: existing.title,
+  payment_date: existing.date,
+  isDuplicate: true,
+});
 
 const TIMEZONE = "America/Toronto";
 const getTodayString = () =>
@@ -49,12 +58,7 @@ router.post(
         where: { clientRef: req.body.clientRef },
       });
       if (existing) {
-        return res.status(200).json({
-          ...existing.toJSON(),
-          name: existing.title,
-          payment_date: existing.date,
-          isDuplicate: true,
-        });
+        return res.status(200).json(duplicatePaychequeResponse(existing));
       }
     }
 
@@ -62,17 +66,32 @@ router.post(
     // Only mark income cleared if its payment date has arrived
     const isCleared = payment_date <= todayStr;
 
-    const newIncome = await Transaction.create({
-      title: name,
-      amount: parseFloat(amount),
-      date: payment_date,
-      type: "INCOME",
-      category: "Income",
-      isCleared,
-      toAccountId: checking ? checking.id : null,
-      recurrence: recurrence || "none",
-      clientRef: req.body.clientRef || null,
-    });
+    let newIncome;
+    try {
+      newIncome = await Transaction.create({
+        title: name,
+        amount: parseFloat(amount),
+        date: payment_date,
+        type: "INCOME",
+        category: "Income",
+        isCleared,
+        toAccountId: checking ? checking.id : null,
+        recurrence: recurrence || "none",
+        clientRef: req.body.clientRef || null,
+      });
+    } catch (error) {
+      // Two requests with the same clientRef raced past the check above and this one
+      // lost on the unique index: the other request saved it, so return that row.
+      if (req.body.clientRef && isClientRefConflict(error)) {
+        const existing = await Transaction.findOne({
+          where: { clientRef: req.body.clientRef },
+        });
+        if (existing) {
+          return res.status(200).json(duplicatePaychequeResponse(existing));
+        }
+      }
+      throw error;
+    }
 
     if (recurrence && recurrence !== "none") {
       await createRecurringExpenses().catch((err) =>

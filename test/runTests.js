@@ -4743,6 +4743,68 @@ async function runTestSuite() {
   await s33("DELETE", `/api/debts/${s33DebtId}`);
   await Transaction.destroy({ where: { title: "Payment for Suite 33 Loan" } });
 
+  console.log("\n--- Suite 34: Simultaneous Retries With the Same clientRef ---");
+  const { isClientRefConflict } = require("../services/clientRefService");
+  const s34Post = (path, body) =>
+    request({ hostname: "localhost", port: 8000, path, method: "POST", headers: authHeaders }, body);
+
+  // A retry that reaches the server together with the first save: one row is
+  // created and every other request gets that row back as a duplicate (not 409/500).
+  let s34CleanRounds = 0;
+  const s34Rounds = 5;
+  for (let round = 0; round < s34Rounds; round++) {
+    const ref = crypto.randomUUID();
+    const body = { name: "Suite 34 Pay", amount: 100, payment_date: "2026-04-15", clientRef: ref };
+    const results = await Promise.all([0, 1, 2].map(() => s34Post("/api/paycheques", body)));
+    const created = results.filter((r) => r.status === 201);
+    const dups = results.filter((r) => r.status === 200 && r.body.isDuplicate === true);
+    const rows = await Transaction.count({ where: { clientRef: ref } });
+    if (
+      created.length === 1 &&
+      dups.length === 2 &&
+      dups.every((r) => r.body.id === created[0].body.id && r.body.name === "Suite 34 Pay") &&
+      rows === 1
+    ) {
+      s34CleanRounds++;
+    } else {
+      console.error("    Suite 34 round statuses:", results.map((r) => r.status).join(", "), "rows:", rows);
+    }
+    await Transaction.destroy({ where: { clientRef: ref } });
+  }
+  assert(
+    s34CleanRounds === s34Rounds,
+    "Simultaneous POST /paycheques with one clientRef: one 201, the rest 200 isDuplicate with the same row"
+  );
+
+  // The expenses route runs inside a transaction. On Postgres the race loser fails on the
+  // clientRef unique index; SQLite (tests) locks instead, so check the detection directly.
+  const s34Ref = crypto.randomUUID();
+  const s34Row = { title: "Suite 34 Coffee", amount: 4, date: "2026-04-15", type: "EXPENSE", category: "Food & Drink" };
+  await Transaction.create({ ...s34Row, clientRef: s34Ref });
+  let s34SqliteErr = null;
+  try {
+    await Transaction.create({ ...s34Row, clientRef: s34Ref });
+  } catch (err) {
+    s34SqliteErr = err;
+  }
+  await Transaction.destroy({ where: { clientRef: s34Ref } });
+  assert(isClientRefConflict(s34SqliteErr), "A duplicate clientRef insert on SQLite is recognised as a clientRef conflict");
+  // Shape of the error Postgres (Neon) raises for the same race, as Sequelize reports it
+  const s34PgErr = Object.assign(new Error("Validation error"), {
+    name: "SequelizeUniqueConstraintError",
+    fields: { clientRef: s34Ref },
+    parent: { code: "23505", constraint: "transactions_client_ref_unique" },
+    original: { code: "23505", constraint: "transactions_client_ref_unique" },
+  });
+  assert(isClientRefConflict(s34PgErr), "A duplicate clientRef insert on Postgres is recognised as a clientRef conflict");
+  const s34RecurringErr = Object.assign(new Error("Validation error"), {
+    name: "SequelizeUniqueConstraintError",
+    fields: { recurringGroupId: s34Ref, date: "2026-04-15" },
+    parent: { code: "23505", constraint: "transactions_recurring_group_date_unique" },
+  });
+  assert(!isClientRefConflict(s34RecurringErr), "Other unique conflicts (recurring series date) are not treated as clientRef duplicates");
+  assert(!isClientRefConflict(new Error("SQLITE_BUSY: database is locked")), "Non-unique errors are not treated as clientRef duplicates");
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

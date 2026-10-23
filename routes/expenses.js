@@ -7,6 +7,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateQuery, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
+const { isClientRefConflict } = require("../services/clientRefService");
 const {
   adjustAccountForTransaction,
   getTodayString,
@@ -16,6 +17,19 @@ const router = express.Router();
 router.param("id", validateIdParam);
 
 router.use("/expenses", authMiddleware);
+
+// Response for a create whose clientRef was already saved (an idempotent retry)
+const duplicateExpenseResponse = (existing) => ({
+  ...existing.toJSON(),
+  id: existing.id,
+  name: existing.title,
+  amount: parseFloat(existing.amount),
+  date: existing.date,
+  due_date: existing.date,
+  category: existing.category,
+  is_paid: existing.isCleared,
+  isDuplicate: true,
+});
 
 // Helper to format YYYY-MM-DD month boundaries cleanly
 const getMonthDateRange = (year, month) => {
@@ -299,17 +313,7 @@ router.post(
         });
         if (existing) {
           await dbTx.rollback();
-          return res.status(200).json({
-            ...existing.toJSON(),
-            id: existing.id,
-            name: existing.title,
-            amount: parseFloat(existing.amount),
-            date: existing.date,
-            due_date: existing.date,
-            category: existing.category,
-            is_paid: existing.isCleared,
-            isDuplicate: true,
-          });
+          return res.status(200).json(duplicateExpenseResponse(existing));
         }
       }
 
@@ -351,6 +355,16 @@ router.post(
       res.status(201).json(newExp);
     } catch (error) {
       await dbTx.rollback();
+      // Two requests with the same clientRef raced past the check above and this one
+      // lost on the unique index: the other request saved it, so return that row.
+      if (req.body.clientRef && isClientRefConflict(error)) {
+        const existing = await Transaction.findOne({
+          where: { clientRef: req.body.clientRef },
+        });
+        if (existing) {
+          return res.status(200).json(duplicateExpenseResponse(existing));
+        }
+      }
       throw error;
     }
   })
