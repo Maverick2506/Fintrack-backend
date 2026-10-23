@@ -5009,8 +5009,11 @@ async function runTestSuite() {
       normalizePayeeTitle(" hydro ") === "hydro" &&
       normalizePayeeTitle("HYDRO 10/15") === "hydro" &&
       normalizePayeeTitle("Rent 2026-11-01") === "rent" &&
-      normalizePayeeTitle("Bell Sept. bill") === "bell bill",
-    "Payee titles are lowercased, trimmed, with digits, dates and month names removed"
+      normalizePayeeTitle("Bell Sept. bill") === "bell bill" &&
+      normalizePayeeTitle("Café Nero") === "cafe nero" &&
+      normalizePayeeTitle("Marché Jean-Talon") === "marche jean-talon" &&
+      normalizePayeeTitle("Marché Mar") === "marche",
+    "Payee titles are lowercased, trimmed, with digits, dates, month names and accents removed"
   );
 
   const s36Today = getTorontoToday();

@@ -12,13 +12,16 @@ const normalizePayeeTitle = (rawTitle) => {
   const fallback = rawTitle.toLowerCase().trim();
 
   const cleaned = fallback
+    // Drop accents first, so "Café" stays "cafe" and "Marché" isn't read as "march"
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
     // ISO dates and numeric dates like 10/15, 10-15-2026
     .replace(/\b\d{4}-\d{1,2}-\d{1,2}\b/g, " ")
     .replace(/\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b/g, " ")
-    .replace(new RegExp(`\\b(?:${MONTH_WORDS})(?![a-z])\\.?`, "g"), " ")
+    .replace(new RegExp(`(?<![\\p{L}])(?:${MONTH_WORDS})(?![\\p{L}])\\.?`, "gu"), " ")
     .replace(/\d+/g, " ")
-    // Keep letters, spaces, & ' and - only
-    .replace(/[^a-z\s&'-]/g, " ")
+    // Keep letters (any language), spaces, & ' and - only
+    .replace(/[^\p{L}\s&'-]/gu, " ")
     .replace(/\s+/g, " ")
     .replace(/^[\s&'-]+|[\s&'-]+$/g, "")
     .trim();

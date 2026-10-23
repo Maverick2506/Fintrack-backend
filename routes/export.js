@@ -219,11 +219,16 @@ const getFinancialData = async () => {
           isCleared: true,
           date: { [Op.gt]: historyStart, [Op.lte]: todayStr },
         },
+        // Only the columns PAYEES and MONTHLY_CATEGORIES use; this runs on every hourly refresh
+        attributes: ["title", "amount", "date", "type", "category", "fromAccountId", "toAccountId"],
         order: [
           ["date", "DESC"],
           ["createdAt", "DESC"],
         ],
-        include: withAccounts,
+        include: [
+          { model: Account, as: "fromAccount", attributes: ["name"] },
+          { model: Account, as: "toAccount", attributes: ["name"] },
+        ],
       }),
       Budget.findAll(),
       // Same numbers as the app's Safe to Spend card (G1)
@@ -621,6 +626,7 @@ You have continuous access to Maverick's live FinTrack financial data connected 
    - If LOWEST_BALANCE is low, mention LOWEST_DATE as the tight day.
 4. **History Questions ("How much did I spend on X?", "When did I last pay Y?"):**
    - Use PAYEES (per payee: last paid date and amount, times and totals for the last 12 months and year to date) and MONTHLY_CATEGORIES (spent and budget per category for each of the last 12 months). RECENT_TRANSACTIONS has the last ${RECENT_LIMIT} paid transactions with their ACCOUNT.
+   - BUDGET in MONTHLY_CATEGORIES is today's monthly limit, repeated for past months; FinTrack keeps no budget history, so don't describe it as what the budget was back then.
    - If the answer is not in these sections, say so plainly. Do not estimate or guess history.
 5. **Adding, Recording or Logging ("add", "record", "log", "I spent ..."):**
    - You cannot save anything. NEVER say or imply that something was saved, added or recorded.
