@@ -5004,16 +5004,34 @@ async function runTestSuite() {
       return out;
     });
 
+  // Maverick's rule: drop dates and reference numbers, keep digits that belong to the name
+  const s36NormCases = [
+    ["7-Eleven #2231", "7-eleven"],
+    ["Hydro Oct", "hydro"],
+    ["hydro", "hydro"],
+    [" HYDRO 10/15 ", "hydro"],
+    ["Hydro Oct 22", "hydro"],
+    ["COSTCO WHOLESALE 1234", "costco wholesale"],
+    ["99 Ranch Market", "99 ranch market"],
+    ["Rent 2026-10-01", "rent"],
+    ["Netflix.com", "netflix.com"],
+    ["3M", "3m"],
+    ["A&W", "a&w"],
+    ["POS 000123 Tim Hortons", "pos tim hortons"],
+    ["Store #4521 Walmart", "store walmart"],
+    ["Gym no. 12", "gym"],
+    ["Visa ref 88912", "visa"],
+    ["No Frills", "no frills"],
+    ["Bell Sept. bill", "bell bill"],
+    ["Café Nero", "cafe nero"],
+    ["Marché Jean-Talon", "marche jean-talon"],
+  ];
+  const s36NormWrong = s36NormCases.filter(([raw, want]) => normalizePayeeTitle(raw) !== want);
   assert(
-    normalizePayeeTitle("Hydro Oct") === "hydro" &&
-      normalizePayeeTitle(" hydro ") === "hydro" &&
-      normalizePayeeTitle("HYDRO 10/15") === "hydro" &&
-      normalizePayeeTitle("Rent 2026-11-01") === "rent" &&
-      normalizePayeeTitle("Bell Sept. bill") === "bell bill" &&
-      normalizePayeeTitle("Café Nero") === "cafe nero" &&
-      normalizePayeeTitle("Marché Jean-Talon") === "marche jean-talon" &&
-      normalizePayeeTitle("Marché Mar") === "marche",
-    "Payee titles are lowercased, trimmed, with digits, dates, month names and accents removed"
+    s36NormWrong.length === 0,
+    `Payee titles drop dates and reference numbers but keep digits in names (wrong: ${
+      s36NormWrong.map(([raw, want]) => `${raw} -> ${normalizePayeeTitle(raw)} (want ${want})`).join("; ") || "none"
+    })`
   );
 
   const s36Today = getTorontoToday();
