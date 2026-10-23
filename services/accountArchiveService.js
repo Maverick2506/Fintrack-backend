@@ -74,6 +74,15 @@ const getDeleteImpact = async (account, dbTx = null) => {
       total: round2(unpaidRows.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0)),
       titles: [...new Set(unpaidRows.map((t) => t.title))],
       movableCount: unpaidRows.filter((t) => isMovableToChecking(t, account.id)).length,
+      items: unpaidRows.map((t) => ({
+        id: t.id,
+        title: t.title,
+        date: t.date,
+        amount: round2(parseFloat(t.amount) || 0),
+        type: t.type,
+        recurringGroupId: t.recurringGroupId || null,
+        movable: isMovableToChecking(t, account.id),
+      })),
     },
     series: activeSeries.map(({ latest }) => ({
       recurringGroupId: latest.recurringGroupId || latest.id,

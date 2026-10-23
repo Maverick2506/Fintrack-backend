@@ -5256,6 +5256,12 @@ async function runTestSuite() {
     "delete-impact lists Netflix as the card's active monthly series"
   );
   assert(s37Impact.status === 200 && s37Impact.body.balance === 0, "delete-impact returns the card balance");
+  assert(
+    s37Impact.status === 200 &&
+      s37Impact.body.unpaid.items.find((i) => i.title === "Suite 37 Netflix")?.movable === true &&
+      s37Impact.body.unpaid.items.find((i) => i.title === "Payment for Suite 37 Visa")?.movable === false,
+    "delete-impact marks the card charge as movable to Checking and the payment to the card as not"
+  );
   const s37ImpactBad = await s33("GET", "/api/accounts/not-a-uuid/delete-impact");
   assert(s37ImpactBad.status === 400, "delete-impact rejects a non-UUID id with 400");
   const s37ImpactChecking = await s33("GET", `/api/accounts/${s37Checking.id}/delete-impact`);
