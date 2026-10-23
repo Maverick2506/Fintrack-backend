@@ -4743,67 +4743,242 @@ async function runTestSuite() {
   await s33("DELETE", `/api/debts/${s33DebtId}`);
   await Transaction.destroy({ where: { title: "Payment for Suite 33 Loan" } });
 
-  console.log("\n--- Suite 34: Simultaneous Retries With the Same clientRef ---");
+  // 34. Post-merge review fixes (N1, N4)
+  console.log("\n--- Suite 34: Post-merge Review Fixes ---");
+  // Started 10 days ago so next month's date falls inside the 30-day generation horizon
+  const s34Start = getTorontoOffsetDate(-10);
+  const s34NextMonth = getNextOccurrenceDate(s34Start, "monthly", 1);
+
+  // N1: a Quick Add row (with clientRef) that is later made recurring still generates
+  const s34Quick = await s33("POST", "/api/expenses", {
+    name: "Suite 34 Quick Gym", amount: 40, due_date: s34Start, category: "Other", is_paid: true,
+    recurrence: "none", clientRef: "7d8c1c1e-3a43-4b8e-9a51-0f2b1e9f5a34",
+  });
+  assert(s34Quick.status === 201, "Creates a Quick Add expense with a clientRef");
+  const s34QuickPut = await s33("PUT", `/api/expenses/${s34Quick.body.id}`, { recurrence: "monthly" });
+  assert(s34QuickPut.status === 200, "Makes the Quick Add expense monthly");
+  const s34QuickRows = await Transaction.findAll({ where: { recurringGroupId: s34QuickPut.body.recurringGroupId } });
+  const s34QuickNext = s34QuickRows.find((t) => t.date === s34NextMonth);
+  assert(s34QuickNext, "Next month's occurrence is generated for a series that started from Quick Add (N1)");
+  assert(s34QuickNext && s34QuickNext.clientRef === null, "Generated occurrence does not copy the original clientRef (N1)");
+  await Transaction.destroy({ where: { recurringGroupId: s34QuickPut.body.recurringGroupId } });
+
+  const s34Income = await s33("POST", "/api/paycheques", {
+    name: "Suite 34 Quick Income", amount: 100, payment_date: s34Start, recurrence: "none",
+    clientRef: "7d8c1c1e-3a43-4b8e-9a51-0f2b1e9f5a35",
+  });
+  assert(s34Income.status === 201, "Creates a Quick Add income with a clientRef");
+  const s34IncomePut = await s33("PUT", `/api/expenses/${s34Income.body.id}`, { recurrence: "monthly", payment_date: s34Start });
+  const s34IncomeRows = await Transaction.findAll({ where: { recurringGroupId: s34IncomePut.body.recurringGroupId } });
+  assert(s34IncomeRows.some((t) => t.date === s34NextMonth), "Quick Add income made monthly generates next month's paycheque (N1)");
+  await Transaction.destroy({ where: { recurringGroupId: s34IncomePut.body.recurringGroupId } });
+
+  // N4: month-end dates come back after a short month instead of drifting to the clamped day
+  assert(getNextOccurrenceDate("2026-02-28", "monthly", 1, 31) === "2026-03-31", "Monthly step with anchor day 31 returns from Feb 28 to Mar 31 (N4)");
+  assert(getNextOccurrenceDate("2026-01-31", "monthly", 1, 31) === "2026-02-28", "Monthly step with anchor day 31 still clamps to Feb 28 (N4)");
+  assert(getNextOccurrenceDate("2028-02-29", "yearly", 1) === "2029-02-28", "Yearly step clamps Feb 29 to Feb 28");
+  const { getSeriesAnchorDay } = require("../routes/recurring");
+  assert(getSeriesAnchorDay(["2026-02-28", "2026-01-31"]) === 31, "A clamped month-end date keeps the series' original day (N4)");
+  assert(getSeriesAnchorDay(["2026-03-15", "2026-01-31"]) === 15, "A series moved to another day keeps the new day (N4)");
+  assert(getSeriesAnchorDay(["2026-03-31"]) === 31, "A single-row series uses its own day");
+  assert(getSeriesAnchorDay(["2026-09-30", "2026-08-31", "2026-07-15"]) === 31, "A series moved to the 31st keeps the 31st after a 30-day month");
+  assert(getSeriesAnchorDay(["2026-02-28", "2026-01-29"]) === 29, "A series on the 29th returns to the 29th after February");
+  assert(getSeriesAnchorDay(["2026-04-30", "2026-03-30", "2026-02-28"]) === 30, "A series on the 30th stays on the 30th");
+
+  // Fixed dates through the generator's todayStr option, so these checks do not depend on the run date
+  const { createRecurringExpenses: s34Generate, QUICK_ADD_CATCHUP_KEY } = require("../routes/recurring");
+  const s34FixedToday = "2026-03-05"; // 30-day horizon ends 2026-04-04
+  const s34GroupDates = async (groupId) =>
+    (await Transaction.findAll({ where: { recurringGroupId: groupId }, order: [["date", "ASC"]] })).map((t) => t.date);
+
+  // N4 integration: a series on the 31st whose newest row was clamped to Feb 28 returns to Mar 31
+  const s34RentGroup = "4b0b5f2e-6c1d-4a8e-9f3a-2d7c8e9f0a34";
+  await Transaction.bulkCreate([
+    { title: "Suite 34 Month End Rent", amount: 10, date: "2026-01-31", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34RentGroup },
+    { title: "Suite 34 Month End Rent", amount: 10, date: "2026-02-28", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34RentGroup },
+  ]);
+  await s34Generate(null, { todayStr: s34FixedToday });
+  const s34RentDates = await s34GroupDates(s34RentGroup);
+  assert(s34RentDates[2] === "2026-03-31", `Month-end series generates 2026-03-31 after 2026-02-28 (N4), got ${s34RentDates[2]}`);
+  await Transaction.destroy({ where: { recurringGroupId: s34RentGroup } });
+
+  // Series moved from the 15th to the 31st keeps the 31st after a 30-day month
+  const s34MovedGroup = "4b0b5f2e-6c1d-4a8e-9f3a-2d7c8e9f0a35";
+  await Transaction.bulkCreate([
+    { title: "Suite 34 Moved Rent", amount: 10, date: "2025-12-15", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34MovedGroup },
+    { title: "Suite 34 Moved Rent", amount: 10, date: "2026-01-31", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34MovedGroup },
+    { title: "Suite 34 Moved Rent", amount: 10, date: "2026-02-28", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s34MovedGroup },
+  ]);
+  await s34Generate(null, { todayStr: s34FixedToday });
+  const s34MovedDates = await s34GroupDates(s34MovedGroup);
+  assert(s34MovedDates[3] === "2026-03-31", `Series moved to the 31st generates 2026-03-31, got ${s34MovedDates[3]}`);
+  await Transaction.destroy({ where: { recurringGroupId: s34MovedGroup } });
+
+  // One-time effect of N1: a Quick Add series that never generated does not backfill months before the
+  // first run after deploy (stored in a Setting); it picks up from that date instead
+  const s34SavedCatchup = await Setting.findByPk(QUICK_ADD_CATCHUP_KEY);
+  await Setting.upsert({ key: QUICK_ADD_CATCHUP_KEY, value: s34FixedToday });
+  const s34OldGym = "4b0b5f2e-6c1d-4a8e-9f3a-2d7c8e9f0a36";
+  const s34OldPay = "4b0b5f2e-6c1d-4a8e-9f3a-2d7c8e9f0a37";
+  const s34Plain = "4b0b5f2e-6c1d-4a8e-9f3a-2d7c8e9f0a38";
+  await Transaction.bulkCreate([
+    { title: "Suite 34 Old Gym", amount: 40, date: "2026-01-13", type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly", recurringGroupId: s34OldGym, clientRef: "7d8c1c1e-3a43-4b8e-9a51-0f2b1e9f5a36" },
+    { title: "Suite 34 Old Pay", amount: 100, date: "2026-01-13", type: "INCOME", isCleared: true, recurrence: "monthly", recurringGroupId: s34OldPay, clientRef: "7d8c1c1e-3a43-4b8e-9a51-0f2b1e9f5a37" },
+    { title: "Suite 34 Plain Bill", amount: 20, date: "2026-01-13", type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly", recurringGroupId: s34Plain },
+  ]);
+  await s34Generate(null, { todayStr: s34FixedToday });
+  const s34GymDates = await s34GroupDates(s34OldGym);
+  const s34PayDates = await s34GroupDates(s34OldPay);
+  assert(
+    s34GymDates.join(",") === "2026-01-13,2026-03-13",
+    `Quick Add expense series skips missed past months and resumes on 2026-03-13, got ${s34GymDates.join(",")}`
+  );
+  assert(
+    s34PayDates.join(",") === "2026-01-13,2026-03-13",
+    `Quick Add income series skips missed past months and resumes on 2026-03-13, got ${s34PayDates.join(",")}`
+  );
+  // Later runs follow the new newest row (no clientRef) and do not go back for the skipped months
+  await s34Generate(null, { todayStr: "2026-03-20" });
+  const s34GymLater = await s34GroupDates(s34OldGym);
+  assert(
+    s34GymLater.join(",") === "2026-01-13,2026-03-13,2026-04-13",
+    `A later run continues the Quick Add series without backfilling, got ${s34GymLater.join(",")}`
+  );
+  const s34PlainDates = await s34GroupDates(s34Plain);
+  assert(s34PlainDates.includes("2026-02-13"), "A series without a clientRef still fills in a missed month as before");
+  await Transaction.destroy({ where: { recurringGroupId: [s34OldGym, s34OldPay, s34Plain] } });
+  if (s34SavedCatchup) {
+    await Setting.upsert({ key: QUICK_ADD_CATCHUP_KEY, value: s34SavedCatchup.value });
+  } else {
+    await Setting.destroy({ where: { key: QUICK_ADD_CATCHUP_KEY } });
+  }
+
+  // N5 call path: a new monthly expense is saved and next month's row is generated after the commit
+  const s34Monthly = await s33("POST", "/api/expenses", {
+    name: "Suite 34 New Monthly", amount: 12, due_date: s34Start, category: "Other", is_paid: true, recurrence: "monthly",
+  });
+  assert(s34Monthly.status === 201, "Creates a monthly expense (N5)");
+  const s34MonthlyDates = await s34GroupDates(s34Monthly.body.recurringGroupId);
+  assert(s34MonthlyDates.includes(s34NextMonth), "Next month's row is generated after the save commits (N5)");
+  await Transaction.destroy({ where: { recurringGroupId: s34Monthly.body.recurringGroupId } });
+
+  console.log("\n--- Suite 35: Simultaneous Retries With the Same clientRef ---");
   const { isClientRefConflict } = require("../services/clientRefService");
-  const s34Post = (path, body) =>
+  const s35Post = (path, body) =>
     request({ hostname: "localhost", port: 8000, path, method: "POST", headers: authHeaders }, body);
 
   // A retry that reaches the server together with the first save: one row is
   // created and every other request gets that row back as a duplicate (not 409/500).
-  let s34CleanRounds = 0;
-  const s34Rounds = 5;
-  for (let round = 0; round < s34Rounds; round++) {
+  let s35CleanRounds = 0;
+  const s35Rounds = 5;
+  for (let round = 0; round < s35Rounds; round++) {
     const ref = crypto.randomUUID();
-    const body = { name: "Suite 34 Pay", amount: 100, payment_date: "2026-04-15", clientRef: ref };
-    const results = await Promise.all([0, 1, 2].map(() => s34Post("/api/paycheques", body)));
+    const body = { name: "Suite 35 Pay", amount: 100, payment_date: "2026-04-15", clientRef: ref };
+    const results = await Promise.all([0, 1, 2].map(() => s35Post("/api/paycheques", body)));
     const created = results.filter((r) => r.status === 201);
     const dups = results.filter((r) => r.status === 200 && r.body.isDuplicate === true);
     const rows = await Transaction.count({ where: { clientRef: ref } });
     if (
       created.length === 1 &&
       dups.length === 2 &&
-      dups.every((r) => r.body.id === created[0].body.id && r.body.name === "Suite 34 Pay") &&
+      dups.every((r) => r.body.id === created[0].body.id && r.body.name === "Suite 35 Pay") &&
       rows === 1
     ) {
-      s34CleanRounds++;
+      s35CleanRounds++;
     } else {
-      console.error("    Suite 34 round statuses:", results.map((r) => r.status).join(", "), "rows:", rows);
+      console.error("    Suite 35 round statuses:", results.map((r) => r.status).join(", "), "rows:", rows);
     }
     await Transaction.destroy({ where: { clientRef: ref } });
   }
   assert(
-    s34CleanRounds === s34Rounds,
+    s35CleanRounds === s35Rounds,
     "Simultaneous POST /paycheques with one clientRef: one 201, the rest 200 isDuplicate with the same row"
   );
 
   // The expenses route runs inside a transaction. On Postgres the race loser fails on the
   // clientRef unique index; SQLite (tests) locks instead, so check the detection directly.
-  const s34Ref = crypto.randomUUID();
-  const s34Row = { title: "Suite 34 Coffee", amount: 4, date: "2026-04-15", type: "EXPENSE", category: "Food & Drink" };
-  await Transaction.create({ ...s34Row, clientRef: s34Ref });
-  let s34SqliteErr = null;
+  const s35Ref = crypto.randomUUID();
+  const s35Row = { title: "Suite 35 Coffee", amount: 4, date: "2026-04-15", type: "EXPENSE", category: "Food & Drink" };
+  await Transaction.create({ ...s35Row, clientRef: s35Ref });
+  let s35SqliteErr = null;
   try {
-    await Transaction.create({ ...s34Row, clientRef: s34Ref });
+    await Transaction.create({ ...s35Row, clientRef: s35Ref });
   } catch (err) {
-    s34SqliteErr = err;
+    s35SqliteErr = err;
   }
-  await Transaction.destroy({ where: { clientRef: s34Ref } });
-  assert(isClientRefConflict(s34SqliteErr), "A duplicate clientRef insert on SQLite is recognised as a clientRef conflict");
+  await Transaction.destroy({ where: { clientRef: s35Ref } });
+  assert(isClientRefConflict(s35SqliteErr), "A duplicate clientRef insert on SQLite is recognised as a clientRef conflict");
   // Shape of the error Postgres (Neon) raises for the same race, as Sequelize reports it
-  const s34PgErr = Object.assign(new Error("Validation error"), {
+  const s35PgErr = Object.assign(new Error("Validation error"), {
     name: "SequelizeUniqueConstraintError",
-    fields: { clientRef: s34Ref },
+    fields: { clientRef: s35Ref },
     parent: { code: "23505", constraint: "transactions_client_ref_unique" },
     original: { code: "23505", constraint: "transactions_client_ref_unique" },
   });
-  assert(isClientRefConflict(s34PgErr), "A duplicate clientRef insert on Postgres is recognised as a clientRef conflict");
-  const s34RecurringErr = Object.assign(new Error("Validation error"), {
+  assert(isClientRefConflict(s35PgErr), "A duplicate clientRef insert on Postgres is recognised as a clientRef conflict");
+  const s35RecurringErr = Object.assign(new Error("Validation error"), {
     name: "SequelizeUniqueConstraintError",
-    fields: { recurringGroupId: s34Ref, date: "2026-04-15" },
+    fields: { recurringGroupId: s35Ref, date: "2026-04-15" },
     parent: { code: "23505", constraint: "transactions_recurring_group_date_unique" },
   });
-  assert(!isClientRefConflict(s34RecurringErr), "Other unique conflicts (recurring series date) are not treated as clientRef duplicates");
+  assert(!isClientRefConflict(s35RecurringErr), "Other unique conflicts (recurring series date) are not treated as clientRef duplicates");
   assert(!isClientRefConflict(new Error("SQLITE_BUSY: database is locked")), "Non-unique errors are not treated as clientRef duplicates");
+
+  // POST /expenses race branch, end to end. SQLite locks before two live requests reach the
+  // index, so run the real route in-process and make its first lookup miss, as when the other
+  // request commits between this request's lookup and its insert. The insert then fails on the
+  // real clientRef unique index and the route must answer with the saved row.
+  const s35Express = require("express");
+  const { JWT_SECRET } = require("../config/auth");
+  const { errorHandler: s35ErrorHandler } = require("../middleware/errorHandler");
+  const s35App = s35Express();
+  s35App.use(s35Express.json());
+  s35App.use("/api", require("../routes/expenses"));
+  s35App.use(s35ErrorHandler);
+  const s35Server = await new Promise((resolve) => {
+    const srv = s35App.listen(0, () => resolve(srv));
+  });
+  const s35Token = require("jsonwebtoken").sign({ user: "Maverick" }, JWT_SECRET, { expiresIn: "5m" });
+  const s35RaceRef = crypto.randomUUID();
+  const s35Winner = await Transaction.create({
+    ...s35Row, title: "Suite 35 Race Coffee", isCleared: true, clientRef: s35RaceRef,
+  });
+  const s35Balances = async () =>
+    JSON.stringify((await Account.findAll({ order: [["id", "ASC"]] })).map((a) => [a.id, a.initialBalance]));
+  const s35BalancesBefore = await s35Balances();
+  const s35OrigFindOne = Transaction.findOne;
+  let s35LookupMissed = false;
+  Transaction.findOne = function (opts, ...rest) {
+    if (!s35LookupMissed && opts && opts.where && opts.where.clientRef === s35RaceRef && opts.transaction) {
+      s35LookupMissed = true;
+      return Promise.resolve(null);
+    }
+    return s35OrigFindOne.call(this, opts, ...rest);
+  };
+  let s35Race;
+  try {
+    s35Race = await request(
+      {
+        hostname: "localhost",
+        port: s35Server.address().port,
+        path: "/api/expenses",
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${s35Token}` },
+      },
+      { name: "Suite 35 Race Coffee", amount: 4, due_date: "2026-04-15", category: "Food & Drink", is_paid: true, applyToBalance: true, clientRef: s35RaceRef }
+    );
+  } finally {
+    Transaction.findOne = s35OrigFindOne;
+    await new Promise((resolve) => s35Server.close(resolve));
+  }
+  assert(s35LookupMissed, "Race test reached the POST /expenses clientRef lookup");
+  assert(
+    s35Race.status === 200 && s35Race.body.isDuplicate === true && s35Race.body.id === s35Winner.id,
+    `POST /expenses that loses the clientRef race returns the saved row with 200 isDuplicate (got ${s35Race.status})`
+  );
+  assert((await Transaction.count({ where: { clientRef: s35RaceRef } })) === 1, "Losing the clientRef race stores no second row");
+  assert((await s35Balances()) === s35BalancesBefore, "Losing the clientRef race changes no account balance");
+  await Transaction.destroy({ where: { clientRef: s35RaceRef } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
