@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const { toZonedTime, format } = require("date-fns-tz");
 const { getNextOccurrenceDate } = require("../routes/recurring");
 
 // Debt interest (R2): on each due date, before the payment, a debt's balance grows by one period of
@@ -43,20 +44,58 @@ const getDebtAnchorDay = (debt) => {
 const getNextDebtDueDate = (dueDate, frequency, anchorDay) =>
   getNextOccurrenceDate(dueDate, frequency || "monthly", 1, anchorDay || null);
 
-// Interest rows are idempotent through the unique clientRef index. clientRef is a UUID column, so
-// the key "interest:<debtId>:<dueDate>" is hashed into a stable UUID (same key, same UUID).
-const stableUuid = (key) => {
-  const hex = crypto.createHash("sha1").update(key).digest("hex");
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    `5${hex.slice(13, 16)}`,
-    ((parseInt(hex.slice(16, 18), 16) & 0x3f) | 0x80).toString(16) + hex.slice(18, 20),
-    hex.slice(20, 32),
-  ].join("-");
+// Interest rows are idempotent through the unique clientRef index (transactions_client_ref_unique,
+// created in server initialize() on Postgres and SQLite). clientRef is a UUID column, so the key
+// "interest:<debtId>:<dueDate>" becomes a UUIDv5 (RFC 4122, SHA-1) in a fixed FinTrack namespace:
+// the same debt and due date always give the same UUID. Never change this namespace, or interest
+// already recorded would no longer be recognised.
+const INTEREST_UUID_NAMESPACE = "3f6c2b8e-5d4a-4e1b-9c7f-2a8d6e0b4c91";
+
+const uuidV5 = (name, namespace) => {
+  const nsBytes = Buffer.from(namespace.replace(/-/g, ""), "hex");
+  const hash = crypto.createHash("sha1").update(Buffer.concat([nsBytes, Buffer.from(name, "utf8")])).digest();
+  const bytes = hash.subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
 
-const interestClientRef = (debtId, dueDate) => stableUuid(`interest:${debtId}:${dueDate}`);
+const interestClientRef = (debtId, dueDate) =>
+  uuidV5(`interest:${debtId}:${dueDate}`, INTEREST_UUID_NAMESPACE);
+
+// Due date one period before (anchored like getNextDebtDueDate)
+const getPreviousDebtDueDate = (dueDate, frequency, anchorDay) =>
+  getNextOccurrenceDate(dueDate, frequency || "monthly", -1, anchorDay || null);
+
+// Rows that count as a payment towards a debt: anything paid to it except statement-sync rows
+const NOT_A_PAYMENT_CATEGORIES = ["Adjustment", "Interest"];
+
+/**
+ * Missed payment (Debts page): the due date that most recently passed (before today) had no cleared
+ * payment to the debt between the due date before it and today. Returns that due date, or null.
+ * payments: [{ date, category }] of cleared rows paid to this debt.
+ */
+const findMissedPayment = (debt, payments, todayStr) => {
+  if (!debt.dueDate || debt.isActive === false || !((parseFloat(debt.initialBalance) || 0) > 0)) {
+    return null;
+  }
+  const frequency = debt.paymentFrequency || "monthly";
+  const anchorDay = getDebtAnchorDay(debt);
+  const lastDue =
+    debt.dueDate < todayStr ? debt.dueDate : getPreviousDebtDueDate(debt.dueDate, frequency, anchorDay);
+  // On the due day itself the payment may still come; a debt added after it never had that due date
+  if (!lastDue || lastDue >= todayStr) return null;
+  const createdStr = debt.createdAt
+    ? format(toZonedTime(new Date(debt.createdAt), "America/Toronto"), "yyyy-MM-dd")
+    : null;
+  if (createdStr && lastDue < createdStr) return null;
+  const windowStart = getPreviousDebtDueDate(lastDue, frequency, anchorDay);
+  const paid = payments.some(
+    (p) => !NOT_A_PAYMENT_CATEGORIES.includes(p.category) && p.date > windowStart && p.date <= todayStr
+  );
+  return paid ? null : lastDue;
+};
 
 const interestTitle = (debtName) => `Interest – ${debtName}`;
 
@@ -149,6 +188,10 @@ module.exports = {
   getNextDebtDueDate,
   interestClientRef,
   interestTitle,
+  uuidV5,
+  INTEREST_UUID_NAMESPACE,
+  getPreviousDebtDueDate,
+  findMissedPayment,
   projectDebtSchedule,
   isDebtInterestEnabled,
   hasInterestRate,

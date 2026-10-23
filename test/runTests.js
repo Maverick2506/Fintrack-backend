@@ -5570,6 +5570,7 @@ async function runTestSuite() {
     DEBT_INTEREST_START_KEY: s38StartKey,
   } = require("../services/debtInterestService");
   const s38Bal = async (id) => parseFloat((await Account.findByPk(id)).initialBalance);
+  const { getPrimaryCheckingAccount: s39GetCheckingForS38 } = require("../services/checkingService");
   const s38InterestRows = (id) =>
     Transaction.findAll({ where: { fromAccountId: id, category: "Interest" }, order: [["date", "ASC"]] });
   // Fixed future dates so the sweep's checks do not depend on the run date. Interest starts 2027-01-01.
@@ -5726,6 +5727,58 @@ async function runTestSuite() {
     `Editing interest from $69 to $70 keeps it on the debt and moves the balance by $1 (got ${await s38Bal(s38LoanId)})`
   );
 
+  // 38.14 clientRef is a UUIDv5 in a fixed namespace, and the unique index enforces one row per key
+  const { uuidV5: s38V5, INTEREST_UUID_NAMESPACE: s38Ns } = require("../services/debtInterestService");
+  assert(
+    s38V5("www.example.com", "6ba7b810-9dad-11d1-80b4-00c04fd430c8") === "2ed6657d-e927-568b-95e1-2665a8aea6a2",
+    "uuidV5 matches the RFC 4122 test vector (www.example.com in the DNS namespace)"
+  );
+  assert(s38Ns === "3f6c2b8e-5d4a-4e1b-9c7f-2a8d6e0b4c91", "Interest clientRefs use the fixed hard-coded FinTrack namespace");
+  const s38RefA = s38Ref("11111111-1111-4111-8111-111111111111", "2027-01-31");
+  assert(
+    s38RefA === s38V5("interest:11111111-1111-4111-8111-111111111111:2027-01-31", s38Ns) &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(s38RefA) &&
+      s38RefA === s38Ref("11111111-1111-4111-8111-111111111111", "2027-01-31") &&
+      s38RefA !== s38Ref("11111111-1111-4111-8111-111111111111", "2027-02-28"),
+    "interestClientRef is UUIDv5 of interest:<debtId>:<dueDate>, stable per key and different per due date"
+  );
+  const s38Idx = await sequelize.getQueryInterface().showIndex("Transactions");
+  assert(s38Idx.some((i) => i.name === "transactions_client_ref_unique" && i.unique), "Unique index transactions_client_ref_unique exists on Transactions(clientRef)");
+  let s38DupError = null;
+  try {
+    await Transaction.create({ title: "Suite 38 dup", amount: 1, date: "2027-01-31", type: "EXPENSE", category: "Interest", clientRef: s38Row.clientRef });
+  } catch (err) {
+    s38DupError = err;
+  }
+  assert(s38DupError && s38DupError.name === "SequelizeUniqueConstraintError", "A second row with the same interest clientRef is rejected by the index");
+
+  // 38.15 Missed payment flag on GET /debts (manual debts move on even when unpaid)
+  const { getPreviousDebtDueDate: s38Prev } = require("../services/debtInterestService");
+  const s38MissDue = getTorontoOffsetDate(10);
+  const s38Miss = await s33("POST", "/api/debts", { name: "Suite 38 Missed", total_amount: 900, monthly_payment: 50, next_due_date: s38MissDue });
+  const s38MissId = s38Miss.body.id;
+  const s38MissLast = s38Prev(s38MissDue, "monthly", s38Miss.body.dueDay);
+  const s38MissStart = s38Prev(s38MissLast, "monthly", s38Miss.body.dueDay);
+  const s38MissFlag = async () => ((await s33("GET", "/api/debts")).body || []).find((d) => d.id === s38MissId)?.missed_payment_due_date;
+  assert((await s38MissFlag()) === null, "A debt added after its last due date is not flagged");
+  await sequelize.query("UPDATE Accounts SET createdAt = :c WHERE id = :id", { replacements: { c: `${s38MissStart} 12:00:00.000 +00:00`, id: s38MissId } });
+  assert((await s38MissFlag()) === s38MissLast, `No payment since the ${s38MissLast} due date is flagged (got ${await s38MissFlag()})`);
+  const s38AdjRow = await Transaction.create({ title: "Statement sync – Suite 38 Missed", amount: 5, date: s38MissLast, type: "TRANSFER", category: "Adjustment", isCleared: true, toAccountId: s38MissId });
+  assert((await s38MissFlag()) === s38MissLast, "A statement-sync adjustment is not a payment");
+  const s38Paid = await Transaction.create({ title: "Payment for Suite 38 Missed", amount: 50, date: s38MissLast, type: "TRANSFER", category: "Debt", isCleared: true, fromAccountId: (await s39GetCheckingForS38()).id, toAccountId: s38MissId });
+  assert((await s38MissFlag()) === null, "A payment between the previous and the last due date clears the flag");
+  await s38Paid.update({ date: getTorontoToday() });
+  assert((await s38MissFlag()) === null, "A late payment (after the due date, up to today) also clears the flag");
+  await s38Paid.update({ date: s38MissStart });
+  assert((await s38MissFlag()) === s38MissLast, "A payment on or before the previous due date does not count for this one");
+  await s38Paid.update({ isCleared: false, date: s38MissLast });
+  assert((await s38MissFlag()) === s38MissLast, "An unpaid (scheduled) payment does not clear the flag");
+  await s38AdjRow.destroy();
+  await Transaction.destroy({ where: { toAccountId: s38MissId } });
+  await Account.update({ dueDate: getTorontoToday() }, { where: { id: s38MissId } });
+  const s38TodayLast = s38Prev(getTorontoToday(), "monthly", s38Miss.body.dueDay);
+  assert((await s38MissFlag()) === s38TodayLast, "On the due day itself, the earlier due date is the one checked");
+
   // 38.13 dueDay backfill on boot (one-off, behind a Setting flag; server initialize() calls it)
   const { backfillDebtDueDays: s38Backfill, DUE_DAY_BACKFILL_KEY: s38BackfillKey } = require("../services/debtInterestService");
   const s38Legacy = await Account.create({ name: "Suite 38 Legacy", type: "DEBT", initialBalance: 50, dueDate: "2027-05-31", dueDay: null });
@@ -5790,7 +5843,7 @@ async function runTestSuite() {
   // 39.3 Card up and down
   const s39CardUp = await s39Reconcile(s39CardId, { actualBalance: 250, reason: "adjustment" });
   s39Row = await Transaction.findByPk(s39CardUp.body.transactionId);
-  assert(s39CardUp.status === 201 && s39Row.type === "EXPENSE" && s39Row.fromAccountId === s39CardId && parseFloat(s39Row.amount) === 50 && (await s39Bal(s39CardId)) === 250, "Card up: $50 Adjustment EXPENSE on the card, balance $250");
+  assert(s39CardUp.status === 201 && s39Row.type === "TRANSFER" && s39Row.category === "Adjustment" && s39Row.fromAccountId === s39CardId && !s39Row.toAccountId && parseFloat(s39Row.amount) === 50 && (await s39Bal(s39CardId)) === 250, "Card up (adjustment): $50 TRANSFER out of the card to no account, balance $250");
   const s39CardDown = await s39Reconcile(s39CardId, { actualBalance: 180.5, reason: "interest" });
   s39Row = await Transaction.findByPk(s39CardDown.body.transactionId);
   assert(s39CardDown.status === 201 && s39Row.type === "TRANSFER" && s39Row.toAccountId === s39CardId && s39Row.category === "Interest" && parseFloat(s39Row.amount) === 69.5 && (await s39Bal(s39CardId)) === 180.5, "Card down: $69.50 credit towards the card, balance $180.50");
@@ -5826,6 +5879,81 @@ async function runTestSuite() {
   assert((await s39Count()) === s39Before, "Refused syncs record nothing");
   const s39NoAuth = await request({ hostname: "localhost", port: 8000, path: `/api/accounts/${s39CardId}/reconcile`, method: "POST", headers: { "Content-Type": "application/json" } }, { actualBalance: 1 });
   assert(s39NoAuth.status === 401, "Reconcile needs auth");
+
+  // 39.7 Interest counts as spending; Adjustments are not spending or income anywhere (still change balances)
+  const { buildMorningDigest: s39Digest } = require("../services/notificationService");
+  const { executeTool: s39Tool } = require("../routes/gemini");
+  const [s39Y, s39M] = s39Today.split("-").map(Number);
+  const s39Totals = async () => {
+    const [dash, summary, trends, feed] = await Promise.all([
+      s33("GET", `/api/dashboard?year=${s39Y}&month=${s39M}`),
+      s33("GET", `/api/spending-summary?year=${s39Y}&month=${s39M}`),
+      s33("GET", "/api/trends"),
+      s36(`/api/export/financial-feed.csv?key=${s36Key}`),
+    ]);
+    const csv = s36ParseCsv(feed.raw);
+    const overview = (metric) => parseFloat(String((csv.find((r) => r[0] === "OVERVIEW" && r[2] === metric) || [])[3] || "0").replace(/[$,]/g, ""));
+    const monthCat = (cat) => parseFloat(String((csv.find((r) => r[0] === "MONTHLY_CATEGORIES" && r[1] === s39Today.slice(0, 7) && r[2] === cat) || [])[3] || "0").replace(/[$,]/g, ""));
+    const lastTrend = (trends.body || [])[trends.body.length - 1] || {};
+    const cat = (name) => ((summary.body || []).find((c) => c.name === name) || {}).value || 0;
+    return {
+      spending: dash.body.monthlySummary.totalSpending,
+      income: dash.body.monthlySummary.totalIncome,
+      sumInterest: parseFloat(cat("Interest")) || 0,
+      sumAdjustment: parseFloat(cat("Adjustment")) || 0,
+      trendSpending: lastTrend.spending,
+      trendIncome: lastTrend.income,
+      feedSpending: overview("Month Cleared Spending"),
+      feedIncome: overview("Month Cleared Income"),
+      feedInterest: monthCat("Interest"),
+      feedAdjustment: monthCat("Adjustment"),
+      payees: csv.filter((r) => r[0] === "PAYEES").map((r) => r[1]),
+      net: (await getBalancesSummary()).netWorth,
+    };
+  };
+  const s39Debt2 = await s33("POST", "/api/debts", { name: "Suite 39 Spend Loan", total_amount: 1000, next_due_date: "2027-06-01" });
+  const s39Card2 = await s33("POST", "/api/credit-cards", { name: "Suite 39 Spend Card", creditLimit: 2000, currentBalance: 100 });
+  const s39T0 = await s39Totals();
+  const s39Adj = [
+    await s39Reconcile(s39Debt2.body.id, { actualBalance: 1050, reason: "adjustment" }),
+    await s39Reconcile(s39Card2.body.id, { actualBalance: 175, reason: "adjustment" }),
+    await s39Reconcile(s39Checking.id, { actualBalance: Math.round(((await s39CheckingBal(await s39GetChecking(), s39Today)) + 40) * 100) / 100, reason: "adjustment" }),
+    await s39Reconcile(s39Card2.body.id, { actualBalance: 160, reason: "adjustment" }),
+  ];
+  assert(s39Adj.every((r) => r.status === 201), "Four adjustments recorded (debt +$50, card +$75, Checking +$40, card -$15)");
+  const s39AdjRows = await Transaction.findAll({ where: { id: s39Adj.map((r) => r.body.transactionId) } });
+  assert(s39AdjRows.every((r) => r.type === "TRANSFER" && r.category === "Adjustment"), "Every Adjustment row is a TRANSFER, never an EXPENSE or INCOME");
+  const s39T1 = await s39Totals();
+  const s39Same = (k) => Math.round((s39T1[k] - s39T0[k]) * 100) / 100 === 0;
+  assert(s39Same("spending") && s39Same("income"), "Dashboard monthly spending and income ignore adjustments");
+  assert(s39T1.sumAdjustment === 0, "Spending summary (budgets) has no Adjustment category");
+  assert(s39Same("trendSpending") && s39Same("trendIncome"), "Trends ignore adjustments");
+  assert(s39Same("feedSpending") && s39Same("feedIncome") && s39T1.feedAdjustment === 0, "Gem feed month totals and MONTHLY_CATEGORIES ignore adjustments");
+  assert(!s39T1.payees.some((p) => /statement sync/i.test(p)), "Gem feed PAYEES leave out statement-sync rows");
+  assert((await s39Tool("getCategorySpending", { category: "Adjustment", months: 1 }, s39Today)).totalSpent === 0, "Gemini chat category totals ignore adjustments");
+  assert(
+    Math.round((s39T1.net - s39T0.net) * 100) / 100 === Math.round((-50 - 60 + 40) * 100) / 100,
+    `Adjustments still change net worth (-$50 debt, -$60 card, +$40 Checking = -$70; got ${Math.round((s39T1.net - s39T0.net) * 100) / 100})`
+  );
+  assert((await s39Bal(s39Debt2.body.id)) === 1050 && (await s39Bal(s39Card2.body.id)) === 160, "Adjustments still change the debt and card balances");
+
+  const s39Int = await s39Reconcile(s39Debt2.body.id, { actualBalance: 1062.5, reason: "interest" });
+  assert(s39Int.status === 201, "Interest of $12.50 recorded on the debt");
+  const s39T2 = await s39Totals();
+  const s39D = (k) => Math.round((s39T2[k] - s39T1[k]) * 100) / 100;
+  assert(s39D("spending") === 12.5 && s39D("income") === 0, `Dashboard monthly spending includes the $12.50 interest (got +${s39D("spending")})`);
+  assert(s39D("sumInterest") === 12.5, "Spending summary shows it under Interest");
+  assert(s39D("trendSpending") === 12.5, "Trends count the interest as spending");
+  assert(s39D("feedSpending") === 12.5 && s39D("feedInterest") === 12.5, "Gem feed counts the interest in month spending and the Interest category");
+  assert((await s39Tool("getCategorySpending", { category: "Interest", months: 1 }, s39Today)).totalSpent >= 12.5, "Gemini chat category totals include interest");
+  await Budget.bulkCreate([
+    { category: "Interest", monthlyLimit: 1 },
+    { category: "Adjustment", monthlyLimit: 1 },
+  ]);
+  const s39DigestMsg = (await s39Digest())?.message || "";
+  assert(/Interest: \$[\d.]+ spent of \$1\.00/.test(s39DigestMsg), "Digest flags the Interest budget as over");
+  assert(!/Adjustment: \$/.test(s39DigestMsg), "Digest never counts adjustments against a budget");
+  await Budget.destroy({ where: { category: ["Interest", "Adjustment"] } });
 
   // 39.6 PUT /checking stays for compatibility
   const s39Put = await s33("PUT", "/api/checking", { balance: 4321.09 });

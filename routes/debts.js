@@ -6,6 +6,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
+const { findMissedPayment } = require("../services/debtInterestService");
 const router = express.Router();
 
 // Day of month from a YYYY-MM-DD due date (R3)
@@ -44,7 +45,29 @@ router.get(
       where: { type: "DEBT", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
-    res.json(debts.map(formatDebtResponse));
+    // Cleared rows paid to each debt, to flag a due date with no payment recorded
+    const payments = debts.length
+      ? await Transaction.findAll({
+          where: {
+            toAccountId: debts.map((d) => d.id),
+            isCleared: true,
+            type: { [Op.in]: ["TRANSFER", "EXPENSE"] },
+          },
+          attributes: ["toAccountId", "date", "category"],
+          raw: true,
+        })
+      : [];
+    const todayStr = getTodayString();
+    res.json(
+      debts.map((d) => ({
+        ...formatDebtResponse(d),
+        missed_payment_due_date: findMissedPayment(
+          d,
+          payments.filter((p) => p.toAccountId === d.id),
+          todayStr
+        ),
+      }))
+    );
   })
 );
 

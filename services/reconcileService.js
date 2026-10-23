@@ -15,20 +15,24 @@ const getAppBalance = async (account, dbTx) =>
     : round2(parseFloat(account.initialBalance) || 0);
 
 // The one row that moves the balance by `difference`, shaped so accountBalanceService (cards, debts)
-// or the Checking activity sums apply it.
-const buildReconcileRow = (account, difference) => {
+// or the Checking activity sums apply it. Only interest charged to a card or debt is an EXPENSE
+// (it is spending); every Adjustment is a TRANSFER, so it never counts as spending or income.
+const buildReconcileRow = (account, difference, reason) => {
   const amount = round2(Math.abs(difference));
   if (account.type === "CHECKING") {
-    // Money in or out of Checking without touching another account (not income or spending)
+    // Money in or out of Checking without touching another account
     return difference > 0
       ? { amount, type: "TRANSFER", fromAccountId: null, toAccountId: account.id }
       : { amount, type: "TRANSFER", fromAccountId: account.id, toAccountId: null };
   }
-  // Card or debt: owing more is a charge to it; owing less is paid towards it without leaving
-  // Checking (the same shape as the adjust-to-$0 row)
-  return difference > 0
-    ? { amount, type: "EXPENSE", fromAccountId: account.id, toAccountId: null }
-    : { amount, type: "TRANSFER", fromAccountId: null, toAccountId: account.id };
+  if (difference > 0) {
+    // Card or debt owes more: interest is a charge to it, an adjustment moves the balance up
+    return reason === "interest"
+      ? { amount, type: "EXPENSE", fromAccountId: account.id, toAccountId: null }
+      : { amount, type: "TRANSFER", fromAccountId: account.id, toAccountId: null };
+  }
+  // Owes less: paid towards it without leaving Checking (the same shape as the adjust-to-$0 row)
+  return { amount, type: "TRANSFER", fromAccountId: null, toAccountId: account.id };
 };
 
 /**
@@ -59,7 +63,7 @@ const reconcileAccount = async (account, body, dbTx) => {
   const reason = body.reason === "interest" ? "interest" : "adjustment";
   const trx = await Transaction.create(
     {
-      ...buildReconcileRow(account, difference),
+      ...buildReconcileRow(account, difference, reason),
       title: reason === "interest" ? interestTitle(account.name) : `Statement sync – ${account.name}`,
       date,
       category: reason === "interest" ? "Interest" : "Adjustment",

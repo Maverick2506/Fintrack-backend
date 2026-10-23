@@ -219,6 +219,8 @@ const getFinancialData = async () => {
           type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
           isCleared: true,
           date: { [Op.gt]: historyStart, [Op.lte]: todayStr },
+          // Balance adjustments (statement sync, adjust to $0) are not money paid to anyone
+          [Op.or]: [{ category: null }, { category: { [Op.ne]: "Adjustment" } }],
         },
         // Only the columns PAYEES and MONTHLY_CATEGORIES use; this runs on every hourly refresh
         attributes: ["title", "amount", "date", "type", "category", "fromAccountId", "toAccountId"],
