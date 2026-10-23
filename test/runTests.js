@@ -5230,7 +5230,7 @@ async function runTestSuite() {
   const s37Card = await s33("POST", "/api/credit-cards", { name: "Suite 37 Visa", creditLimit: 1000, currentBalance: 0 });
   assert(s37Card.status === 201, "Creates Suite 37 card");
   const s37CardId = s37Card.body.id;
-  const s37NetflixGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a36";
+  const s37NetflixGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a46";
   await Transaction.bulkCreate([
     { title: "Suite 37 Netflix", amount: 17, date: s37Past, type: "EXPENSE", category: "Entertainment", isCleared: true, recurrence: "monthly", recurringGroupId: s37NetflixGroup, fromAccountId: s37CardId },
     { title: "Suite 37 Netflix", amount: 17, date: s37NextMonth, type: "EXPENSE", category: "Entertainment", isCleared: false, recurrence: "monthly", recurringGroupId: s37NetflixGroup, fromAccountId: s37CardId },
@@ -5303,8 +5303,8 @@ async function runTestSuite() {
   // 37.2 Move a card's recurring charges to Checking
   const s37Card2 = await s33("POST", "/api/credit-cards", { name: "Suite 37 Amex", creditLimit: 1000, currentBalance: 0 });
   const s37Card2Id = s37Card2.body.id;
-  const s37SpotifyGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a37";
-  const s37GymGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a38";
+  const s37SpotifyGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a47";
+  const s37GymGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a48";
   const s37GymPast = getTorontoOffsetDate(-30);
   const s37GymNext = getNextOccurrenceDate(s37GymPast, "yearly", 1);
   await Transaction.bulkCreate([
