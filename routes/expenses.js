@@ -27,6 +27,17 @@ const getMonthDateRange = (year, month) => {
   return { startDate, endDate };
 };
 
+// Generates upcoming rows once the save has committed (N5). Running it inside the save's transaction
+// meant a failure could abort that transaction on Postgres, and the commit then rolled back silently.
+// The row is already saved here, so a failure is logged and the nightly job fills the gap.
+const generateAfterSave = async () => {
+  try {
+    await createRecurringExpenses();
+  } catch (err) {
+    console.error("Recurring generation after save failed:", err);
+  }
+};
+
 // Resolve target Debt or Credit Card account when a transaction is categorized as Debt
 const resolvePaydownTargetId = async (
   explicitTargetId,
@@ -203,6 +214,7 @@ router.post(
   validateBody(schemas.createExpense),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
+    let newExp;
     try {
       const {
         name,
@@ -317,7 +329,7 @@ router.post(
       const finalRecurringGroupId =
         req.body.recurringGroupId || (isRecurring ? crypto.randomUUID() : null);
 
-      const newExp = await Transaction.create(
+      newExp = await Transaction.create(
         {
           title: name,
           amount: effectiveAmount,
@@ -341,18 +353,16 @@ router.post(
       // Apply balance change on Credit Card (charge) or Debt/Credit Card (paydown) if cleared
       await adjustAccountForTransaction(newExp, 1, dbTx, req.body.applyToBalance === true);
 
-      if (recurrence && recurrence !== "none") {
-        await createRecurringExpenses(dbTx).catch((err) =>
-          console.error("Background recurring generation error:", err)
-        );
-      }
-
       await dbTx.commit();
-      res.status(201).json(newExp);
     } catch (error) {
       await dbTx.rollback();
       throw error;
     }
+
+    if (newExp.recurrence && newExp.recurrence !== "none") {
+      await generateAfterSave();
+    }
+    res.status(201).json(newExp);
   })
 );
 
@@ -361,6 +371,7 @@ router.put(
   validateBody(schemas.updateExpense),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
+    let updated;
     try {
       const trx = await Transaction.findByPk(req.params.id, {
         transaction: dbTx,
@@ -630,18 +641,17 @@ router.put(
         wasBalanceApplied || (!wasCleared && nextIsCleared)
       );
 
-      if (req.body.recurrence && req.body.recurrence !== "none") {
-        await createRecurringExpenses(dbTx).catch((err) =>
-          console.error("Background recurring generation error:", err)
-        );
-      }
-
       await dbTx.commit();
-      res.json({ ...trx.toJSON(), seriesEnded, removedUpcomingCount });
+      updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount };
     } catch (error) {
       await dbTx.rollback();
       throw error;
     }
+
+    if (req.body.recurrence && req.body.recurrence !== "none") {
+      await generateAfterSave();
+    }
+    res.json(updated);
   })
 );
 
