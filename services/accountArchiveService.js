@@ -5,6 +5,7 @@ const {
   getTodayString,
 } = require("./accountBalanceService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
+const { HttpError } = require("../middleware/errorHandler");
 const {
   groupSeries,
   getNextOccurrenceDate,
@@ -13,6 +14,18 @@ const {
 } = require("../routes/recurring");
 
 const round2 = (n) => Math.round(n * 100) / 100;
+
+const ACCOUNT_LABELS = {
+  CREDIT_CARD: "card",
+  DEBT: "debt",
+  SAVINGS_GOAL: "goal",
+};
+
+const ADJUSTMENT_REASONS = {
+  written_off: "written off",
+  closed_by_bank: "closed by bank",
+  spent: "spent",
+};
 
 // For rows loaded with their fromAccount/toAccount: true when either account is archived
 const usesArchivedAccount = (trx) =>
@@ -64,13 +77,19 @@ const loadAccountCommitments = async (account, dbTx = null) => {
 
 const getDeleteImpact = async (account, dbTx = null) => {
   const { unpaidRows, activeSeries } = await loadAccountCommitments(account, dbTx);
+  const todayStr = getTodayString();
+  const balance = round2(parseFloat(account.initialBalance) || 0);
   return {
     id: account.id,
     name: account.name,
     type: account.type,
-    balance: round2(parseFloat(account.initialBalance) || 0),
+    balance,
+    // Archive and delete are refused until the balance is $0, so net worth never loses money silently
+    canRetire: balance === 0,
     unpaid: {
       count: unpaidRows.length,
+      overdueCount: unpaidRows.filter((t) => t.date < todayStr).length,
+      upcomingCount: unpaidRows.filter((t) => t.date >= todayStr).length,
       total: round2(unpaidRows.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0)),
       titles: [...new Set(unpaidRows.map((t) => t.title))],
       movableCount: unpaidRows.filter((t) => isMovableToChecking(t, account.id)).length,
@@ -82,6 +101,7 @@ const getDeleteImpact = async (account, dbTx = null) => {
         type: t.type,
         recurringGroupId: t.recurringGroupId || null,
         movable: isMovableToChecking(t, account.id),
+        overdue: t.date < todayStr,
       })),
     },
     series: activeSeries.map(({ latest }) => ({
@@ -103,6 +123,19 @@ const retireAccount = async (account, options, dbTx) => {
   const checking = await getPrimaryCheckingAccount(dbTx);
   const { unpaidRows, activeSeries } = await loadAccountCommitments(account, dbTx);
   const moving = series === "moveToChecking";
+
+  // A balance left on an archived or deleted account would silently leave net worth. A goal's money
+  // may still move to Checking here; anything else needs a final payment or an adjustment first.
+  const balanceBefore = round2(parseFloat(account.initialBalance) || 0);
+  const goalMoveCoversBalance =
+    account.type === "SAVINGS_GOAL" && moveBalanceToChecking && balanceBefore > 0;
+  if (balanceBefore !== 0 && !goalMoveCoversBalance) {
+    throw new HttpError(
+      409,
+      `This ${ACCOUNT_LABELS[account.type] || "account"} still has a balance of $${balanceBefore.toFixed(2)}. Record a final payment or adjust it to $0 first.`,
+      { balance: balanceBefore }
+    );
+  }
 
   // 1. Unpaid rows: charges move to Checking when asked, everything else is removed
   const movedIds = new Set();
@@ -219,9 +252,73 @@ const retireAccount = async (account, options, dbTx) => {
   };
 };
 
+// Brings a card or debt to $0 with one cleared TRANSFER from Checking for the amount owed, or moves a
+// goal's money back to Checking. Net worth is unchanged: Checking and the account move by the same amount.
+const recordFinalPayment = async (account, dbTx) => {
+  const balance = round2(parseFloat(account.initialBalance) || 0);
+  if (balance <= 0) {
+    throw new HttpError(409, `Nothing to settle: the balance is $${balance.toFixed(2)}.`);
+  }
+  const checking = await getPrimaryCheckingAccount(dbTx);
+  const isGoal = account.type === "SAVINGS_GOAL";
+  const trx = await Transaction.create(
+    {
+      title: isGoal ? `Moved from ${account.name}` : `Final payment for ${account.name}`,
+      amount: balance,
+      date: getTodayString(),
+      type: "TRANSFER",
+      category: isGoal
+        ? "Savings Transfer"
+        : account.type === "CREDIT_CARD"
+        ? "Credit Card Payment"
+        : "Debt",
+      isCleared: true,
+      balanceApplied: false,
+      fromAccountId: isGoal ? account.id : checking.id,
+      toAccountId: isGoal ? checking.id : account.id,
+    },
+    { transaction: dbTx }
+  );
+  await adjustAccountForTransaction(trx, 1, dbTx);
+  return trx;
+};
+
+// Brings the balance to $0 with one cleared Adjustment row that does not touch Checking
+// (a written-off debt, a card the bank closed, goal money already spent).
+const adjustBalanceToZero = async (account, reason, dbTx) => {
+  const balance = round2(parseFloat(account.initialBalance) || 0);
+  if (balance === 0) {
+    throw new HttpError(409, "The balance is already $0.");
+  }
+  const isGoal = account.type === "SAVINGS_GOAL";
+  // Goal money leaves the goal; money owed on a card or debt is cleared towards it. A negative
+  // balance (an overpaid card, an overdrawn goal) is reversed with a negative amount on the same side.
+  const outOfGoal = isGoal && balance > 0;
+  const trx = await Transaction.create(
+    {
+      title: `Balance adjustment: ${account.name} (${ADJUSTMENT_REASONS[reason]})`,
+      // Card/debt: paying towards it lowers what is owed. Goal: money in raises it, so flip the sign.
+      amount: isGoal && !outOfGoal ? -balance : balance,
+      date: getTodayString(),
+      type: "TRANSFER",
+      category: "Adjustment",
+      isCleared: true,
+      balanceApplied: false,
+      fromAccountId: outOfGoal ? account.id : null,
+      toAccountId: outOfGoal ? null : account.id,
+    },
+    { transaction: dbTx }
+  );
+  await adjustAccountForTransaction(trx, 1, dbTx);
+  return trx;
+};
+
 module.exports = {
   getDeleteImpact,
   retireAccount,
   isMovableToChecking,
   usesArchivedAccount,
+  recordFinalPayment,
+  adjustBalanceToZero,
+  ADJUSTMENT_REASONS,
 };

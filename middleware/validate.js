@@ -217,6 +217,16 @@ const schemas = {
     })
   ),
 
+  // POST /accounts/:id/final-payment takes no fields
+  finalPayment: z.preprocess(
+    (v) => (v === undefined || v === null ? {} : v),
+    z.object({}).strict()
+  ),
+
+  adjustToZero: z.object({
+    reason: z.enum(["written_off", "closed_by_bank", "spent"]),
+  }),
+
   updateChecking: z.object({
     balance: z.coerce.number(),
   }),

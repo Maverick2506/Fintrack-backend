@@ -309,6 +309,8 @@ async function runTestSuite() {
   assert(testExp.status === 201 && testExp.body.id, "Created purchase transaction on card");
   const testExpId = testExp.body.id;
 
+  // Archive and delete need a $0 balance, so settle it first
+  await request({ hostname: "localhost", port: 8000, path: `/api/accounts/${cardId}/final-payment`, method: "POST", headers: authHeaders }, {});
   const delCard = await request({
     hostname: "localhost",
     port: 8000,
@@ -341,6 +343,8 @@ async function runTestSuite() {
     monthly_payment: 50,
   });
   assert(testDebt.status === 201 && testDebt.body.id, "Created test debt for deletion");
+  // Archive and delete need a $0 balance, so settle it first
+  await request({ hostname: "localhost", port: 8000, path: `/api/accounts/${testDebt.body.id}/final-payment`, method: "POST", headers: authHeaders }, {});
   const delDebt = await request({
     hostname: "localhost",
     port: 8000,
@@ -371,6 +375,8 @@ async function runTestSuite() {
     current_amount: 100,
   });
   assert(testGoal.status === 201 && testGoal.body.id, "Created test savings goal for deletion");
+  // Archive and delete need a $0 balance, so settle it first
+  await request({ hostname: "localhost", port: 8000, path: `/api/accounts/${testGoal.body.id}/final-payment`, method: "POST", headers: authHeaders }, {});
   const delGoal = await request({
     hostname: "localhost",
     port: 8000,
@@ -5410,20 +5416,105 @@ async function runTestSuite() {
     "Gemini context leaves out archived cards, goals and debts (R7)"
   );
 
-  // 37.5 Debts accept the same body; a permanent delete removes the account and unlinks its history
+  // 37.5 A debt with money owed cannot be archived until a final payment brings it to $0
   const s37Debt = await s33("POST", "/api/debts", { name: "Suite 37 Loan", total_amount: 500, monthly_payment: 50 });
   const s37DebtId = s37Debt.body.id;
   const s37DebtPay = await s33("POST", `/api/debts/${s37DebtId}/pay`, { amount: 50 });
   assert(s37DebtPay.status === 200, "Pays $50 toward the Suite 37 debt");
   await Transaction.create({ title: "Payment for Suite 37 Loan", amount: 50, date: s37Soon, type: "TRANSFER", category: "Debt", isCleared: false, recurrence: "monthly", fromAccountId: s37Checking.id, toAccountId: s37DebtId });
+  const s37DebtImpact = await s33("GET", `/api/accounts/${s37DebtId}/delete-impact`);
+  assert(s37DebtImpact.body.balance === 450 && s37DebtImpact.body.canRetire === false, "delete-impact says a debt with $450 owed cannot be archived yet");
+  const s37DebtRefused = await s33("DELETE", `/api/debts/${s37DebtId}`, { mode: "archive" });
+  assert(
+    s37DebtRefused.status === 409 && s37DebtRefused.body.details?.balance === 450,
+    `Archive is refused while the debt still has a balance (got ${s37DebtRefused.status})`
+  );
+  const s37DebtStill = await Account.findByPk(s37DebtId);
+  assert(s37DebtStill && s37DebtStill.isActive !== false && parseFloat(s37DebtStill.initialBalance) === 450, "A refused archive leaves the debt and its balance untouched");
+  assert(
+    (await Transaction.count({ where: { title: "Payment for Suite 37 Loan", isCleared: false } })) === 1,
+    "A refused archive leaves the debt's upcoming payment untouched"
+  );
+  const s37DebtNetBefore = (await getBalancesSummary()).netWorth;
+  const s37Final = await s33("POST", `/api/accounts/${s37DebtId}/final-payment`, {});
+  assert(s37Final.status === 201 && s37Final.body.balance === 0, "Final payment brings the debt to $0");
+  const s37FinalRow = await Transaction.findByPk(s37Final.body.transactionId);
+  assert(
+    s37FinalRow && s37FinalRow.type === "TRANSFER" && s37FinalRow.isCleared === true && parseFloat(s37FinalRow.amount) === 450 &&
+      s37FinalRow.fromAccountId === s37Checking.id && s37FinalRow.toAccountId === s37DebtId,
+    "Final payment is one cleared $450 TRANSFER from Checking to the debt"
+  );
+  const s37FinalAgain = await s33("POST", `/api/accounts/${s37DebtId}/final-payment`, {});
+  assert(s37FinalAgain.status === 409, "A second final payment on a $0 debt is refused");
   const s37DebtDelete = await s33("DELETE", `/api/debts/${s37DebtId}`, { mode: "delete", series: "moveToChecking" });
-  assert(s37DebtDelete.status === 204, "Deletes the debt permanently");
+  assert(s37DebtDelete.status === 204, "Deletes the settled debt permanently");
+  assert((await getBalancesSummary()).netWorth === s37DebtNetBefore, "Final payment then delete leaves net worth unchanged");
   assert((await Account.findByPk(s37DebtId)) === null, "The deleted debt is gone");
   const s37DebtRows = await Transaction.findAll({ where: { title: "Payment for Suite 37 Loan" } });
   assert(
     s37DebtRows.length === 1 && s37DebtRows[0].isCleared === true && s37DebtRows[0].toAccountId === null,
     "The paid debt payment stays in history (unlinked) and the upcoming one is removed"
   );
+
+  // 37.6 A card with money owed: final payment then archive keeps net worth; overdue and upcoming are told apart
+  const s37Card4 = await s33("POST", "/api/credit-cards", { name: "Suite 37 Mastercard", creditLimit: 2000, currentBalance: 300 });
+  const s37Card4Id = s37Card4.body.id;
+  await Transaction.bulkCreate([
+    { title: "Suite 37 Overdue Hydro", amount: 80, date: getTorontoOffsetDate(-3), type: "EXPENSE", category: "Essentials", isCleared: false, fromAccountId: s37Card4Id },
+    { title: "Suite 37 Upcoming Gas", amount: 40, date: s37Soon, type: "EXPENSE", category: "Essentials", isCleared: false, fromAccountId: s37Card4Id },
+  ]);
+  const s37Card4Impact = await s33("GET", `/api/accounts/${s37Card4Id}/delete-impact`);
+  const s37OverdueItem = (s37Card4Impact.body.unpaid?.items || []).find((i) => i.title === "Suite 37 Overdue Hydro");
+  const s37UpcomingItem = (s37Card4Impact.body.unpaid?.items || []).find((i) => i.title === "Suite 37 Upcoming Gas");
+  assert(
+    s37Card4Impact.body.unpaid?.overdueCount === 1 && s37Card4Impact.body.unpaid?.upcomingCount === 1 &&
+      s37OverdueItem?.overdue === true && s37UpcomingItem?.overdue === false && s37OverdueItem?.date === getTorontoOffsetDate(-3),
+    "delete-impact lists 1 overdue and 1 upcoming bill, with dates"
+  );
+  const s37Card4Refused = await s33("DELETE", `/api/credit-cards/${s37Card4Id}`, {});
+  assert(s37Card4Refused.status === 409, "Archive is refused while the card still has $300 owed");
+  const s37Card4NetBefore = (await getBalancesSummary()).netWorth;
+  const s37Card4Final = await s33("POST", `/api/accounts/${s37Card4Id}/final-payment`, {});
+  assert(s37Card4Final.status === 201 && s37Card4Final.body.balance === 0, "Final payment brings the card to $0");
+  const s37Card4Archive = await s33("DELETE", `/api/credit-cards/${s37Card4Id}`, { mode: "archive", series: "end" });
+  assert(s37Card4Archive.status === 204, "Archives the settled card");
+  assert(
+    (await getBalancesSummary()).netWorth === s37Card4NetBefore,
+    "Final payment then archive leaves net worth unchanged"
+  );
+
+  // 37.7 Adjust to $0 records exactly one Adjustment row and leaves Checking alone
+  const s37Card5 = await s33("POST", "/api/credit-cards", { name: "Suite 37 Store Card", creditLimit: 500, currentBalance: 120 });
+  const s37Card5Id = s37Card5.body.id;
+  const s37BadReason = await s33("POST", `/api/accounts/${s37Card5Id}/adjust-to-zero`, { reason: "lost it" });
+  assert(s37BadReason.status === 400, "Adjust to $0 rejects an unknown reason with 400");
+  const s37CheckingBeforeAdjust = (await getBalancesSummary()).checking;
+  const s37Adjust = await s33("POST", `/api/accounts/${s37Card5Id}/adjust-to-zero`, { reason: "closed_by_bank" });
+  assert(s37Adjust.status === 201 && s37Adjust.body.balance === 0, "Adjust to $0 brings the card to $0");
+  const s37AdjustRows = await Transaction.findAll({
+    where: { [Op.or]: [{ fromAccountId: s37Card5Id }, { toAccountId: s37Card5Id }] },
+  });
+  assert(
+    s37AdjustRows.length === 1 && s37AdjustRows[0].category === "Adjustment" && s37AdjustRows[0].isCleared === true &&
+      parseFloat(s37AdjustRows[0].amount) === 120 && s37AdjustRows[0].title.includes("closed by bank"),
+    `Adjust to $0 records exactly one $120 Adjustment row with its reason (${s37AdjustRows.length} rows)`
+  );
+  assert((await getBalancesSummary()).checking === s37CheckingBeforeAdjust, "Adjust to $0 does not touch Checking");
+  const s37AdjustAgain = await s33("POST", `/api/accounts/${s37Card5Id}/adjust-to-zero`, { reason: "written_off" });
+  assert(s37AdjustAgain.status === 409, "Adjust to $0 on a $0 card is refused");
+  const s37Card5Archive = await s33("DELETE", `/api/credit-cards/${s37Card5Id}`, {});
+  assert(s37Card5Archive.status === 204, "Archives the card once it is adjusted to $0");
+
+  // Goal money already spent, and an overpaid (negative) card, both adjust to exactly $0
+  const s37Goal3 = await s33("POST", "/api/savings-goals", { name: "Suite 37 Spent Goal", target_amount: 500, current_amount: 75 });
+  const s37Goal3Id = s37Goal3.body.id;
+  const s37GoalAdjust = await s33("POST", `/api/accounts/${s37Goal3Id}/adjust-to-zero`, { reason: "spent" });
+  assert(s37GoalAdjust.status === 201 && s37GoalAdjust.body.balance === 0, "Adjust to $0 empties a goal whose money was spent");
+  const s37Card6 = await s33("POST", "/api/credit-cards", { name: "Suite 37 Overpaid Card", creditLimit: 500, currentBalance: -20 });
+  const s37NegAdjust = await s33("POST", `/api/accounts/${s37Card6.body.id}/adjust-to-zero`, { reason: "written_off" });
+  assert(s37NegAdjust.status === 201 && s37NegAdjust.body.balance === 0, "Adjust to $0 also clears an overpaid card's credit");
+  const s37CheckingImpact = await s33("POST", `/api/accounts/${s37Checking.id}/final-payment`, {});
+  assert(s37CheckingImpact.status === 404, "Final payment refuses Primary Checking (404)");
 
   await Transaction.destroy({
     where: {
@@ -5432,6 +5523,8 @@ async function runTestSuite() {
         { title: { [Op.like]: "Payment for Suite 37 %" } },
         { title: { [Op.like]: "Contribution to Suite 37 %" } },
         { title: { [Op.like]: "Moved from Suite 37 %" } },
+        { title: { [Op.like]: "Final payment for Suite 37 %" } },
+        { title: { [Op.like]: "Balance adjustment: Suite 37 %" } },
       ],
     },
   });
