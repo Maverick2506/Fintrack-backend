@@ -207,6 +207,16 @@ const schemas = {
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
   }),
 
+  // DELETE /credit-cards|debts|savings-goals/:id. An empty body archives and ends the account's series.
+  retireAccount: z.preprocess(
+    (v) => (v === undefined || v === null ? {} : v),
+    z.object({
+      mode: z.enum(["archive", "delete"]).optional().default("archive"),
+      series: z.enum(["end", "moveToChecking"]).optional().default("end"),
+      moveBalanceToChecking: z.boolean().optional().default(false),
+    })
+  ),
+
   updateChecking: z.object({
     balance: z.coerce.number(),
   }),

@@ -32,6 +32,11 @@ if (require("../database").isProductionDb) {
 
 function request(options, body = null) {
   return new Promise((resolve, reject) => {
+    const payload = body ? (typeof body === "string" ? body : JSON.stringify(body)) : null;
+    if (payload) {
+      // Node sends a DELETE body without framing unless Content-Length is set
+      options = { ...options, headers: { ...(options.headers || {}), "Content-Length": Buffer.byteLength(payload) } };
+    }
     const req = http.request(options, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
@@ -45,8 +50,8 @@ function request(options, body = null) {
       });
     });
     req.on("error", reject);
-    if (body) {
-      req.write(typeof body === "string" ? body : JSON.stringify(body));
+    if (payload) {
+      req.write(payload);
     }
     req.end();
   });
@@ -136,6 +141,7 @@ async function runTestSuite() {
     { prefix: "/api", r: require("../routes/dashboard") },
     { prefix: "/api", r: require("../routes/gemini") },
     { prefix: "/api", r: require("../routes/creditCards") },
+    { prefix: "/api", r: require("../routes/accounts") },
     { prefix: "/api", r: require("../routes/paycheques") },
     { prefix: "/api/budgets", r: require("../routes/budgets") },
     { prefix: "/api/forecast", r: require("../routes/forecast") },
@@ -5202,6 +5208,228 @@ async function runTestSuite() {
 
   await Transaction.destroy({ where: { id: [...s36Rows.map((t) => t.id), s36CardRow.id] } });
   await s36Card.destroy();
+
+  // 37. Safe archive and delete for cards, debts and goals
+  console.log("\n--- Suite 37: Safe Archive and Delete for Cards, Debts and Goals ---");
+  const { createRecurringExpenses: s37Generate } = require("../routes/recurring");
+  const { getPrimaryCheckingAccount: s37GetChecking } = require("../services/checkingService");
+  const s37Checking = await s37GetChecking();
+  const s37Past = getTorontoOffsetDate(-10);
+  const s37NextMonth = getNextOccurrenceDate(s37Past, "monthly", 1);
+  const s37Soon = getTorontoOffsetDate(5);
+  const s37ForecastTitles = async () => {
+    const f = await s33("GET", "/api/forecast?days=60");
+    return (f.body.days || []).flatMap((d) => (d.items || []).map((i) => i.title));
+  };
+  const s37UpcomingTitles = async () => {
+    const dash = await s33("GET", "/api/dashboard");
+    return (dash.body.upcomingBills || []).map((b) => b.title);
+  };
+
+  // 37.1 Archive a card that has a monthly Netflix charge and an upcoming payment, then run the generator
+  const s37Card = await s33("POST", "/api/credit-cards", { name: "Suite 37 Visa", creditLimit: 1000, currentBalance: 0 });
+  assert(s37Card.status === 201, "Creates Suite 37 card");
+  const s37CardId = s37Card.body.id;
+  const s37NetflixGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a36";
+  await Transaction.bulkCreate([
+    { title: "Suite 37 Netflix", amount: 17, date: s37Past, type: "EXPENSE", category: "Entertainment", isCleared: true, recurrence: "monthly", recurringGroupId: s37NetflixGroup, fromAccountId: s37CardId },
+    { title: "Suite 37 Netflix", amount: 17, date: s37NextMonth, type: "EXPENSE", category: "Entertainment", isCleared: false, recurrence: "monthly", recurringGroupId: s37NetflixGroup, fromAccountId: s37CardId },
+    { title: "Payment for Suite 37 Visa", amount: 50, date: s37Soon, type: "TRANSFER", category: "Credit Card Payment", isCleared: false, fromAccountId: s37Checking.id, toAccountId: s37CardId },
+  ]);
+  assert((await s37ForecastTitles()).includes("Payment for Suite 37 Visa"), "Before archiving, the forecast includes the card's upcoming payment");
+
+  const s37Impact = await s33("GET", `/api/accounts/${s37CardId}/delete-impact`);
+  assert(
+    s37Impact.status === 200 &&
+      s37Impact.body.unpaid?.count === 2 &&
+      s37Impact.body.unpaid?.total === 67 &&
+      s37Impact.body.unpaid?.titles.includes("Suite 37 Netflix") &&
+      s37Impact.body.unpaid?.titles.includes("Payment for Suite 37 Visa"),
+    `delete-impact lists the card's 2 unpaid rows totalling $67 (got ${s37Impact.status} ${JSON.stringify(s37Impact.body.unpaid)})`
+  );
+  assert(
+    s37Impact.status === 200 &&
+      s37Impact.body.series?.length === 1 &&
+      s37Impact.body.series[0].recurringGroupId === s37NetflixGroup &&
+      s37Impact.body.series[0].title === "Suite 37 Netflix" &&
+      s37Impact.body.series[0].recurrence === "monthly",
+    "delete-impact lists Netflix as the card's active monthly series"
+  );
+  assert(s37Impact.status === 200 && s37Impact.body.balance === 0, "delete-impact returns the card balance");
+  const s37ImpactBad = await s33("GET", "/api/accounts/not-a-uuid/delete-impact");
+  assert(s37ImpactBad.status === 400, "delete-impact rejects a non-UUID id with 400");
+  const s37ImpactChecking = await s33("GET", `/api/accounts/${s37Checking.id}/delete-impact`);
+  assert(s37ImpactChecking.status === 404, "delete-impact refuses Primary Checking (404)");
+
+  const s37BadBody = await s33("DELETE", `/api/credit-cards/${s37CardId}`, { mode: "shred" });
+  assert(s37BadBody.status === 400, `DELETE rejects an unknown mode with 400 (got ${s37BadBody.status})`);
+  assert((await Account.findByPk(s37CardId))?.isActive !== false, "A rejected DELETE leaves the card untouched");
+
+  const s37Archive = await s33("DELETE", `/api/credit-cards/${s37CardId}`, { mode: "archive", series: "end" });
+  assert(s37Archive.status === 204, "Archives the card (204)");
+  const s37CardAfter = await Account.findByPk(s37CardId);
+  assert(s37CardAfter && s37CardAfter.isActive === false, "Archive keeps the card as inactive");
+  const s37NetflixRows = await Transaction.findAll({ where: { recurringGroupId: s37NetflixGroup } });
+  assert(
+    s37NetflixRows.length === 1 && s37NetflixRows[0].date === s37Past && s37NetflixRows[0].fromAccountId === s37CardId,
+    "Archive removes the upcoming Netflix charge and keeps the paid one linked to the card"
+  );
+  assert(
+    (await Transaction.count({ where: { title: "Payment for Suite 37 Visa" } })) === 0,
+    "Archive removes the upcoming payment for the card"
+  );
+  await s37Generate();
+  assert(
+    (await Transaction.count({ where: { recurringGroupId: s37NetflixGroup } })) === 1,
+    "The recurring generator does not bring Netflix back after the card is archived"
+  );
+  const s37Cards = await s33("GET", "/api/credit-cards");
+  assert(!(s37Cards.body || []).some((c) => c.id === s37CardId), "Archived card is left out of the card list (pickers)");
+  assert(!(await s37ForecastTitles()).some((t) => t.includes("Suite 37")), "Archived card's rows are left out of the forecast");
+  assert(!(await s37UpcomingTitles()).some((t) => t.includes("Suite 37")), "Archived card's rows are left out of Upcoming Bills");
+  const s37Ledger = await s33("GET", "/api/expenses/all");
+  const s37LedgerRow = (s37Ledger.body || []).find((r) => r.recurringGroupId === s37NetflixGroup);
+  assert(
+    s37LedgerRow && s37LedgerRow.fromAccount === "Suite 37 Visa" && s37LedgerRow.fromAccountArchived === true,
+    "The Ledger still shows the archived card's name on its past rows"
+  );
+
+  // 37.2 Move a card's recurring charges to Checking
+  const s37Card2 = await s33("POST", "/api/credit-cards", { name: "Suite 37 Amex", creditLimit: 1000, currentBalance: 0 });
+  const s37Card2Id = s37Card2.body.id;
+  const s37SpotifyGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a37";
+  const s37GymGroup = "6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a38";
+  const s37GymPast = getTorontoOffsetDate(-30);
+  const s37GymNext = getNextOccurrenceDate(s37GymPast, "yearly", 1);
+  await Transaction.bulkCreate([
+    { title: "Suite 37 Spotify", amount: 12, date: s37Past, type: "EXPENSE", category: "Entertainment", isCleared: true, recurrence: "monthly", recurringGroupId: s37SpotifyGroup, fromAccountId: s37Card2Id },
+    { title: "Suite 37 Spotify", amount: 12, date: s37NextMonth, type: "EXPENSE", category: "Entertainment", isCleared: false, recurrence: "monthly", recurringGroupId: s37SpotifyGroup, fromAccountId: s37Card2Id },
+    { title: "Suite 37 Gym", amount: 300, date: s37GymPast, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "yearly", recurringGroupId: s37GymGroup, fromAccountId: s37Card2Id },
+    { title: "Payment for Suite 37 Amex", amount: 40, date: s37Soon, type: "TRANSFER", category: "Credit Card Payment", isCleared: false, fromAccountId: s37Checking.id, toAccountId: s37Card2Id },
+  ]);
+  const s37Move = await s33("DELETE", `/api/credit-cards/${s37Card2Id}`, { mode: "archive", series: "moveToChecking" });
+  assert(s37Move.status === 204, "Archives the second card, moving its series to Checking");
+  const s37SpotifyNext = await Transaction.findOne({ where: { recurringGroupId: s37SpotifyGroup, date: s37NextMonth } });
+  assert(
+    s37SpotifyNext && s37SpotifyNext.fromAccountId === s37Checking.id && s37SpotifyNext.isCleared === false,
+    "moveToChecking moves the upcoming Spotify charge to Checking"
+  );
+  const s37GymNextRow = await Transaction.findOne({ where: { recurringGroupId: s37GymGroup, date: s37GymNext } });
+  assert(
+    s37GymNextRow && s37GymNextRow.fromAccountId === s37Checking.id && s37GymNextRow.isCleared === false,
+    "moveToChecking starts a series with no upcoming row (yearly gym) on Checking"
+  );
+  assert(
+    (await Transaction.count({ where: { title: "Payment for Suite 37 Amex" } })) === 0,
+    "moveToChecking still ends the upcoming payment to the archived card"
+  );
+  const s37SpotifyPaid = await Transaction.findOne({ where: { recurringGroupId: s37SpotifyGroup, date: s37Past } });
+  assert(s37SpotifyPaid && s37SpotifyPaid.fromAccountId === s37Card2Id, "Paid Spotify history stays on the archived card");
+  await s37Generate(null, { todayStr: getTorontoOffsetDate(30) });
+  const s37SpotifyRows = await Transaction.findAll({ where: { recurringGroupId: s37SpotifyGroup }, order: [["date", "ASC"]] });
+  const s37SpotifyNewest = s37SpotifyRows[s37SpotifyRows.length - 1];
+  assert(
+    s37SpotifyRows.length >= 3 && s37SpotifyNewest.fromAccountId === s37Checking.id,
+    `The generator keeps Spotify going on Checking (${s37SpotifyRows.length} rows)`
+  );
+  const s37Upcoming2 = await s33("GET", "/api/dashboard");
+  const s37SpotifyBill = (s37Upcoming2.body.upcomingBills || []).find((b) => b.title === "Suite 37 Spotify");
+  assert(!s37SpotifyBill || s37SpotifyBill.fromAccount?.type === "CHECKING", "A moved Spotify bill shows as paid from Checking");
+
+  // 37.3 Delete a goal that holds money, moving it back to Checking: net worth is unchanged
+  const s37Goal = await s33("POST", "/api/savings-goals", { name: "Suite 37 Trip", target_amount: 1000 });
+  const s37GoalId = s37Goal.body.id;
+  const s37Contrib = await s33("POST", `/api/savings-goals/${s37GoalId}/contribute`, { amount: 300 });
+  assert(s37Contrib.status === 200, "Contributes $300 from Checking to the goal");
+  const s37GoalImpact = await s33("GET", `/api/accounts/${s37GoalId}/delete-impact`);
+  assert(s37GoalImpact.body.balance === 300, "delete-impact returns the goal's $300 balance");
+  const s37NetBefore = (await getBalancesSummary()).netWorth;
+  const s37CheckingBefore = (await getBalancesSummary()).checking;
+  const s37GoalDelete = await s33("DELETE", `/api/savings-goals/${s37GoalId}`, { mode: "delete", series: "end", moveBalanceToChecking: true });
+  assert(s37GoalDelete.status === 204, "Deletes the goal permanently, moving its money to Checking");
+  assert((await Account.findByPk(s37GoalId)) === null, "The deleted goal is gone");
+  const s37After = await getBalancesSummary();
+  assert(
+    s37After.netWorth === s37NetBefore,
+    `Net worth is unchanged after deleting a goal with moveBalanceToChecking (${s37NetBefore} -> ${s37After.netWorth})`
+  );
+  assert(Math.round((s37After.checking - s37CheckingBefore) * 100) / 100 === 300, "Checking gains the goal's $300");
+  const s37MoveRow = await Transaction.findOne({ where: { title: "Moved from Suite 37 Trip" } });
+  assert(
+    s37MoveRow && s37MoveRow.type === "TRANSFER" && s37MoveRow.isCleared === true && parseFloat(s37MoveRow.amount) === 300 && s37MoveRow.toAccountId === s37Checking.id,
+    "One cleared $300 TRANSFER from the goal to Checking is recorded"
+  );
+
+  // Archive variant: the goal keeps its history but is emptied into Checking
+  const s37Goal2 = await s33("POST", "/api/savings-goals", { name: "Suite 37 Car", target_amount: 1000 });
+  const s37Goal2Id = s37Goal2.body.id;
+  await s33("POST", `/api/savings-goals/${s37Goal2Id}/contribute`, { amount: 120 });
+  const s37Net2Before = (await getBalancesSummary()).netWorth;
+  const s37Goal2Archive = await s33("DELETE", `/api/savings-goals/${s37Goal2Id}`, { moveBalanceToChecking: true });
+  assert(s37Goal2Archive.status === 204, "Archives the second goal (default mode) moving its money");
+  const s37Goal2After = await Account.findByPk(s37Goal2Id);
+  assert(
+    s37Goal2After && s37Goal2After.isActive === false && parseFloat(s37Goal2After.initialBalance) === 0,
+    "The archived goal is inactive and empty"
+  );
+  assert((await getBalancesSummary()).netWorth === s37Net2Before, "Net worth is unchanged after archiving a goal with moveBalanceToChecking");
+
+  // 37.4 An archived account and any unpaid row still pointing at it stay out of the forecast, dashboard, feed and AI context
+  const s37Card3 = await s33("POST", "/api/credit-cards", { name: "Suite 37 Hidden Card", creditLimit: 500, currentBalance: 80 });
+  const s37Card3Id = s37Card3.body.id;
+  await Transaction.create({ title: "Suite 37 Leftover Bill", amount: 80, date: s37Soon, type: "TRANSFER", category: "Credit Card Payment", isCleared: false, fromAccountId: s37Checking.id, toAccountId: s37Card3Id });
+  await Account.update({ isActive: false }, { where: { id: s37Card3Id } });
+  assert(!(await s37ForecastTitles()).includes("Suite 37 Leftover Bill"), "Forecast skips a row that uses an archived account");
+  const s37Dash = await s33("GET", "/api/dashboard");
+  assert(
+    !(s37Dash.body.upcomingBills || []).some((b) => b.title === "Suite 37 Leftover Bill") &&
+      !(s37Dash.body.creditCardSummary || []).some((c) => c.id === s37Card3Id),
+    "Dashboard leaves out the archived card and its upcoming payment"
+  );
+  const s37Config = await s33("GET", "/api/export/gemini-config");
+  const s37Feed = await request({ hostname: "localhost", port: 8000, path: `/api/export/financial-feed.md?key=${s37Config.body.feedKey}`, method: "GET" });
+  assert(s37Feed.status === 200 && !s37Feed.raw.includes("Suite 37 Hidden Card"), "Export feed leaves out the archived card");
+  const { getContextAccounts: s37ContextAccounts } = require("../routes/gemini");
+  const s37Ctx =
+    typeof s37ContextAccounts === "function"
+      ? s37ContextAccounts([
+          { type: "CREDIT_CARD", name: "On", isActive: true },
+          { type: "CREDIT_CARD", name: "Off", isActive: false },
+          { type: "SAVINGS_GOAL", name: "Goal Off", isActive: false, initialBalance: 5 },
+          { type: "DEBT", name: "Debt Off", isActive: false, initialBalance: 5 },
+        ])
+      : null;
+  assert(
+    s37Ctx && s37Ctx.cards.map((c) => c.name).join() === "On" && s37Ctx.goals.length === 0 && s37Ctx.debts.length === 0,
+    "Gemini context leaves out archived cards, goals and debts (R7)"
+  );
+
+  // 37.5 Debts accept the same body; a permanent delete removes the account and unlinks its history
+  const s37Debt = await s33("POST", "/api/debts", { name: "Suite 37 Loan", total_amount: 500, monthly_payment: 50 });
+  const s37DebtId = s37Debt.body.id;
+  const s37DebtPay = await s33("POST", `/api/debts/${s37DebtId}/pay`, { amount: 50 });
+  assert(s37DebtPay.status === 200, "Pays $50 toward the Suite 37 debt");
+  await Transaction.create({ title: "Payment for Suite 37 Loan", amount: 50, date: s37Soon, type: "TRANSFER", category: "Debt", isCleared: false, recurrence: "monthly", fromAccountId: s37Checking.id, toAccountId: s37DebtId });
+  const s37DebtDelete = await s33("DELETE", `/api/debts/${s37DebtId}`, { mode: "delete", series: "moveToChecking" });
+  assert(s37DebtDelete.status === 204, "Deletes the debt permanently");
+  assert((await Account.findByPk(s37DebtId)) === null, "The deleted debt is gone");
+  const s37DebtRows = await Transaction.findAll({ where: { title: "Payment for Suite 37 Loan" } });
+  assert(
+    s37DebtRows.length === 1 && s37DebtRows[0].isCleared === true && s37DebtRows[0].toAccountId === null,
+    "The paid debt payment stays in history (unlinked) and the upcoming one is removed"
+  );
+
+  await Transaction.destroy({
+    where: {
+      [Op.or]: [
+        { title: { [Op.like]: "Suite 37 %" } },
+        { title: { [Op.like]: "Payment for Suite 37 %" } },
+        { title: { [Op.like]: "Contribution to Suite 37 %" } },
+        { title: { [Op.like]: "Moved from Suite 37 %" } },
+      ],
+    },
+  });
+  await Account.destroy({ where: { name: { [Op.like]: "Suite 37 %" } } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

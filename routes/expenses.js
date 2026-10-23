@@ -217,6 +217,11 @@ router.get(
       targetAccountId: t.toAccountId || null,
       fromAccount: t.fromAccount ? t.fromAccount.name : null,
       toAccount: t.toAccount ? t.toAccount.name : null,
+      fromAccountType: t.fromAccount ? t.fromAccount.type : null,
+      toAccountType: t.toAccount ? t.toAccount.type : null,
+      // Archived accounts keep their name in the history
+      fromAccountArchived: t.fromAccount ? t.fromAccount.isActive === false : false,
+      toAccountArchived: t.toAccount ? t.toAccount.isActive === false : false,
     }));
 
     res.json(rows);

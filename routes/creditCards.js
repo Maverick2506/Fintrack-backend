@@ -5,6 +5,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { retireAccount } = require("../services/accountArchiveService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -105,8 +106,10 @@ router.post(
   })
 );
 
+// Archives by default. Unpaid rows and recurring series using it are ended or moved to Checking.
 router.delete(
   "/credit-cards/:id",
+  validateBody(schemas.retireAccount),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     try {
@@ -116,18 +119,7 @@ router.delete(
         return res.status(404).json({ error: "Credit Card not found" });
       }
 
-      // Unlink any transactions referencing this card so transaction history is preserved
-      await Transaction.update(
-        { fromAccountId: null },
-        { where: { fromAccountId: card.id }, transaction: dbTx }
-      );
-      await Transaction.update(
-        { toAccountId: null },
-        { where: { toAccountId: card.id }, transaction: dbTx }
-      );
-
-      // Truly delete the credit card record from the database
-      await card.destroy({ transaction: dbTx });
+      await retireAccount(card, req.body, dbTx);
 
       await dbTx.commit();
       res.status(204).send();

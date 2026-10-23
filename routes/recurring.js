@@ -1,6 +1,6 @@
 const express = require("express");
 const crypto = require("crypto");
-const { Transaction, Setting } = require("../models");
+const { Transaction, Setting, Account } = require("../models");
 const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
 const { toZonedTime, format } = require("date-fns-tz");
@@ -95,6 +95,38 @@ const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
   }
 };
 
+const ACTIVE_RECURRENCES = ["weekly", "bi-weekly", "monthly", "yearly"];
+
+// Groups rows (newest first) into series, keyed by recurringGroupId or by type and title for older rows.
+// The generator follows the newest row of each series.
+const getSeriesKey = (trx) =>
+  trx.recurringGroupId
+    ? `series:${trx.recurringGroupId}`
+    : `${trx.type}:${trx.title.toLowerCase().trim()}`;
+
+const groupSeries = (rowsNewestFirst) => {
+  const latestOccurrences = {};
+  const seriesDates = {};
+  const seriesRows = {};
+  for (const trx of rowsNewestFirst) {
+    const key = getSeriesKey(trx);
+    if (!latestOccurrences[key]) {
+      latestOccurrences[key] = trx;
+      seriesDates[key] = [];
+      seriesRows[key] = [];
+    }
+    seriesDates[key].push(trx.date);
+    seriesRows[key].push(trx);
+  }
+  return { latestOccurrences, seriesDates, seriesRows };
+};
+
+// A series whose card, debt or goal is archived (or no longer exists) stops generating
+const isSeriesAccountRetired = (trx, accountsById) =>
+  [trx.fromAccountId, trx.toAccountId].some(
+    (id) => id && (!accountsById.has(id) || accountsById.get(id).isActive === false)
+  );
+
 const getNextDueDate = (currentDate, recurrence) => {
   if (currentDate instanceof Date) {
     const y = currentDate.getFullYear();
@@ -133,27 +165,18 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
       transaction: dbTx,
     });
 
-    const latestOccurrences = {};
-    const seriesDates = {};
-    for (const trx of allTransactions) {
-      const key = trx.recurringGroupId
-        ? `series:${trx.recurringGroupId}`
-        : `${trx.type}:${trx.title.toLowerCase().trim()}`;
-      if (!latestOccurrences[key]) {
-        latestOccurrences[key] = trx;
-        seriesDates[key] = [];
-      }
-      // Rows are newest first
-      seriesDates[key].push(trx.date);
-    }
+    const { latestOccurrences, seriesDates } = groupSeries(allTransactions);
+    const accounts = await Account.findAll({
+      attributes: ["id", "isActive"],
+      transaction: dbTx,
+    });
+    const accountsById = new Map(accounts.map((a) => [a.id, a]));
 
     for (const [seriesKey, baseTrx] of Object.entries(latestOccurrences)) {
-      if (
-        !baseTrx.recurrence ||
-        !["weekly", "bi-weekly", "monthly", "yearly"].includes(
-          baseTrx.recurrence
-        )
-      ) {
+      if (!ACTIVE_RECURRENCES.includes(baseTrx.recurrence)) {
+        continue;
+      }
+      if (isSeriesAccountRetired(baseTrx, accountsById)) {
         continue;
       }
 
@@ -296,5 +319,7 @@ module.exports = {
   getNextDueDate,
   getNextOccurrenceDate,
   getSeriesAnchorDay,
+  groupSeries,
+  ACTIVE_RECURRENCES,
   QUICK_ADD_CATCHUP_KEY,
 };

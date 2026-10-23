@@ -6,6 +6,7 @@ const { subDays } = require("date-fns");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { retireAccount } = require("../services/accountArchiveService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -182,8 +183,10 @@ router.post(
   })
 );
 
+// Archives by default. Unpaid rows and recurring series using it are ended or moved to Checking.
 router.delete(
   "/savings-goals/:id",
+  validateBody(schemas.retireAccount),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     try {
@@ -193,18 +196,7 @@ router.delete(
         return res.status(404).json({ error: "Savings Goal not found" });
       }
 
-      // Unlink any transactions referencing this savings goal so contribution history is preserved
-      await Transaction.update(
-        { fromAccountId: null },
-        { where: { fromAccountId: goal.id }, transaction: dbTx }
-      );
-      await Transaction.update(
-        { toAccountId: null },
-        { where: { toAccountId: goal.id }, transaction: dbTx }
-      );
-
-      // Truly delete the savings goal record from the database
-      await goal.destroy({ transaction: dbTx });
+      await retireAccount(goal, req.body, dbTx);
 
       await dbTx.commit();
       res.status(204).send();
