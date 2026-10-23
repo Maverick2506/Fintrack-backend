@@ -3,9 +3,12 @@ const crypto = require("crypto");
 const { getBalancesSummary } = require("../services/netWorthService");
 const { toZonedTime, format } = require("date-fns-tz");
 const { Op } = require("sequelize");
-const { sequelize, Account, Transaction, Setting } = require("../models");
+const { Account, Transaction, Setting, Budget } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
 const { getPaychequeProjection } = require("../services/projectionService");
+const { getForecast } = require("../services/forecastService");
+const { normalizePayeeTitle } = require("../utils/payeeNormalizer");
+const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { feedLimiter } = require("../middleware/rateLimit");
 
 // Helper: Timing-safe token comparison
@@ -20,6 +23,13 @@ const constantTimeCompare = (a, b) => {
 const router = express.Router();
 const TIMEZONE = "America/Toronto";
 const SETTING_KEY = "gemini_feed_token";
+const FORECAST_DAYS = 60;
+const RECENT_LIMIT = 50;
+const PAYEES_LIMIT = 300;
+const HISTORY_MONTHS = 12;
+const DEFAULT_FRONTEND_URL = "https://fintrack-frontend-jet.vercel.app";
+const getFrontendUrl = () =>
+  (process.env.FRONTEND_URL || DEFAULT_FRONTEND_URL).trim().replace(/\/+$/, "");
 
 // Helper: Retrieve or initialize persistent secret feed token
 const getOrCreateFeedToken = async () => {
@@ -48,6 +58,93 @@ const regenerateFeedToken = async () => {
   return record.value;
 };
 
+const money = (n) => (Math.round((parseFloat(n) || 0) * 100) / 100).toFixed(2);
+
+// FORECAST section: the forecast service's numbers, unchanged, so the Gem matches the app
+const buildForecastSummary = (f) => {
+  const lastDay = f.days && f.days.length ? f.days[f.days.length - 1].date : f.today;
+  const est = f.estimatedIncome;
+  return {
+    safeToSpend: f.safeToSpend,
+    until: f.nextPayday || lastDay,
+    untilNote: f.nextPayday
+      ? "Next payday; Safe to Spend covers the days before it"
+      : `No payday in the next ${FORECAST_DAYS} days; covers the whole forecast`,
+    buffer: f.buffer,
+    lowestBalance: f.lowestPoint.balance,
+    lowestDate: f.lowestPoint.date,
+    nextPayday: f.nextPayday || "",
+    estimatedIncomeIncluded: Boolean(est),
+    estimatedIncomeNote: est
+      ? `Estimated ${est.cadence} paycheque of $${money(est.amount)} on ${est.dates.join("; ")}`
+      : "Only income already in FinTrack is counted",
+  };
+};
+
+// PAYEES section: one row per normalized title over the last 12 months, biggest first.
+// rows arrive newest first, so the first row seen for a payee is its latest payment.
+const buildPayees = (rows, accountLabel, yearStart) => {
+  const byKey = new Map();
+  for (const t of rows) {
+    const key = normalizePayeeTitle(t.title);
+    if (!key) continue;
+    const amount = parseFloat(t.amount) || 0;
+    let p = byKey.get(key);
+    if (!p) {
+      p = {
+        title: key,
+        category: t.type === "TRANSFER" ? "Transfer" : t.category || "Other",
+        account: accountLabel(t),
+        lastPaidDate: t.date,
+        lastAmount: amount,
+        times12m: 0,
+        total12m: 0,
+        totalYtd: 0,
+      };
+      byKey.set(key, p);
+    }
+    p.times12m += 1;
+    p.total12m += amount;
+    if (t.date >= yearStart) p.totalYtd += amount;
+  }
+  return [...byKey.values()]
+    .sort((a, b) => b.total12m - a.total12m || a.title.localeCompare(b.title))
+    .slice(0, PAYEES_LIMIT);
+};
+
+// MONTHLY_CATEGORIES section: the last 12 months (newest first) x category.
+// SPENT counts paid EXPENSEs only (card and debt payments are transfers, not spending).
+// Budgets have no history, so BUDGET is today's monthly limit for every month.
+const buildMonthlyCategories = (rows, budgets, year, month) => {
+  const months = [];
+  for (let i = 0; i < HISTORY_MONTHS; i++) {
+    const d = new Date(Date.UTC(year, month - 1 - i, 1));
+    months.push(`${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`);
+  }
+  const budgetMap = new Map(budgets.map((b) => [b.category, parseFloat(b.monthlyLimit)]));
+  const spent = new Map();
+  const categories = new Set([...EXPENSE_CATEGORIES, ...budgetMap.keys()]);
+  for (const t of rows) {
+    if (t.type !== "EXPENSE") continue;
+    const category = t.category || "Other";
+    categories.add(category);
+    const key = `${t.date.slice(0, 7)}|${category}`;
+    spent.set(key, (spent.get(key) || 0) + (parseFloat(t.amount) || 0));
+  }
+  const out = [];
+  for (const m of months) {
+    for (const category of categories) {
+      out.push({
+        month: m,
+        category,
+        spent: spent.get(`${m}|${category}`) || 0,
+        budget: budgetMap.has(category) ? budgetMap.get(category) : null,
+      });
+    }
+  }
+  return out;
+};
+
 // Helper: Fetch live financial snapshot
 const getFinancialData = async () => {
   const nowZoned = toZonedTime(new Date(), TIMEZONE);
@@ -57,9 +154,25 @@ const getFinancialData = async () => {
   const lastDay = new Date(year, month, 0).getDate();
   const endOfMonth = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
   const currentMonthPrefix = todayStr.slice(0, 7);
+  const generatedAt = format(nowZoned, "yyyy-MM-dd HH:mm", { timeZone: TIMEZONE });
+  // History window: the last 12 months, i.e. after this date a year ago
+  const historyStart = `${year - 1}${todayStr.slice(4)}`;
+  const yearStart = `${year}-01-01`;
+  const withAccounts = [
+    { model: Account, as: "fromAccount" },
+    { model: Account, as: "toAccount" },
+  ];
 
-  const [accounts, monthExpensesSum, monthIncomeSum, upcomingBills, recentTransactions] =
-    await Promise.all([
+  const [
+    accounts,
+    monthExpensesSum,
+    monthIncomeSum,
+    upcomingBills,
+    recentTransactions,
+    historyRows,
+    budgets,
+    forecast,
+  ] = await Promise.all([
       Account.findAll({ order: [["type", "ASC"], ["name", "ASC"]] }),
       Transaction.sum("amount", {
         where: {
@@ -89,13 +202,32 @@ const getFinancialData = async () => {
         ],
         limit: 20,
       }),
+      // Only what has actually happened: paid and dated today or earlier (G3)
       Transaction.findAll({
+        where: { isCleared: true, date: { [Op.lte]: todayStr } },
         order: [
           ["date", "DESC"],
           ["createdAt", "DESC"],
         ],
-        limit: 50,
+        include: withAccounts,
+        limit: RECENT_LIMIT,
       }),
+      // Paid money out over the last 12 months, for PAYEES and MONTHLY_CATEGORIES
+      Transaction.findAll({
+        where: {
+          type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
+          isCleared: true,
+          date: { [Op.gt]: historyStart, [Op.lte]: todayStr },
+        },
+        order: [
+          ["date", "DESC"],
+          ["createdAt", "DESC"],
+        ],
+        include: withAccounts,
+      }),
+      Budget.findAll(),
+      // Same numbers as the app's Safe to Spend card (G1)
+      getForecast(FORECAST_DAYS),
     ]);
 
   const balancesSummary = await getBalancesSummary(null, todayStr);
@@ -155,8 +287,28 @@ const getFinancialData = async () => {
   const endOfMonthFloat =
     checkingBalance + totalProjectedIncome - upcomingCheckingBillsTotal;
 
+  const checkingName = checkingAcc ? checkingAcc.name : "Primary Checking";
+  const accountLabel = (t) => {
+    // No account id means checking; an id with no account means it was deleted
+    const name = (acc, id) => (acc ? acc.name : id ? "Deleted account" : checkingName);
+    const from = name(t.fromAccount, t.fromAccountId);
+    const to = name(t.toAccount, t.toAccountId);
+    if (t.type === "INCOME") return to;
+    if (t.type === "TRANSFER") return `${from} → ${to}`;
+    return from;
+  };
+
+  const forecastSummary = buildForecastSummary(forecast);
+  const payees = buildPayees(historyRows, accountLabel, yearStart);
+  const monthlyCategories = buildMonthlyCategories(historyRows, budgets, year, month);
+
   return {
     todayStr,
+    generatedAt,
+    forecast: forecastSummary,
+    payees,
+    monthlyCategories,
+    accountLabel,
     checkingBalance,
     totalCC,
     totalDebt,
@@ -194,8 +346,25 @@ const csvEscape = (val) => {
 // Helper: Generate structured CSV
 const generateCSV = (d) => {
   const rows = [];
+  const push = (...cols) => rows.push(cols.map(csvEscape).join(","));
+  const f = d.forecast;
 
-  // 1. OVERVIEW
+  // First row: when this snapshot was taken, so the Gem can tell how fresh it is
+  push("SNAPSHOT_AT", d.generatedAt, "America/Toronto");
+  rows.push([]);
+
+  // 1. FORECAST (the app's Safe to Spend; use this for affordability)
+  push("SECTION", "METRIC", "VALUE", "NOTES");
+  push("FORECAST", "SAFE_TO_SPEND", money(f.safeToSpend), "Same as the app's Safe to Spend. Use this for every affordability answer.");
+  push("FORECAST", "UNTIL", f.until, f.untilNote);
+  push("FORECAST", "BUFFER", money(f.buffer), "Cushion already kept back from SAFE_TO_SPEND");
+  push("FORECAST", "LOWEST_BALANCE", money(f.lowestBalance), `Lowest projected checking balance in the next ${FORECAST_DAYS} days`);
+  push("FORECAST", "LOWEST_DATE", f.lowestDate, "Date of LOWEST_BALANCE");
+  push("FORECAST", "NEXT_PAYDAY", f.nextPayday, f.nextPayday ? "" : `No income expected in the next ${FORECAST_DAYS} days`);
+  push("FORECAST", "ESTIMATED_INCOME_INCLUDED", f.estimatedIncomeIncluded ? "YES" : "NO", f.estimatedIncomeNote);
+
+  // 2. OVERVIEW
+  rows.push([]);
   rows.push(["SECTION", "CATEGORY", "METRIC", "VALUE", "NOTES"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Snapshot", "Snapshot Date", d.todayStr, "Timezone: America/Toronto"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Accounts", "Primary Checking Balance", `$${d.checkingBalance.toFixed(2)}`, "Available liquid cash"].map(csvEscape).join(","));
@@ -207,9 +376,9 @@ const generateCSV = (d) => {
   rows.push(["OVERVIEW", "Projections", "Upcoming Unpaid Bills Total", `$${d.upcomingBillsTotal.toFixed(2)}`, "All unpaid bills remaining this month"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Projections", "Upcoming Bills (From Checking)", `$${d.upcomingCheckingBillsTotal.toFixed(2)}`, "Bills directly deducting liquid cash from Primary Checking"].map(csvEscape).join(","));
   rows.push(["OVERVIEW", "Projections", "Upcoming Bills (On Credit Cards)", `$${d.upcomingCCBillsTotal.toFixed(2)}`, "Bills charged to credit cards (adds to card balance)"].map(csvEscape).join(","));
-  rows.push(["OVERVIEW", "Projections", "Projected End-of-Month Float", `$${d.endOfMonthFloat.toFixed(2)}`, "Liquid cash remaining after checking bills & projected income"].map(csvEscape).join(","));
+  rows.push(["OVERVIEW", "Projections", "Projected End-of-Month Float", `$${d.endOfMonthFloat.toFixed(2)}`, "Context only, rest of this month. For affordability use FORECAST SAFE_TO_SPEND."].map(csvEscape).join(","));
 
-  // 2. ACCOUNTS & LIABILITIES
+  // 3. ACCOUNTS & LIABILITIES
   rows.push([]);
   rows.push(["SECTION", "TYPE", "ACCOUNT_NAME", "CURRENT_BALANCE", "LIMIT_OR_TARGET", "INTEREST_RATE_PCT", "MIN_PAYMENT", "STATUS"].map(csvEscape).join(","));
   if (d.checkingAcc) {
@@ -228,7 +397,7 @@ const generateCSV = (d) => {
     rows.push(["ACCOUNTS", "SAVINGS_GOAL", g.name, parseFloat(g.initialBalance || 0).toFixed(2), parseFloat(g.targetAmount || 0).toFixed(2), "", "", "ACTIVE"].map(csvEscape).join(","));
   }
 
-  // 3. UPCOMING UNPAID BILLS
+  // 4. UPCOMING UNPAID BILLS
   rows.push([]);
   rows.push(["SECTION", "DUE_DATE", "BILL_TITLE", "AMOUNT", "DEDUCTED_FROM", "ACCOUNT_TYPE", "RECURRENCE", "TAX_STATUS"].map(csvEscape).join(","));
   for (const b of d.upcomingBills) {
@@ -247,25 +416,52 @@ const generateCSV = (d) => {
     ].map(csvEscape).join(","));
   }
 
-  // 4. RECENT TRANSACTIONS
+  // 5. RECENT TRANSACTIONS (paid, dated today or earlier)
   rows.push([]);
-  rows.push(["SECTION", "DATE", "TYPE", "CATEGORY", "TITLE", "AMOUNT", "CLEARED"].map(csvEscape).join(","));
+  push("SECTION", "DATE", "TYPE", "CATEGORY", "TITLE", "AMOUNT", "ACCOUNT");
   for (const t of d.recentTransactions) {
-    rows.push(["RECENT_TRANSACTIONS", t.date, t.type, t.category, t.title, parseFloat(t.amount).toFixed(2), t.isCleared ? "YES" : "NO"].map(csvEscape).join(","));
+    push("RECENT_TRANSACTIONS", t.date, t.type, t.category, t.title, money(t.amount), d.accountLabel(t));
+  }
+
+  // 6. PAYEES (last 12 months, biggest first)
+  rows.push([]);
+  push("SECTION", "TITLE", "CATEGORY", "ACCOUNT", "LAST_PAID_DATE", "LAST_AMOUNT", "TIMES_12M", "TOTAL_12M", "TOTAL_YTD");
+  for (const p of d.payees) {
+    push("PAYEES", p.title, p.category, p.account, p.lastPaidDate, money(p.lastAmount), p.times12m, money(p.total12m), money(p.totalYtd));
+  }
+
+  // 7. MONTHLY_CATEGORIES (last 12 months x category)
+  rows.push([]);
+  push("SECTION", "MONTH", "CATEGORY", "SPENT", "BUDGET");
+  for (const m of d.monthlyCategories) {
+    push("MONTHLY_CATEGORIES", m.month, m.category, money(m.spent), m.budget === null ? "" : money(m.budget));
   }
 
   return rows.join("\n");
 };
 
+const mdCell = (val) => String(val ?? "").replace(/\|/g, "/").replace(/\s*\n\s*/g, " ");
+
 // Helper: Generate structured Markdown
 const generateMarkdown = (d) => {
   return `# FINTRACK FINANCIAL SNAPSHOT
-**Generated:** ${d.todayStr} (America/Toronto)
+**Generated:** ${d.generatedAt} (America/Toronto)
 **Owner:** Maverick
 
 ---
 
-## 1. Executive Summary & Float
+## Forecast (the app's Safe to Spend)
+- **SAFE_TO_SPEND:** **$${money(d.forecast.safeToSpend)}** (use this for every affordability answer)
+- **UNTIL:** ${d.forecast.until} (${d.forecast.untilNote})
+- **BUFFER:** $${money(d.forecast.buffer)}
+- **LOWEST_BALANCE:** $${money(d.forecast.lowestBalance)}
+- **LOWEST_DATE:** ${d.forecast.lowestDate}
+- **NEXT_PAYDAY:** ${d.forecast.nextPayday || "none in the next " + FORECAST_DAYS + " days"}
+- **ESTIMATED_INCOME_INCLUDED:** ${d.forecast.estimatedIncomeIncluded ? "YES" : "NO"} (${d.forecast.estimatedIncomeNote})
+
+---
+
+## 1. Executive Summary
 - **Primary Checking Balance:** $${d.checkingBalance.toFixed(2)}
 - **Estimated Net Worth:** $${d.netWorth.toFixed(2)}
 - **Current Month Cleared Income:** $${d.clearedIncome.toFixed(2)}
@@ -273,7 +469,7 @@ const generateMarkdown = (d) => {
 - **Current Net Cash Flow:** $${d.netFlow.toFixed(2)}
 - **Projected Upcoming Income:** $${d.totalProjectedIncome.toFixed(2)} (${d.projectedPaychequeDates.length} upcoming paycheques)
 - **Upcoming Unpaid Bills Total:** $${d.upcomingBillsTotal.toFixed(2)}
-- **Projected End-of-Month Safe Float:** **$${d.endOfMonthFloat.toFixed(2)}**
+- **Projected End-of-Month Float (context only):** $${d.endOfMonthFloat.toFixed(2)}
 
 ---
 
@@ -366,42 +562,73 @@ ${
 
 ---
 
-## 4. Recent Transactions Ledger (Last 50)
-| Date | Type | Category | Description | Amount |
-| :--- | :--- | :--- | :--- | :--- |
+## 4. Recent Transactions Ledger (Last ${RECENT_LIMIT} paid, today or earlier)
+| Date | Type | Category | Description | Amount | Account |
+| :--- | :--- | :--- | :--- | :--- | :--- |
 ${d.recentTransactions
   .map(
     (t) =>
-      `| ${t.date} | ${t.type} | ${t.category} | ${t.title.replace(/\|/g, "/")} | $${parseFloat(
-        t.amount
-      ).toFixed(2)} |`
+      `| ${t.date} | ${t.type} | ${t.category} | ${mdCell(t.title)} | $${money(t.amount)} | ${mdCell(d.accountLabel(t))} |`
+  )
+  .join("\n")}
+
+---
+
+## 5. Payees (last 12 months)
+| Title | Category | Account | Last Paid | Last Amount | Times (12m) | Total (12m) | Total (YTD) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+${d.payees
+  .map(
+    (p) =>
+      `| ${mdCell(p.title)} | ${mdCell(p.category)} | ${mdCell(p.account)} | ${p.lastPaidDate} | $${money(p.lastAmount)} | ${p.times12m} | $${money(p.total12m)} | $${money(p.totalYtd)} |`
+  )
+  .join("\n")}
+
+---
+
+## 6. Monthly Categories (last 12 months)
+| Month | Category | Spent | Budget |
+| :--- | :--- | :--- | :--- |
+${d.monthlyCategories
+  .map(
+    (m) =>
+      `| ${m.month} | ${mdCell(m.category)} | $${money(m.spent)} | ${m.budget === null ? "" : `$${money(m.budget)}`} |`
   )
   .join("\n")}
 `;
 };
 
 // Helper: Generate specialized Gem instructions
-const generateGemInstructions = () => {
+const generateGemInstructions = (frontendUrl = getFrontendUrl()) => {
   return `# Role & Persona
 You are Maverick's elite personal financial strategist, money advisor, and day-to-day financial co-pilot inside Google Gemini.
 You have continuous access to Maverick's live FinTrack financial data connected via your Google Drive Knowledge Base ("FinTrack Live Data").
 
 # Core Principles & Directives
 1. **Mathematical Rigor:** Always reference exact numbers from the FinTrack data (Primary Checking balance, Credit Card balances, APRs, minimum payments, debts, and upcoming bills). Never guess or hallucinate numbers.
-2. **The Affordability Test ("Can I afford X?"):**
-   - Step 1: Check Primary Checking balance.
-   - Step 2: Check the DEDUCTED_FROM and ACCOUNT_TYPE columns in UPCOMING_BILLS:
-     - Bills with ACCOUNT_TYPE "CHECKING" deduct directly from liquid cash before the next expected paycheque.
-     - Bills with ACCOUNT_TYPE "CREDIT_CARD" increase credit card balance instead of immediately reducing checking cash.
-   - Step 3: Determine the remaining Safe Liquid Float (Primary Checking + Projected Income - Upcoming Checking Bills).
-   - Step 4: Deliver a direct verdict: **Yes / Caution / No**, with the exact resulting checking balance, float impact, and any credit card utilization impact.
-3. **Debt Strategy & Paid-Off Debts:**
+2. **Freshness:** The first row (SNAPSHOT_AT) says when the data was taken, in Toronto time. If it is more than 24 hours old, start your answer with "Data as of <SNAPSHOT_AT>".
+3. **The Affordability Test ("Can I afford X?"):**
+   - Use FORECAST SAFE_TO_SPEND. It is the same number the FinTrack app shows, and it already accounts for upcoming bills, expected income (see ESTIMATED_INCOME_INCLUDED) and the BUFFER until the UNTIL date.
+   - NEVER compute your own affordability or "safe float" from balances, bills or income. The OVERVIEW "Projected End-of-Month Float" is context only.
+   - Verdict: **Yes** if the amount is comfortably under SAFE_TO_SPEND, **Caution** if it uses most of it, **No** if it is over it. Quote SAFE_TO_SPEND, what would be left of it, and the UNTIL date.
+   - For a purchase on a credit card, also mention the card's balance and limit from ACCOUNTS.
+   - If LOWEST_BALANCE is low, mention LOWEST_DATE as the tight day.
+4. **History Questions ("How much did I spend on X?", "When did I last pay Y?"):**
+   - Use PAYEES (per payee: last paid date and amount, times and totals for the last 12 months and year to date) and MONTHLY_CATEGORIES (spent and budget per category for each of the last 12 months). RECENT_TRANSACTIONS has the last ${RECENT_LIMIT} paid transactions with their ACCOUNT.
+   - If the answer is not in these sections, say so plainly. Do not estimate or guess history.
+5. **Adding, Recording or Logging ("add", "record", "log", "I spent ..."):**
+   - You cannot save anything. NEVER say or imply that something was saved, added or recorded.
+   - Reply with a link Maverick taps to review and save it in FinTrack: ${frontendUrl}/quick?text=<url-encoded Quick Add text>
+   - Quick Add format, one line per item: \`amount description [card] [due MM/DD]\`. Use \`+amount\` for income. Add the card name only for card purchases, and "due MM/DD" only for a bill that is not paid yet.
+   - Examples: "23.40 lunch visa", "120 hydro due 11/05", "+2100 paycheque".
+   - URL-encode the text (spaces as %20, a new line between items as %0A). Example: ${frontendUrl}/quick?text=23.40%20lunch%20visa%0A4.50%20coffee
+6. **Debt Strategy & Paid-Off Debts:**
    - Only consider debts with STATUS "ACTIVE" as active liabilities requiring payment.
-   - Debts with STATUS "PAID_OFF" or listed under "Paid Off & Cleared Debts" (e.g. Old Navy Paypal) are 100% paid off ($0 balance, $0 payment due).
+   - Debts with STATUS "PAID_OFF" or listed under "Paid Off & Cleared Debts" are 100% paid off ($0 balance, $0 payment due).
    - NEVER suggest or calculate payments for paid-off debts. Congratulate Maverick for having eliminated them!
    - For active debts, recommend the Avalanche method (highest interest APR first) for maximum interest savings, or Snowball for quick psychological wins if requested.
-   - Ensure minimum payments on active debts are protected first before allocating surplus float.
-4. **Tone & Style:**
+   - Ensure minimum payments on active debts are protected first before allocating surplus.
+7. **Tone & Style:**
    - Address Maverick directly and warmly.
    - Concise, actionable, and structured with clean markdown (bold key dollar figures, bullet points).
    - Avoid generic financial disclaimers; speak as Maverick's trusted, private financial architect.
@@ -466,12 +693,13 @@ router.get("/financial-feed.md", async (req, res) => {
   }
 });
 
-// Helper: Generate Apps Script for guaranteed real-time on-open syncing
+// Helper: Generate Apps Script for the Sheet the Gem reads
 const generateAppsScript = (feedUrl) => {
   return `/**
  * FinTrack Auto-Sync Script for Google Sheets
- * - Automatically refreshes data every time you open the sheet.
+ * - Run installTrigger() once: it refreshes the sheet every hour, even when it's closed.
  * - Adds a "FinTrack > 🔄 Refresh Data Now" menu for 1-click sync.
+ * - The first row (SNAPSHOT_AT) is the date and time of the data, in Toronto time.
  * - Bypasses Google formula proxy caching for 100% real-time accuracy.
  */
 function onOpen() {
@@ -482,6 +710,17 @@ function onOpen() {
   refreshFinTrack();
 }
 
+// Run once from the Apps Script editor. Replaces any earlier refresh triggers with one hourly trigger.
+function installTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === "refreshFinTrack") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+  ScriptApp.newTrigger("refreshFinTrack").timeBased().everyHours(1).create();
+  refreshFinTrack();
+}
+
 function refreshFinTrack() {
   const url = "${feedUrl}&t=" + new Date().getTime();
   try {
@@ -489,14 +728,22 @@ function refreshFinTrack() {
       headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" },
       muteHttpExceptions: true,
     });
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
     if (response.getResponseCode() === 200) {
       const csvData = Utilities.parseCsv(response.getContentText());
-      const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+      // Sections have different widths; setValues needs every row the same length
+      const width = csvData.reduce(function (max, row) { return Math.max(max, row.length); }, 1);
+      const values = csvData.map(function (row) {
+        while (row.length < width) row.push("");
+        return row;
+      });
+      // The first tab, so the hourly trigger (which has no open tab) writes to the same place
+      const sheet = ss.getSheets()[0];
       sheet.clearContents();
-      sheet.getRange(1, 1, csvData.length, csvData[0].length).setValues(csvData);
-      SpreadsheetApp.getActiveSpreadsheet().toast("FinTrack numbers synchronized successfully!", "Live Sync", 3);
+      sheet.getRange(1, 1, values.length, width).setValues(values);
+      ss.toast("FinTrack numbers synchronized successfully!", "Live Sync", 3);
     } else {
-      SpreadsheetApp.getActiveSpreadsheet().toast("HTTP " + response.getResponseCode() + ": Feed fetch failed.", "Sync Warning", 5);
+      ss.toast("HTTP " + response.getResponseCode() + ": Feed fetch failed.", "Sync Warning", 5);
     }
   } catch (err) {
     Logger.log("FinTrack Sync Error: " + err.message);
