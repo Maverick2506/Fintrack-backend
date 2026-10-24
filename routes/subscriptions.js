@@ -75,12 +75,10 @@ router.get(
       ],
     });
 
-    // 2. Group by recurringGroupId (or series fallback by title)
+    // 2. Group by recurringGroupId; a row without one is on its own (see getSeriesKey)
     const groups = new Map();
     for (const trx of recurringTrxs) {
-      const key = trx.recurringGroupId
-        ? `group:${trx.recurringGroupId}`
-        : `title:${trx.title.toLowerCase().trim()}`;
+      const key = trx.recurringGroupId ? `group:${trx.recurringGroupId}` : `row:${trx.id}`;
       if (!groups.has(key)) {
         groups.set(key, []);
       }

@@ -12,7 +12,7 @@ const {
   markSeriesRowMoved,
   ACTIVE_RECURRENCES,
 } = require("./recurring");
-const { endSeries, findSeriesRows, findCurrentOccurrence } = require("../services/seriesService");
+const { endSeries, findSeriesRows, findCurrentOccurrence, seriesOf } = require("../services/seriesService");
 const { isClientRefConflict } = require("../services/clientRefService");
 const {
   snapshotArchivedBalances,
@@ -591,12 +591,10 @@ router.put(
       let nextRecurringGroupId = trx.recurringGroupId;
       if (req.body.recurringGroupId !== undefined) {
         nextRecurringGroupId = req.body.recurringGroupId;
-      } else if (nextRecurrence && nextRecurrence !== "none") {
-        if (!nextRecurringGroupId) {
-          nextRecurringGroupId = crypto.randomUUID();
-        }
-      } else if (!trx.recurringGroupId) {
-        nextRecurringGroupId = null;
+      }
+      // A recurring row always belongs to a series id: a row without one is a single row, not a series
+      if (nextRecurrence && nextRecurrence !== "none" && !nextRecurringGroupId) {
+        nextRecurringGroupId = crypto.randomUUID();
       }
 
       // A trashed occurrence still holds its date in the series' unique index; say so instead of the
@@ -623,8 +621,6 @@ router.put(
       }
 
       const prevRecurrence = trx.recurrence;
-      const prevType = trx.type;
-      const prevTitle = trx.title;
       const prevDate = trx.date;
       const prevGroupId = trx.recurringGroupId;
       await trx.update(
@@ -660,10 +656,7 @@ router.put(
       let removedUpcomingTotal = 0;
       const wasRecurring = prevRecurrence && prevRecurrence !== "none";
       if (wasRecurring && nextRecurrence === "none") {
-        // An older series without a group id is grouped by its type and title before this edit
-        const series = nextRecurringGroupId
-          ? { recurringGroupId: nextRecurringGroupId }
-          : { type: prevType, title: prevTitle };
+        const series = seriesOf(trx);
         const todayStr = getTodayString();
         const currentOccurrence = findCurrentOccurrence(
           await findSeriesRows(series, dbTx),
