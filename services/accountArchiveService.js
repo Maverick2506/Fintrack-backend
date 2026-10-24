@@ -144,7 +144,8 @@ const retireAccount = async (account, options, dbTx) => {
       await row.update({ fromAccountId: checking.id }, { transaction: dbTx });
       movedIds.add(row.id);
     } else {
-      await row.destroy({ transaction: dbTx });
+      // Removed for good, not sent to the Trash (the account they used is going away)
+      await row.destroy({ force: true, transaction: dbTx });
     }
   }
 
@@ -231,13 +232,14 @@ const retireAccount = async (account, options, dbTx) => {
 
   // 4. Archive keeps the account (and its history links); delete unlinks past rows and removes it
   if (mode === "delete") {
+    // Rows in the Trash are unlinked too
     await Transaction.update(
       { fromAccountId: null },
-      { where: { fromAccountId: account.id }, transaction: dbTx }
+      { where: { fromAccountId: account.id }, paranoid: false, transaction: dbTx }
     );
     await Transaction.update(
       { toAccountId: null },
-      { where: { toAccountId: account.id }, transaction: dbTx }
+      { where: { toAccountId: account.id }, paranoid: false, transaction: dbTx }
     );
     await account.destroy({ transaction: dbTx });
   } else {

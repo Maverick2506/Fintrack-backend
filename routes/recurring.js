@@ -204,11 +204,13 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
           ? { recurringGroupId: baseTrx.recurringGroupId }
           : { type: baseTrx.type, title: baseTrx.title };
 
+        // A deleted occurrence (in the Trash) counts as taken: deleting a row must not bring it back
         const existing = await Transaction.findOne({
           where: {
             date: nextDateStr,
             ...duplicateCondition,
           },
+          paranoid: false,
           transaction: dbTx,
         });
 

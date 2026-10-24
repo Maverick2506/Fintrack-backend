@@ -17,6 +17,11 @@ const {
   getTodayString,
   TIMEZONE,
 } = require("../services/accountBalanceService");
+const {
+  softDeleteTransactions,
+  restoreTransactions,
+  listTrash,
+} = require("../services/trashService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -328,8 +333,10 @@ router.post(
 
       // Phase L: Idempotent clientRef check
       if (req.body.clientRef) {
+        // A deleted row still holds its clientRef in the unique index, so look in the Trash too
         const existing = await Transaction.findOne({
           where: { clientRef: req.body.clientRef },
+          paranoid: false,
           transaction: dbTx,
         });
         if (existing) {
@@ -374,6 +381,7 @@ router.post(
       if (req.body.clientRef && isClientRefConflict(error)) {
         const existing = await Transaction.findOne({
           where: { clientRef: req.body.clientRef },
+          paranoid: false,
         });
         if (existing) {
           return res.status(200).json(duplicateExpenseResponse(existing));
@@ -391,8 +399,12 @@ router.post(
 
 router.put(
   "/expenses/:id",
+  validateQuery(schemas.dryRunQuery),
   validateBody(schemas.updateExpense),
   asyncHandler(async (req, res) => {
+    // dryRun runs the whole update, reports what it would do (seriesEnded, removedUpcomingCount,
+    // removedUpcomingTotal) and rolls back, so the client can confirm with exact numbers (R4)
+    const dryRun = ["1", "true"].includes(req.validatedQuery.dryRun);
     const dbTx = await sequelize.transaction();
     let updated;
     try {
@@ -613,6 +625,7 @@ router.put(
       // does not recreate it.
       let seriesEnded = false;
       let removedUpcomingCount = 0;
+      let removedUpcomingTotal = 0;
       const wasRecurring = prevRecurrence && prevRecurrence !== "none";
       if (wasRecurring && nextRecurrence === "none" && nextRecurringGroupId) {
         const todayStr = getTodayString();
@@ -639,15 +652,30 @@ router.put(
 
         if (currentOccurrence && currentOccurrence.id === trx.id) {
           seriesEnded = true;
-          removedUpcomingCount = await Transaction.destroy({
+          const upcoming = await Transaction.findAll({
             where: {
               recurringGroupId: nextRecurringGroupId,
               id: { [Op.ne]: trx.id },
               isCleared: false,
               date: { [Op.gt]: trx.date },
             },
+            attributes: ["id", "amount"],
             transaction: dbTx,
           });
+          removedUpcomingCount = upcoming.length;
+          removedUpcomingTotal =
+            Math.round(upcoming.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0) * 100) / 100;
+          // Generated upcoming rows are removed for good, not sent to the Trash: restoring one would
+          // restart the series it belonged to
+          if (upcoming.length > 0) {
+            await Transaction.destroy({
+              where: { id: { [Op.in]: upcoming.map((r) => r.id) } },
+              force: true,
+              transaction: dbTx,
+            });
+          }
+          // Rows of the series already in the Trash stop recurring too, so restoring one later
+          // does not bring the series back
           await Transaction.update(
             { recurrence: "none" },
             {
@@ -655,6 +683,7 @@ router.put(
                 recurringGroupId: nextRecurringGroupId,
                 id: { [Op.ne]: trx.id },
               },
+              paranoid: false,
               transaction: dbTx,
             }
           );
@@ -671,10 +700,14 @@ router.put(
       );
       await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
 
+      updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount, removedUpcomingTotal };
+      if (dryRun) {
+        await dbTx.rollback();
+        return res.json({ ...updated, dryRun: true });
+      }
       await dbTx.commit();
-      updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount };
     } catch (error) {
-      await dbTx.rollback();
+      if (!dbTx.finished) await dbTx.rollback();
       throw error;
     }
 
@@ -698,19 +731,11 @@ router.post(
         transaction: dbTx,
       });
 
-      const archivedBefore = await snapshotArchivedBalances(dbTx);
-      for (const trx of toDelete) {
-        await adjustAccountForTransaction(trx, -1, dbTx);
-      }
-      await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
-
-      const deletedCount = await Transaction.destroy({
-        where: { id: { [Op.in]: ids } },
-        transaction: dbTx,
-      });
+      // Balances come off now; the rows go to the Trash and POST /expenses/restore brings them back
+      const deletedCount = await softDeleteTransactions(toDelete, dbTx);
 
       await dbTx.commit();
-      res.json({ deletedCount });
+      res.json({ deletedCount, ids: toDelete.map((t) => t.id) });
     } catch (error) {
       await dbTx.rollback();
       throw error;
@@ -731,10 +756,7 @@ router.delete(
         return res.status(404).json({ error: "Transaction not found" });
       }
 
-      const archivedBefore = await snapshotArchivedBalances(dbTx);
-      await adjustAccountForTransaction(trx, -1, dbTx);
-      await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
-      await trx.destroy({ transaction: dbTx });
+      await softDeleteTransactions([trx], dbTx);
 
       await dbTx.commit();
       res.status(204).send();
@@ -742,6 +764,36 @@ router.delete(
       await dbTx.rollback();
       throw error;
     }
+  })
+);
+
+// Trash: deleted rows (purged 30 days after their delete), newest delete first
+router.get(
+  "/expenses/trash",
+  asyncHandler(async (req, res) => {
+    res.json(await listTrash());
+  })
+);
+
+// Undo / Restore from Trash: brings rows back and re-applies the balance their delete took off
+router.post(
+  "/expenses/restore",
+  validateBody(schemas.restoreExpenses),
+  asyncHandler(async (req, res) => {
+    const dbTx = await sequelize.transaction();
+    let restored;
+    try {
+      restored = await restoreTransactions(req.body.ids, dbTx);
+      await dbTx.commit();
+    } catch (error) {
+      await dbTx.rollback();
+      throw error;
+    }
+    // A restored row may be the newest of a series again (runs after commit, like every save)
+    if (restored.some((t) => t.recurrence && t.recurrence !== "none")) {
+      await generateAfterSave();
+    }
+    res.json({ restoredCount: restored.length, ids: restored.map((t) => t.id) });
   })
 );
 

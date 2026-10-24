@@ -97,7 +97,7 @@ async function runTestSuite() {
   );
   // Reset test database to clean slate for reproducible runs
   await sequelize.sync();
-  await Transaction.destroy({ where: {} });
+  await Transaction.destroy({ where: {}, force: true });
   await Account.destroy({ where: { name: { [Op.ne]: "Primary Checking" } } });
   await Account.findOrCreate({
     where: { name: "Primary Checking" },
@@ -6000,6 +6000,258 @@ async function runTestSuite() {
   const s39Ids = (await Account.findAll({ where: { name: { [Op.like]: "Suite 39 %" } } })).map((a) => a.id);
   await Transaction.destroy({ where: { [Op.or]: [{ fromAccountId: [...s39Ids, s39Checking.id] }, { toAccountId: [...s39Ids, s39Checking.id] }], category: { [Op.in]: ["Interest", "Adjustment"] } } });
   await Account.destroy({ where: { id: s39Ids } });
+
+  // --- Suite 40: Undo and Trash for deletes ---
+  console.log("\n--- Suite 40: Undo and Trash for deletes ---");
+  const { getPrimaryCheckingAccount: s40GetChecking, getCalculatedCheckingBalance: s40CheckingCalc } = require("../services/checkingService");
+  const { createRecurringExpenses: s40Generate } = require("../routes/recurring");
+  const { purgeDeletedTransactions: s40Purge } = require("../services/trashService");
+  const { runDailySweep: s40Sweep } = require("../services/dailySweepService");
+  const { interestClientRef: s40InterestRef } = require("../services/debtInterestService");
+  const { executeTool: s40Tool } = require("../routes/gemini");
+  const s40Today = getTorontoToday();
+  const s40Bal = async (id) => Math.round(parseFloat((await Account.findByPk(id)).initialBalance) * 100) / 100;
+  const s40CheckingBal = async () => s40CheckingCalc(await s40GetChecking(), s40Today);
+  const s40Balances = async () => ({
+    checking: await s40CheckingBal(),
+    card: await s40Bal(s40CardId),
+    goal: await s40Bal(s40GoalId),
+  });
+  const s40Ledger = async () => ((await s33("GET", "/api/expenses/all")).body || []).map((r) => r.id);
+  const s40Trash = async () => (await s33("GET", "/api/expenses/trash")).body || [];
+  const s40Live = (where) => Transaction.count({ where });
+  const s40All = (where) => Transaction.count({ where, paranoid: false });
+
+  const s40Card = await s33("POST", "/api/credit-cards", { name: "Suite 40 Visa", creditLimit: 2000, currentBalance: 500 });
+  const s40CardId = s40Card.body.id;
+  const s40Goal = await s33("POST", "/api/savings-goals", { name: "Suite 40 Trip", target_amount: 1000, current_amount: 100 });
+  const s40GoalId = s40Goal.body.id;
+  assert(s40Card.status === 201 && s40Goal.status === 201, "Creates the Suite 40 card ($500 owed) and goal ($100 saved)");
+
+  // 40.1 Delete -> restore leaves Checking, the card and the goal exactly as before
+  const s40Before = await s40Balances();
+  const s40Rows = [
+    await s33("POST", "/api/expenses", { name: "Suite 40 Card Lunch", amount: 23.45, category: "Food & Drink", creditCardId: s40CardId, due_date: s40Today, is_paid: true }),
+    await s33("POST", "/api/expenses", { name: "Payment for Suite 40 Visa", amount: 120.1, category: "Debt", targetAccountId: s40CardId, due_date: s40Today, is_paid: true }),
+    await s33("POST", "/api/expenses", { name: "Suite 40 Trip Saving", amount: 75.55, category: "Savings", targetAccountId: s40GoalId, due_date: s40Today, is_paid: true }),
+    await s33("POST", "/api/expenses", { name: "Suite 40 Groceries", amount: 41.2, category: "Groceries", due_date: s40Today, is_paid: true }),
+  ];
+  assert(s40Rows.every((r) => r.status === 201), "Records a card purchase, a card payment, a goal contribution and a Checking expense");
+  // A past-dated card purchase entered after the fact never touched the card balance
+  const s40Historic = await s33("POST", "/api/expenses", { name: "Suite 40 Old Card Charge", amount: 9.99, category: "Shopping", creditCardId: s40CardId, due_date: getTorontoOffsetDate(-40), is_paid: true });
+  const s40Ids = [...s40Rows.map((r) => r.body.id), s40Historic.body.id];
+  const s40After = await s40Balances();
+  assert(
+    s40After.card === Math.round((s40Before.card + 23.45 - 120.1) * 100) / 100 &&
+      s40After.goal === Math.round((s40Before.goal + 75.55) * 100) / 100 &&
+      s40After.checking === Math.round((s40Before.checking - 120.1 - 75.55 - 41.2) * 100) / 100,
+    `The rows move the balances (card ${s40After.card}, goal ${s40After.goal}, checking ${s40After.checking})`
+  );
+
+  const s40Bulk = await s33("POST", "/api/expenses/bulk-delete", { ids: s40Ids });
+  assert(s40Bulk.status === 200 && s40Bulk.body.deletedCount === 5 && s40Bulk.body.ids.length === 5, `Bulk delete removes 5 rows (got ${JSON.stringify(s40Bulk.body)})`);
+  const s40Deleted = await s40Balances();
+  assert(
+    s40Deleted.card === s40Before.card && s40Deleted.goal === s40Before.goal && s40Deleted.checking === s40Before.checking,
+    `After delete every balance is back where it started (card ${s40Deleted.card}, goal ${s40Deleted.goal}, checking ${s40Deleted.checking})`
+  );
+  assert(
+    (await s40Live({ id: s40Ids })) === 0 && (await s40All({ id: s40Ids })) === 5,
+    "Deleted rows are soft-deleted: gone from normal queries, kept in the table"
+  );
+  const s40LedgerIds = await s40Ledger();
+  assert(!s40Ids.some((id) => s40LedgerIds.includes(id)), "The Ledger leaves out deleted rows");
+  const s40TrashRows = await s40Trash();
+  const s40TrashLunch = s40TrashRows.find((r) => r.id === s40Rows[0].body.id);
+  assert(
+    s40Ids.every((id) => s40TrashRows.some((r) => r.id === id)) &&
+      s40TrashLunch && s40TrashLunch.name === "Suite 40 Card Lunch" && s40TrashLunch.amount === 23.45 && s40TrashLunch.fromAccount === "Suite 40 Visa" &&
+      s40TrashLunch.deletedAt && new Date(s40TrashLunch.purgeAfter) - new Date(s40TrashLunch.deletedAt) === 30 * 24 * 60 * 60 * 1000,
+    "GET /expenses/trash lists the deleted rows with their account and a purge date 30 days after the delete"
+  );
+
+  const s40Restore = await s33("POST", "/api/expenses/restore", { ids: s40Ids });
+  assert(s40Restore.status === 200 && s40Restore.body.restoredCount === 5, `Restore brings back 5 rows (got ${JSON.stringify(s40Restore.body)})`);
+  const s40Restored = await s40Balances();
+  assert(
+    s40Restored.card === s40After.card && s40Restored.goal === s40After.goal && s40Restored.checking === s40After.checking,
+    `After restore the card, goal and Checking match exactly (card ${s40Restored.card}/${s40After.card}, goal ${s40Restored.goal}/${s40After.goal}, checking ${s40Restored.checking}/${s40After.checking})`
+  );
+  const s40HistoricRow = await Transaction.findByPk(s40Historic.body.id);
+  assert(s40HistoricRow && s40HistoricRow.balanceApplied === false, "Restoring a row that never touched the card does not apply it now");
+  assert((await s40Trash()).every((r) => !s40Ids.includes(r.id)) && (await s40Live({ id: s40Ids })) === 5, "Restored rows leave the Trash and are back in the Ledger");
+  const s40Again = await s33("POST", "/api/expenses/restore", { ids: s40Ids });
+  assert(s40Again.status === 200 && s40Again.body.restoredCount === 0 && (await s40Balances()).card === s40After.card, "Restoring rows that are not deleted changes nothing (a double Undo)");
+  const s40BadRestore = await s33("POST", "/api/expenses/restore", { ids: ["nope"] });
+  const s40EmptyRestore = await s33("POST", "/api/expenses/restore", { ids: [] });
+  assert(s40BadRestore.status === 400 && s40EmptyRestore.status === 400, "Restore validates its ids (400)");
+
+  // Single DELETE then restore
+  const s40One = await s33("DELETE", `/api/expenses/${s40Rows[1].body.id}`);
+  assert(s40One.status === 204 && (await s40Bal(s40CardId)) === Math.round((s40After.card + 120.1) * 100) / 100, "DELETE /expenses/:id reverses the card payment");
+  await s33("POST", "/api/expenses/restore", { ids: [s40Rows[1].body.id] });
+  assert((await s40Bal(s40CardId)) === s40After.card && (await s40CheckingBal()) === s40After.checking, "Restoring it puts the payment back on the card and Checking");
+
+  // 40.2 Deleted rows are left out of the forecast, subscriptions, export feed, Gemini context and backup
+  const s40Bill = await s33("POST", "/api/expenses", { name: "Suite 40 Upcoming Bill", amount: 66.6, category: "Essentials", due_date: getTorontoOffsetDate(4), is_paid: false });
+  const s40Sub = await s33("POST", "/api/expenses", { name: "Suite 40 Streamflix", amount: 13.13, category: "Suite40Cat", due_date: s40Today, is_paid: true, recurrence: "monthly" });
+  const s40SubGroup = s40Sub.body.recurringGroupId;
+  const s40Forecast = async () => ((await s33("GET", "/api/forecast?days=30")).body.days || []).flatMap((d) => (d.items || []).map((i) => i.title));
+  const s40Subs = async () => ((await s33("GET", "/api/subscriptions")).body.subscriptions || []).map((s) => s.name || s.title);
+  const s40Config = await s33("GET", "/api/export/gemini-config");
+  const s40Feed = async () => (await request({ hostname: "localhost", port: 8000, path: `/api/export/financial-feed.md?key=${s40Config.body.feedKey}`, method: "GET" })).raw || "";
+  const s40Backup = async () => ((await s33("GET", "/api/cron/backup")).body.transactions || []).map((t) => t.id);
+  const s40Spend = async () => (await s40Tool("getCategorySpending", { category: "Suite40Cat", months: 1 }, s40Today)).totalSpent;
+  assert(
+    (await s40Forecast()).includes("Suite 40 Upcoming Bill") && (await s40Subs()).includes("Suite 40 Streamflix") &&
+      (await s40Feed()).includes("Suite 40 Streamflix") && (await s40Backup()).includes(s40Sub.body.id) && (await s40Spend()) === 13.13,
+    "Before delete: the bill is in the forecast, the series in subscriptions, the feed, the backup and Gemini's spending"
+  );
+  const s40SubRows = await Transaction.findAll({ where: { recurringGroupId: s40SubGroup } });
+  await s33("POST", "/api/expenses/bulk-delete", { ids: [s40Bill.body.id, ...s40SubRows.map((r) => r.id)] });
+  assert(!(await s40Forecast()).includes("Suite 40 Upcoming Bill"), "The forecast leaves out a deleted bill");
+  assert(!(await s40Subs()).includes("Suite 40 Streamflix"), "Subscriptions leave out a deleted series");
+  assert(!(await s40Feed()).includes("Suite 40 Streamflix"), "The export feed leaves out deleted rows");
+  assert((await s40Spend()) === 0, "Gemini's spending tool leaves out deleted rows");
+  const s40BackupIds = await s40Backup();
+  assert(!s40BackupIds.includes(s40Sub.body.id) && !s40BackupIds.includes(s40Bill.body.id), "The backup leaves out deleted rows");
+  // A deleted unpaid bill is not paid by the nightly sweep when its date comes
+  await s40Sweep({ todayStr: getTorontoOffsetDate(4) });
+  const s40BillRow = await Transaction.findByPk(s40Bill.body.id, { paranoid: false });
+  assert(s40BillRow.isCleared === false && s40BillRow.deletedAt, "The nightly sweep does not pay a deleted bill");
+  await s40Generate();
+  assert((await s40Live({ recurringGroupId: s40SubGroup })) === 0, "The generator does not bring back a series whose rows were all deleted");
+
+  // 40.3 A deleted recurring row is not re-created by the generator
+  const s40Weekly = await s33("POST", "/api/expenses", { name: "Suite 40 Weekly Gym", amount: 10, category: "Other", due_date: s40Today, is_paid: true, recurrence: "weekly" });
+  const s40WGroup = s40Weekly.body.recurringGroupId;
+  const s40WRows = await Transaction.findAll({ where: { recurringGroupId: s40WGroup }, order: [["date", "ASC"]] });
+  assert(s40WRows.length === 5, `A weekly series from today has 5 rows within 30 days (got ${s40WRows.length})`);
+  const s40Newest = s40WRows[s40WRows.length - 1];
+  const s40Middle = s40WRows[2];
+  await s33("POST", "/api/expenses/bulk-delete", { ids: [s40Newest.id, s40Middle.id] });
+  await s40Generate();
+  assert(
+    (await s40Live({ recurringGroupId: s40WGroup })) === 3 && (await s40All({ recurringGroupId: s40WGroup })) === 5,
+    "After deleting the newest and a middle row, the generator re-creates neither"
+  );
+  await s40Generate({}.transaction, { todayStr: getTorontoOffsetDate(7) });
+  const s40WDates = (await Transaction.findAll({ where: { recurringGroupId: s40WGroup }, order: [["date", "ASC"]] })).map((r) => r.date);
+  assert(
+    s40WDates.length === 4 && s40WDates[3] === getTorontoOffsetDate(35) && !s40WDates.includes(s40Newest.date),
+    `A week later the series carries on past the deleted row (got ${s40WDates.join(",")})`
+  );
+
+  // 40.4 Purge after 30 days
+  const s40Old = await Transaction.create({ title: "Suite 40 Old Delete", amount: 5, date: s40Today, type: "EXPENSE", category: "Other", isCleared: true });
+  const s40Recent = await Transaction.create({ title: "Suite 40 Recent Delete", amount: 5, date: s40Today, type: "EXPENSE", category: "Other", isCleared: true });
+  // A placeholder: the deleted row after the newest live row of an active series
+  const s40PGroup = require("crypto").randomUUID();
+  await Transaction.bulkCreate([
+    { title: "Suite 40 Yearly Fee", amount: 99, date: s40Today, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "yearly", recurringGroupId: s40PGroup },
+  ]);
+  const s40Placeholder = await Transaction.create({ title: "Suite 40 Yearly Fee", amount: 99, date: getTorontoOffsetDate(20), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "yearly", recurringGroupId: s40PGroup });
+  await s33("POST", "/api/expenses/bulk-delete", { ids: [s40Old.id, s40Recent.id, s40Placeholder.id] });
+  const s40DaysAgo = (days) => new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  await Transaction.update({ deletedAt: s40DaysAgo(31) }, { where: { id: [s40Old.id, s40Placeholder.id] }, paranoid: false });
+  await Transaction.update({ deletedAt: s40DaysAgo(29) }, { where: { id: s40Recent.id }, paranoid: false });
+  const s40Sweep2 = await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET", headers: authHeaders });
+  assert(s40Sweep2.status === 200 && s40Sweep2.body.result?.purgedFromTrash >= 1, `The nightly sweep reports what it purged (got ${JSON.stringify(s40Sweep2.body.result)})`);
+  assert((await Transaction.findByPk(s40Old.id, { paranoid: false })) === null, "A row deleted 31 days ago is purged for good");
+  assert((await Transaction.findByPk(s40Recent.id, { paranoid: false }))?.deletedAt, "A row deleted 29 days ago stays in the Trash");
+  assert(
+    (await Transaction.findByPk(s40Placeholder.id, { paranoid: false }))?.deletedAt,
+    "A deleted next occurrence of an active series is kept, so the generator cannot re-create it"
+  );
+  // Once the series has a newer live row the placeholder is no longer needed
+  await Transaction.create({ title: "Suite 40 Yearly Fee", amount: 99, date: getTorontoOffsetDate(385), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "yearly", recurringGroupId: s40PGroup });
+  assert((await s40Purge()) >= 1 && (await Transaction.findByPk(s40Placeholder.id, { paranoid: false })) === null, "It is purged once the series has moved past it");
+
+  // 40.5 A deleted interest row is not charged again and does not break the sweep
+  const s40Loan = await s33("POST", "/api/debts", { name: "Suite 40 Loan", total_amount: 1200, monthly_payment: 0, next_due_date: "2027-06-15", interest_rate: 12 });
+  const s40LoanId = s40Loan.body.id;
+  const s40StartSetting = await Setting.findByPk("debt_interest_start_date");
+  await Setting.upsert({ key: "debt_interest_start_date", value: "2027-01-01" });
+  await s40Sweep({ todayStr: "2027-06-15" });
+  const s40Interest = await Transaction.findOne({ where: { clientRef: s40InterestRef(s40LoanId, "2027-06-15") } });
+  assert(s40Interest && parseFloat(s40Interest.amount) === 12 && (await s40Bal(s40LoanId)) === 1212, "The sweep charges $12.00 interest on the loan");
+  await s33("DELETE", `/api/expenses/${s40Interest.id}`);
+  assert((await s40Bal(s40LoanId)) === 1200, "Deleting the interest row takes it off the loan");
+  await Account.update({ dueDate: "2027-06-15" }, { where: { id: s40LoanId } });
+  let s40SweepErr = null;
+  try {
+    await s40Sweep({ todayStr: "2027-06-15" });
+  } catch (err) {
+    s40SweepErr = err;
+  }
+  assert(
+    s40SweepErr === null && (await s40Live({ fromAccountId: s40LoanId, category: "Interest" })) === 0 && (await s40Bal(s40LoanId)) === 1200,
+    `Re-running that due date neither charges the deleted interest again nor fails on its clientRef (${s40SweepErr?.message || "ok"})`
+  );
+  await s33("POST", "/api/expenses/restore", { ids: [s40Interest.id] });
+  assert((await s40Bal(s40LoanId)) === 1212, "Restoring the interest row puts the $12.00 back on the loan");
+  if (s40StartSetting) await Setting.upsert({ key: "debt_interest_start_date", value: s40StartSetting.value });
+  else await Setting.destroy({ where: { key: "debt_interest_start_date" } });
+
+  // 40.6 A Quick Add retry with the clientRef of a deleted row
+  const s40Ref = require("crypto").randomUUID();
+  const s40Quick = await s33("POST", "/api/expenses", { name: "Suite 40 Quick", amount: 4, category: "Other", due_date: s40Today, is_paid: true, clientRef: s40Ref });
+  await s33("DELETE", `/api/expenses/${s40Quick.body.id}`);
+  const s40Retry = await s33("POST", "/api/expenses", { name: "Suite 40 Quick", amount: 4, category: "Other", due_date: s40Today, is_paid: true, clientRef: s40Ref });
+  assert(s40Retry.status === 200 && s40Retry.body.isDuplicate === true && (await s40Live({ clientRef: s40Ref })) === 0, `A retry of a deleted row answers 200 duplicate, not 500, and does not bring it back (got ${s40Retry.status})`);
+
+  // 40.7 Restore onto an archived account
+  const s40Card2 = await s33("POST", "/api/credit-cards", { name: "Suite 40 Store Card", creditLimit: 500, currentBalance: 0 });
+  const s40Card2Id = s40Card2.body.id;
+  const s40Charge = await s33("POST", "/api/expenses", { name: "Suite 40 Store Charge", amount: 20, category: "Shopping", creditCardId: s40Card2Id, due_date: s40Today, is_paid: true });
+  const s40Pending = await s33("POST", "/api/expenses", { name: "Suite 40 Store Pending", amount: 7, category: "Shopping", creditCardId: s40Card2Id, due_date: getTorontoOffsetDate(-1), is_paid: false });
+  await s33("POST", "/api/expenses/bulk-delete", { ids: [s40Charge.body.id, s40Pending.body.id] });
+  const s40Archive = await s33("DELETE", `/api/credit-cards/${s40Card2Id}`, { mode: "archive", series: "end" });
+  assert(s40Archive.status === 204 && (await s40Bal(s40Card2Id)) === 0, "Archives the store card at $0 after its charge was deleted");
+  const s40RestoreArchived = await s33("POST", "/api/expenses/restore", { ids: [s40Charge.body.id] });
+  assert(
+    s40RestoreArchived.status === 409 && (await s40Bal(s40Card2Id)) === 0 && (await Transaction.findByPk(s40Charge.body.id, { paranoid: false })).deletedAt,
+    `Restoring a charge onto the archived card is refused (409) and it stays in the Trash (got ${s40RestoreArchived.status})`
+  );
+  const s40RestoreNeutral = await s33("POST", "/api/expenses/restore", { ids: [s40Pending.body.id] });
+  assert(s40RestoreNeutral.status === 200 && s40RestoreNeutral.body.restoredCount === 1 && (await s40Bal(s40Card2Id)) === 0, "An unpaid row on the archived card can be restored: it changes no balance");
+
+  // 40.8 PUT ?dryRun=1 reports what ending a series would remove, and saves nothing (R4)
+  const s40Rent = await s33("POST", "/api/expenses", { name: "Suite 40 Weekly Rent", amount: 12, category: "Essentials", due_date: s40Today, is_paid: true, recurrence: "weekly" });
+  const s40RentGroup = s40Rent.body.recurringGroupId;
+  const s40Dry = await s33("PUT", `/api/expenses/${s40Rent.body.id}?dryRun=1`, { recurrence: "none" });
+  assert(
+    s40Dry.status === 200 && s40Dry.body.dryRun === true && s40Dry.body.seriesEnded === true &&
+      s40Dry.body.removedUpcomingCount === 4 && s40Dry.body.removedUpcomingTotal === 48,
+    `Dry run: ending the series removes 4 upcoming charges ($48.00) (got ${JSON.stringify({ e: s40Dry.body.seriesEnded, n: s40Dry.body.removedUpcomingCount, t: s40Dry.body.removedUpcomingTotal })})`
+  );
+  const s40RentAfterDry = await Transaction.findAll({ where: { recurringGroupId: s40RentGroup } });
+  assert(s40RentAfterDry.length === 5 && s40RentAfterDry.every((r) => r.recurrence === "weekly"), "The dry run changed nothing");
+  const s40Future = await s33("POST", "/api/expenses", { name: "Suite 40 Future Lessons", amount: 8, category: "Other", due_date: getTorontoOffsetDate(3), is_paid: false, recurrence: "weekly" });
+  const s40FutureDry = await s33("PUT", `/api/expenses/${s40Future.body.id}?dryRun=1`, { recurrence: "none" });
+  assert(
+    s40FutureDry.body.seriesEnded === true && s40FutureDry.body.removedUpcomingCount === 3 && s40FutureDry.body.removedUpcomingTotal === 24,
+    `Dry run on the first row of a series that has not started yet also ends it (got ${s40FutureDry.body.removedUpcomingCount})`
+  );
+  const s40RentRows = s40RentAfterDry.sort((a, b) => (a.date < b.date ? -1 : 1));
+  const s40LaterDry = await s33("PUT", `/api/expenses/${s40RentRows[2].id}?dryRun=1`, { recurrence: "none" });
+  assert(s40LaterDry.body.seriesEnded === false && s40LaterDry.body.removedUpcomingCount === 0, "Dry run on a later occurrence reports that only that row changes");
+  const s40BadDry = await s33("PUT", `/api/expenses/${s40Rent.body.id}?dryRun=maybe`, { recurrence: "none" });
+  assert(s40BadDry.status === 400, "dryRun only accepts 0/1/true/false (400)");
+  // Ending for real: the 4 upcoming rows are removed for good, and a Trash row of the series stops recurring
+  await s33("DELETE", `/api/expenses/${s40RentRows[4].id}`);
+  const s40End = await s33("PUT", `/api/expenses/${s40Rent.body.id}`, { recurrence: "none" });
+  assert(s40End.status === 200 && s40End.body.seriesEnded === true && s40End.body.removedUpcomingCount === 3 && s40End.body.removedUpcomingTotal === 36, `Ending the series removes the 3 live upcoming rows (got ${s40End.body.removedUpcomingCount})`);
+  const s40TrashedRent = await Transaction.findByPk(s40RentRows[4].id, { paranoid: false });
+  assert(s40TrashedRent.recurrence === "none" && !(await s40Trash()).some((r) => [s40RentRows[1].id, s40RentRows[2].id].includes(r.id)), "Removed upcoming rows skip the Trash, and the trashed one stops recurring");
+  await s33("POST", "/api/expenses/restore", { ids: [s40RentRows[4].id] });
+  await s40Generate();
+  assert((await s40Live({ recurringGroupId: s40RentGroup })) === 2, "Restoring a row of an ended series does not restart it");
+
+  // Cleanup
+  const s40AccountIds = [s40CardId, s40GoalId, s40LoanId, s40Card2Id];
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 40 %" } }, { title: { [Op.like]: "%Suite 40 %" } }, { fromAccountId: s40AccountIds }, { toAccountId: s40AccountIds }] }, force: true });
+  await Account.destroy({ where: { id: s40AccountIds } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

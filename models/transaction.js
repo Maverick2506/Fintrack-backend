@@ -65,8 +65,16 @@ const Transaction = sequelize.define(
       type: DataTypes.UUID,
       allowNull: true,
     },
+    // Set when a delete took this row's balance off its card, debt or goal; restore puts it back
+    balanceReversedOnDelete: {
+      type: DataTypes.BOOLEAN,
+      defaultValue: false,
+    },
   },
   {
+    // Deleted rows stay in the Trash (deletedAt set) until the nightly sweep purges them after 30 days.
+    // Every query leaves them out unless it passes paranoid: false.
+    paranoid: true,
     indexes: [
       { fields: ["type", "date"] },
       { fields: ["date"] },

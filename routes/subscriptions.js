@@ -254,8 +254,10 @@ router.post(
       const toDeleteIds = toDelete.map((t) => t.id);
 
       if (toDeleteIds.length > 0) {
+        // Removed for good, not sent to the Trash: restoring one would restart the subscription
         await Transaction.destroy({
           where: { id: { [Op.in]: toDeleteIds } },
+          force: true,
           transaction: dbTx,
         });
       }
@@ -271,6 +273,14 @@ router.post(
             where: { id: { [Op.in]: remainingIds } },
             transaction: dbTx,
           }
+        );
+      }
+      // Rows of the series in the Trash stop recurring too, so restoring one does not restart it
+      const cancelledGroupId = seriesTrxs.find((t) => t.recurringGroupId)?.recurringGroupId;
+      if (cancelledGroupId) {
+        await Transaction.update(
+          { recurrence: "none" },
+          { where: { recurringGroupId: cancelledGroupId }, paranoid: false, transaction: dbTx }
         );
       }
 

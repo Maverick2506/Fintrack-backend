@@ -233,6 +233,19 @@ async function initialize() {
           allowNull: true,
         });
       }
+      // Trash (soft delete): deletedAt must exist before any query below, since the model is paranoid
+      if (!tableDesc.deletedAt) {
+        await queryInterface.addColumn("Transactions", "deletedAt", {
+          type: DataTypes.DATE,
+          allowNull: true,
+        });
+      }
+      if (!tableDesc.balanceReversedOnDelete) {
+        await queryInterface.addColumn("Transactions", "balanceReversedOnDelete", {
+          type: DataTypes.BOOLEAN,
+          defaultValue: false,
+        });
+      }
 
       // Safely ensure registered account columns exist on Accounts (Phase J)
       try {
