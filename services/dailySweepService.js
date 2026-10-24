@@ -12,6 +12,7 @@ const {
   isDebtInterestEnabled,
 } = require("./debtInterestService");
 const { getBalancesSummary } = require("./netWorthService");
+const { purgeDeletedTransactions } = require("./trashService");
 
 const TIMEZONE = "America/Toronto";
 // Arbitrary constant shared by every instance so only one sweep runs at a time across processes
@@ -49,7 +50,9 @@ const recordDebtInterest = async (debt, dueDate, dbTx) => {
   );
   if (amount <= 0) return 0;
   const clientRef = interestClientRef(debt.id, dueDate);
-  const existing = await Transaction.findOne({ where: { clientRef }, transaction: dbTx });
+  // A deleted interest row (in the Trash) still holds its clientRef: the user removed that charge,
+  // so it is not recorded again (and creating it would hit the unique index)
+  const existing = await Transaction.findOne({ where: { clientRef }, paranoid: false, transaction: dbTx });
   if (existing) return 0;
   const row = await Transaction.create(
     {
@@ -315,6 +318,9 @@ const runDailySweep = async (options = {}) => {
       }
     }
 
+    // 3c. Empty the Trash of rows deleted more than 30 days ago
+    const purgedCount = await purgeDeletedTransactions({ now: options.now || new Date(), dbTx });
+
     // 4. Persist last sweep summary
     await Setting.upsert(
       {
@@ -325,6 +331,7 @@ const runDailySweep = async (options = {}) => {
           clearedIncome: clearedIncomeCount,
           autoPayProcessed: autoPayCount,
           interestRecorded: interestCount,
+          purgedFromTrash: purgedCount,
           date: todayString,
         }),
       },
@@ -371,6 +378,7 @@ const runDailySweep = async (options = {}) => {
       clearedIncome: clearedIncomeCount,
       autoPayProcessed: autoPayCount,
       interestRecorded: interestCount,
+      purgedFromTrash: purgedCount,
       date: todayString,
       netWorth: balances.netWorth,
     };

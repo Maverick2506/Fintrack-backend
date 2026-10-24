@@ -56,6 +56,7 @@ router.post(
     if (req.body.clientRef) {
       const existing = await Transaction.findOne({
         where: { clientRef: req.body.clientRef },
+        paranoid: false, // a deleted row still holds its clientRef
       });
       if (existing) {
         return res.status(200).json(duplicatePaychequeResponse(existing));
@@ -85,6 +86,7 @@ router.post(
       if (req.body.clientRef && isClientRefConflict(error)) {
         const existing = await Transaction.findOne({
           where: { clientRef: req.body.clientRef },
+          paranoid: false,
         });
         if (existing) {
           return res.status(200).json(duplicatePaychequeResponse(existing));

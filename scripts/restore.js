@@ -53,7 +53,8 @@ async function restoreBackup(backupData, options = {}) {
   // Ensure tables exist before inspecting counts or inserting
   await db.sync();
 
-  const existingTxCount = await Transaction.count();
+  // Rows in the Trash count too: they hold ids and unique keys
+  const existingTxCount = await Transaction.count({ paranoid: false });
   const existingAccCount = await Account.count();
 
   if ((existingTxCount > 0 || existingAccCount > 0) && !force) {
@@ -92,7 +93,7 @@ async function restoreBackup(backupData, options = {}) {
   // Perform wipe (if forced) and insertions in a single transaction
   await db.transaction(async (t) => {
     if ((existingTxCount > 0 || existingAccCount > 0) && force) {
-      await Transaction.destroy({ where: {}, transaction: t });
+      await Transaction.destroy({ where: {}, force: true, transaction: t });
       await Account.destroy({ where: {}, transaction: t });
       await Setting.destroy({ where: {}, transaction: t });
       if (Budget) await Budget.destroy({ where: {}, transaction: t });
