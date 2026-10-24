@@ -4,6 +4,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const { Transaction, Account, sequelize } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { ACTIVE_RECURRENCES } = require("./recurring");
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
@@ -59,7 +60,7 @@ router.get(
       where: {
         type: "EXPENSE",
         [Op.or]: [
-          { recurrence: { [Op.in]: ["weekly", "bi-weekly", "monthly", "yearly"] } },
+          { recurrence: { [Op.in]: ACTIVE_RECURRENCES } },
           { recurringGroupId: { [Op.ne]: null } },
         ],
       },
@@ -94,10 +95,12 @@ router.get(
       // Sort occurrences chronologically
       occurrences.sort((a, b) => a.date.localeCompare(b.date));
 
-      const latestTrx = occurrences[occurrences.length - 1];
-
-      // If the series was explicitly cancelled (recurrence changed to 'none'), exclude from active subscriptions
-      if (!latestTrx.recurrence || latestTrx.recurrence === "none") {
+      // The newest row that still recurs: a One-time edit to a later row changes only that row. A
+      // cancelled or ended series has no recurring row left and is not listed.
+      const latestTrx = [...occurrences]
+        .reverse()
+        .find((t) => ACTIVE_RECURRENCES.includes(t.recurrence));
+      if (!latestTrx) {
         continue;
       }
 
@@ -237,7 +240,15 @@ router.post(
               transaction: dbTx,
             });
           } else {
-            seriesTrxs = [single];
+            // An older series without a group id is grouped by type and title (as the generator
+            // does), so every one of its rows stops recurring, not just this one
+            const titleKey = single.title.toLowerCase().trim();
+            seriesTrxs = (
+              await Transaction.findAll({
+                where: { type: single.type, recurringGroupId: null },
+                transaction: dbTx,
+              })
+            ).filter((t) => t.title.toLowerCase().trim() === titleKey);
           }
         }
       }

@@ -98,11 +98,31 @@ const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
 const ACTIVE_RECURRENCES = ["weekly", "bi-weekly", "monthly", "yearly"];
 
 // Groups rows (newest first) into series, keyed by recurringGroupId or by type and title for older rows.
-// The generator follows the newest row of each series.
 const getSeriesKey = (trx) =>
   trx.recurringGroupId
     ? `series:${trx.recurringGroupId}`
     : `${trx.type}:${trx.title.toLowerCase().trim()}`;
+
+// What a series generates from, given its rows newest first. The template is the newest row that
+// still recurs: a row set to One-time changes only itself, so it never stops the series (B3). Ending a
+// series sets recurrence "none" on all of its rows, so a series with no recurring row left has ended
+// (returns null). New occurrences come only after newestDate, the newest row of any recurrence, so a
+// One-time row is never duplicated on its date. The anchor day comes from the recurring rows only, so
+// a One-time row on another day does not move the series.
+const getSeriesTemplate = (rowsNewestFirst) => {
+  const rows = rowsNewestFirst || [];
+  const index = rows.findIndex((r) => ACTIVE_RECURRENCES.includes(r.recurrence));
+  if (index === -1) return null;
+  const recurringDates = rows
+    .slice(index)
+    .filter((r) => ACTIVE_RECURRENCES.includes(r.recurrence))
+    .map((r) => r.date);
+  return {
+    template: rows[index],
+    newestDate: rows[0].date,
+    anchorDay: getSeriesAnchorDay(recurringDates),
+  };
+};
 
 const groupSeries = (rowsNewestFirst) => {
   const latestOccurrences = {};
@@ -118,7 +138,13 @@ const groupSeries = (rowsNewestFirst) => {
     seriesDates[key].push(trx.date);
     seriesRows[key].push(trx);
   }
-  return { latestOccurrences, seriesDates, seriesRows };
+  // Only series that are still running
+  const seriesTemplates = {};
+  for (const [key, rows] of Object.entries(seriesRows)) {
+    const series = getSeriesTemplate(rows);
+    if (series) seriesTemplates[key] = series;
+  }
+  return { latestOccurrences, seriesDates, seriesRows, seriesTemplates };
 };
 
 // A series whose card, debt or goal is archived (or no longer exists) stops generating
@@ -151,9 +177,8 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
     const horizonUtc = new Date(Date.UTC(tY, tM - 1, tD, 12, 0, 0) + 30 * 24 * 60 * 60 * 1000);
     const horizonString = `${horizonUtc.getUTCFullYear()}-${String(horizonUtc.getUTCMonth() + 1).padStart(2, "0")}-${String(horizonUtc.getUTCDate()).padStart(2, "0")}`;
 
-    // Fetch all INCOME, EXPENSE, and TRANSFER transactions ordered newest first so that
-    // if the latest instance of a series was changed to recurrence: "none",
-    // we respect that and do not resurrect it from an older historical row.
+    // Fetch all INCOME, EXPENSE, and TRANSFER transactions newest first; each series generates from
+    // its newest row that still recurs (see getSeriesTemplate)
     const allTransactions = await Transaction.findAll({
       where: {
         type: { [Op.in]: ["EXPENSE", "INCOME", "TRANSFER"] },
@@ -165,22 +190,18 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
       transaction: dbTx,
     });
 
-    const { latestOccurrences, seriesDates } = groupSeries(allTransactions);
+    const { seriesTemplates } = groupSeries(allTransactions);
     const accounts = await Account.findAll({
       attributes: ["id", "isActive"],
       transaction: dbTx,
     });
     const accountsById = new Map(accounts.map((a) => [a.id, a]));
 
-    for (const [seriesKey, baseTrx] of Object.entries(latestOccurrences)) {
-      if (!ACTIVE_RECURRENCES.includes(baseTrx.recurrence)) {
-        continue;
-      }
+    for (const { template: baseTrx, newestDate, anchorDay } of Object.values(seriesTemplates)) {
       if (isSeriesAccountRetired(baseTrx, accountsById)) {
         continue;
       }
 
-      const anchorDay = getSeriesAnchorDay(seriesDates[seriesKey]);
       const skipBefore =
         baseTrx.clientRef && baseTrx.date < quickAddCatchupFrom ? quickAddCatchupFrom : null;
       let step = 1;
@@ -194,7 +215,7 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
         if (!nextDateStr || nextDateStr > horizonString) {
           break;
         }
-        if (skipBefore && nextDateStr < skipBefore) {
+        if ((skipBefore && nextDateStr < skipBefore) || nextDateStr <= newestDate) {
           step++;
           continue;
         }
@@ -310,6 +331,39 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
   }
 };
 
+// One-off (guarded in server.js): before series ended explicitly, a series stopped when its newest
+// row was set to One-time. The generator now looks past such a row, so those series are ended for real
+// (every row "none", Trash included) instead of coming back with a backfill of missed occurrences.
+// Returns the number of series ended.
+const endSeriesStoppedByNewestRow = async (dbTx = null) => {
+  const rows = await Transaction.findAll({
+    where: { type: { [Op.in]: ["EXPENSE", "INCOME", "TRANSFER"] } },
+    order: [
+      ["date", "DESC"],
+      ["createdAt", "DESC"],
+    ],
+    transaction: dbTx,
+  });
+  const { latestOccurrences, seriesRows } = groupSeries(rows);
+  let ended = 0;
+  for (const [key, newest] of Object.entries(latestOccurrences)) {
+    if (ACTIVE_RECURRENCES.includes(newest.recurrence)) continue;
+    const where = newest.recurringGroupId
+      ? { recurringGroupId: newest.recurringGroupId }
+      : { id: { [Op.in]: seriesRows[key].map((r) => r.id) } };
+    const [count] = await Transaction.update(
+      { recurrence: "none" },
+      {
+        where: { ...where, recurrence: { [Op.in]: ACTIVE_RECURRENCES } },
+        paranoid: false,
+        transaction: dbTx,
+      }
+    );
+    if (count > 0) ended++;
+  }
+  return ended;
+};
+
 router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
   await createRecurringExpenses();
   res.status(200).json({ message: "Advanced recurring job triggered successfully." });
@@ -321,7 +375,9 @@ module.exports = {
   getNextDueDate,
   getNextOccurrenceDate,
   getSeriesAnchorDay,
+  getSeriesTemplate,
   groupSeries,
+  endSeriesStoppedByNewestRow,
   ACTIVE_RECURRENCES,
   QUICK_ADD_CATCHUP_KEY,
 };

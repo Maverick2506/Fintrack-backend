@@ -46,6 +46,7 @@ const accountRoutes = require("./routes/accounts");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
+  endSeriesStoppedByNewestRow,
 } = require("./routes/recurring");
 const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
 const {
@@ -659,6 +660,17 @@ async function initialize() {
 
       // One-off backfill (R3): store each debt's due day from its current due date
       await backfillDebtDueDays(Account, Setting);
+
+      // One-off: a series used to stop when its newest row was set to One-time. The generator now
+      // skips One-time rows, so series stopped that way are ended explicitly before it next runs.
+      const seriesEndSetting = await Setting.findByPk("series_end_explicit_v1");
+      if (!seriesEndSetting || seriesEndSetting.value !== "true") {
+        const endedCount = await endSeriesStoppedByNewestRow();
+        if (endedCount > 0) {
+          console.log(`✅ Ended ${endedCount} recurring series whose newest row was One-time.`);
+        }
+        await Setting.upsert({ key: "series_end_explicit_v1", value: "true" });
+      }
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
     }
