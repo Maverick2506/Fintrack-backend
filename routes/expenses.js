@@ -6,7 +6,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateQuery, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler, HttpError } = require("../middleware/errorHandler");
-const { createRecurringExpenses } = require("./recurring");
+const { createRecurringExpenses, markSeriesRestart, ACTIVE_RECURRENCES } = require("./recurring");
 const { isClientRefConflict } = require("../services/clientRefService");
 const {
   snapshotArchivedBalances,
@@ -710,6 +710,23 @@ router.put(
               transaction: dbTx,
             }
           );
+        }
+      }
+
+      // Restarting an ended series (a row set back to recurring when no other row of its series still
+      // recurs): it generates from today on, with no backfill of the occurrences it missed
+      const isRecurringNow = nextRecurrence && nextRecurrence !== "none";
+      if (!wasRecurring && isRecurringNow && nextRecurringGroupId) {
+        const stillRecurring = await Transaction.count({
+          where: {
+            recurringGroupId: nextRecurringGroupId,
+            id: { [Op.ne]: trx.id },
+            recurrence: { [Op.in]: ACTIVE_RECURRENCES },
+          },
+          transaction: dbTx,
+        });
+        if (stillRecurring === 0) {
+          await markSeriesRestart(nextRecurringGroupId, getTodayString(), dbTx);
         }
       }
 

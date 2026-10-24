@@ -46,7 +46,7 @@ const accountRoutes = require("./routes/accounts");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
-  endSeriesStoppedByNewestRow,
+  runSeriesEndMigration,
 } = require("./routes/recurring");
 const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
 const {
@@ -662,14 +662,15 @@ async function initialize() {
       await backfillDebtDueDays(Account, Setting);
 
       // One-off: a series used to stop when its newest row was set to One-time. The generator now
-      // skips One-time rows, so series stopped that way are ended explicitly before it next runs.
-      const seriesEndSetting = await Setting.findByPk("series_end_explicit_v1");
-      if (!seriesEndSetting || seriesEndSetting.value !== "true") {
-        const endedCount = await endSeriesStoppedByNewestRow();
-        if (endedCount > 0) {
-          console.log(`✅ Ended ${endedCount} recurring series whose newest row was One-time.`);
+      // skips One-time rows, so series stopped that way are ended explicitly, in one transaction with
+      // its Setting flag. Until that flag is set the generator does not run (it logs a warning).
+      try {
+        const endedCount = await runSeriesEndMigration();
+        if (endedCount !== null) {
+          console.log(`✅ Series-end migration: ended ${endedCount} recurring series whose newest row was One-time.`);
         }
-        await Setting.upsert({ key: "series_end_explicit_v1", value: "true" });
+      } catch (seriesErr) {
+        console.warn("Series-end migration failed; recurring generation stays off until it succeeds:", seriesErr.message);
       }
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);

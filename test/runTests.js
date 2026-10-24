@@ -6458,6 +6458,88 @@ async function runTestSuite() {
     "The migration leaves a running series alone"
   );
 
+  // 41.6 The migration runs in one transaction; until it has, the generator creates nothing
+  const { runSeriesEndMigration: s41RunMigration, SERIES_END_MIGRATION_KEY: s41MigKey } = require("../routes/recurring");
+  const s41MigGroup = require("crypto").randomUUID();
+  const s41MigRow = await Transaction.create({ title: "Suite 41 Migration Probe", amount: 3, date: getTorontoOffsetDate(0), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s41MigGroup });
+  await Setting.destroy({ where: { key: s41MigKey } });
+  let s41MigErr = null;
+  try {
+    await s41RunMigration(async (dbTx) => {
+      await Transaction.update({ recurrence: "none" }, { where: { id: s41MigRow.id }, transaction: dbTx });
+      throw new Error("Suite 41 migration failure");
+    });
+  } catch (err) {
+    s41MigErr = err;
+  }
+  await s41Generate(null);
+  assert(
+    s41MigErr?.message === "Suite 41 migration failure" && (await Setting.findByPk(s41MigKey)) === null &&
+      (await Transaction.findByPk(s41MigRow.id)).recurrence === "weekly",
+    "A migration that throws rolls back its changes and leaves the flag unset"
+  );
+  assert((await Transaction.count({ where: { recurringGroupId: s41MigGroup } })) === 1, "Until the migration has run, the generator creates nothing");
+  const s41MigCount = await s41RunMigration();
+  await s41Generate(null);
+  assert(
+    typeof s41MigCount === "number" && (await Setting.findByPk(s41MigKey))?.value === "true" &&
+      (await Transaction.count({ where: { recurringGroupId: s41MigGroup } })) > 1,
+    `Once it has run, the flag is set and generation resumes (ended ${s41MigCount})`
+  );
+  assert((await s41RunMigration()) === null, "The migration runs only once");
+
+  // 41.7 Restarting an ended series (a row set back to recurring) does not backfill
+  const { getPrimaryCheckingAccount: s41GetChecking, getCalculatedCheckingBalance: s41CheckingCalc } = require("../services/checkingService");
+  const s41CheckingBal = async () => s41CheckingCalc(await s41GetChecking(), getTorontoOffsetDate(0));
+  const s41FirstOnOrAfterToday = (fromDate, recurrence) => {
+    const anchor = Number(fromDate.split("-")[2]);
+    let step = 1;
+    let next = getNextOccurrenceDate(fromDate, recurrence, step, anchor);
+    while (next < getTorontoOffsetDate(0)) next = getNextOccurrenceDate(fromDate, recurrence, ++step, anchor);
+    return next;
+  };
+  // Monthly income stopped about two months ago, set back to monthly today
+  const s41PayGroup = require("crypto").randomUUID();
+  const s41PayChecking = await s41GetChecking();
+  const [, s41PayLast] = await Transaction.bulkCreate([
+    { title: "Suite 41 Side Pay", amount: 500, date: getTorontoOffsetDate(-100), type: "INCOME", category: "Income", isCleared: true, recurrence: "none", recurringGroupId: s41PayGroup, toAccountId: s41PayChecking.id },
+    { title: "Suite 41 Side Pay", amount: 500, date: getTorontoOffsetDate(-70), type: "INCOME", category: "Income", isCleared: true, recurrence: "none", recurringGroupId: s41PayGroup, toAccountId: s41PayChecking.id },
+  ]);
+  const s41PayBalBefore = await s41CheckingBal();
+  const s41PayPut = await s33("PUT", `/api/expenses/${s41PayLast.id}`, { recurrence: "monthly" });
+  const s41PayRows = await s41Rows(s41PayGroup);
+  const s41PayNext = s41FirstOnOrAfterToday(getTorontoOffsetDate(-70), "monthly");
+  assert(
+    s41PayPut.status === 200 && s41PayRows.length === 3 && s41PayRows[2].date === s41PayNext &&
+      !s41PayRows.some((r) => r.date > getTorontoOffsetDate(-70) && r.date < getTorontoOffsetDate(0)),
+    `A restarted monthly income series starts at ${s41PayNext}, with no missed months (got ${s41PayRows.map((r) => r.date).join(",")})`
+  );
+  assert(
+    s41PayRows.filter((r) => r.date < getTorontoOffsetDate(0)).length === 2 && (await s41CheckingBal()) === s41PayBalBefore,
+    "No past income is generated as received, and Checking is unchanged"
+  );
+  // Weekly expense stopped three weeks ago, set back to weekly: no overdue bills
+  const s41BillGroup = require("crypto").randomUUID();
+  const [, s41BillLast] = await Transaction.bulkCreate([
+    { title: "Suite 41 Cleaner", amount: 40, date: getTorontoOffsetDate(-30), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s41BillGroup },
+    { title: "Suite 41 Cleaner", amount: 40, date: getTorontoOffsetDate(-23), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s41BillGroup },
+  ]);
+  await s33("PUT", `/api/expenses/${s41BillLast.id}`, { recurrence: "weekly" });
+  const s41BillRows = await s41Rows(s41BillGroup);
+  assert(
+    s41BillRows[2]?.date === s41FirstOnOrAfterToday(getTorontoOffsetDate(-23), "weekly") &&
+      !s41BillRows.some((r) => !r.isCleared && r.date < getTorontoOffsetDate(0)),
+    `A restarted weekly expense series has no overdue backfill (got ${s41BillRows.map((r) => r.date).join(",")})`
+  );
+  // A One-time row set back to recurring while the series still runs is not a restart
+  await s33("PUT", `/api/expenses/${s41GymNewest.id}`, { recurrence: "weekly" });
+  assert(
+    (await Setting.findByPk(`recurring_restart_from:${s41GymGroup}`)) === null &&
+      (await Setting.findByPk(`recurring_restart_from:${s41BillGroup}`))?.value === getTorontoOffsetDate(0),
+    "Only a series with no recurring row left is marked as restarted"
+  );
+  await Setting.destroy({ where: { key: [`recurring_restart_from:${s41PayGroup}`, `recurring_restart_from:${s41BillGroup}`] } });
+
   // Cleanup
   await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 41 %" } }, { fromAccountId: s41CardId }, { toAccountId: s41CardId }] }, force: true });
   await Account.destroy({ where: { id: s41CardId } });

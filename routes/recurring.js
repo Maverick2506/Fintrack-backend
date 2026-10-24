@@ -97,6 +97,29 @@ const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
 
 const ACTIVE_RECURRENCES = ["weekly", "bi-weekly", "monthly", "yearly"];
 
+// Set once the one-off series-end migration (runSeriesEndMigration) has committed. The generator
+// does not run before it: it would restart series that stopped under the old rule, with a backfill.
+const SERIES_END_MIGRATION_KEY = "series_end_explicit_v1";
+
+// A series restarted by setting one of its rows back to recurring (after it had ended) generates
+// only from the restart date, so missed occurrences are not backfilled as overdue bills or as
+// income already received. Stored per series as `${SERIES_RESTART_PREFIX}${recurringGroupId}`.
+const SERIES_RESTART_PREFIX = "recurring_restart_from:";
+
+const markSeriesRestart = (recurringGroupId, todayStr, dbTx = null) =>
+  Setting.upsert(
+    { key: `${SERIES_RESTART_PREFIX}${recurringGroupId}`, value: todayStr },
+    { transaction: dbTx }
+  );
+
+const getSeriesRestarts = async (dbTx) => {
+  const rows = await Setting.findAll({
+    where: { key: { [Op.like]: `${SERIES_RESTART_PREFIX}%` } },
+    transaction: dbTx,
+  });
+  return new Map(rows.map((r) => [r.key.slice(SERIES_RESTART_PREFIX.length), r.value]));
+};
+
 // Groups rows (newest first) into series, keyed by recurringGroupId or by type and title for older rows.
 const getSeriesKey = (trx) =>
   trx.recurringGroupId
@@ -170,7 +193,15 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
     const todayStr =
       options.todayStr ||
       format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const migrated = await Setting.findByPk(SERIES_END_MIGRATION_KEY, { transaction: dbTx });
+    if (!migrated || migrated.value !== "true") {
+      console.warn(
+        `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`
+      );
+      return;
+    }
     const quickAddCatchupFrom = await getQuickAddCatchupFrom(todayStr, dbTx);
+    const seriesRestarts = await getSeriesRestarts(dbTx);
     
     // Horizon is 30 calendar days from today in America/Toronto
     const [tY, tM, tD] = todayStr.split("-").map(Number);
@@ -202,8 +233,17 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
         continue;
       }
 
-      const skipBefore =
+      const quickAddSkip =
         baseTrx.clientRef && baseTrx.date < quickAddCatchupFrom ? quickAddCatchupFrom : null;
+      const restartSkip = baseTrx.recurringGroupId
+        ? seriesRestarts.get(baseTrx.recurringGroupId) || null
+        : null;
+      const skipBefore =
+        quickAddSkip && restartSkip
+          ? quickAddSkip > restartSkip
+            ? quickAddSkip
+            : restartSkip
+          : quickAddSkip || restartSkip;
       let step = 1;
       while (true) {
         const nextDateStr = getNextOccurrenceDate(
@@ -364,6 +404,19 @@ const endSeriesStoppedByNewestRow = async (dbTx = null) => {
   return ended;
 };
 
+// Runs the one-off migration in one DB transaction together with its Setting flag, so a failure
+// leaves both untouched (and the generator skipped) until the next boot retries it.
+// Returns the number of series ended, or null when it had already run.
+const runSeriesEndMigration = async (migrate = endSeriesStoppedByNewestRow) => {
+  const done = await Setting.findByPk(SERIES_END_MIGRATION_KEY);
+  if (done && done.value === "true") return null;
+  return Transaction.sequelize.transaction(async (dbTx) => {
+    const endedCount = await migrate(dbTx);
+    await Setting.upsert({ key: SERIES_END_MIGRATION_KEY, value: "true" }, { transaction: dbTx });
+    return endedCount;
+  });
+};
+
 router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
   await createRecurringExpenses();
   res.status(200).json({ message: "Advanced recurring job triggered successfully." });
@@ -378,6 +431,9 @@ module.exports = {
   getSeriesTemplate,
   groupSeries,
   endSeriesStoppedByNewestRow,
+  runSeriesEndMigration,
+  markSeriesRestart,
+  SERIES_END_MIGRATION_KEY,
   ACTIVE_RECURRENCES,
   QUICK_ADD_CATCHUP_KEY,
 };
