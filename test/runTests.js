@@ -6213,10 +6213,12 @@ async function runTestSuite() {
   const s40ArchTrash = await s40Trash();
   const s40ArchCharge = s40ArchTrash.find((r) => r.id === s40Charge.body.id);
   const s40ArchPending = s40ArchTrash.find((r) => r.id === s40Pending.body.id);
+  const s40ArchPay = s40ArchTrash.find((r) => r.id === s40PendingPay.body.id);
   assert(
-    s40ArchCharge?.archivedAccount === "Suite 40 Store Card" && s40ArchCharge.restoreAction === "refuse" &&
-      s40ArchPending?.archivedAccount === "Suite 40 Store Card" && s40ArchPending.restoreAction === "moveToChecking",
-    "The Trash names the archived account and says what Restore will do (refuse a paid row, move an unpaid one to Checking)"
+    s40ArchCharge?.archivedAccount === "Suite 40 Store Card" && s40ArchCharge.restoreAction === "refuse" && s40ArchCharge.refuseReason === "balance" &&
+      s40ArchPending?.archivedAccount === "Suite 40 Store Card" && s40ArchPending.restoreAction === "moveToChecking" &&
+      s40ArchPay?.archivedAccount === "Suite 40 Store Card" && s40ArchPay.restoreAction === "refuse" && s40ArchPay.refuseReason === "nothingToPay",
+    "The Trash labels each kind: paid charge refused (balance), unpaid charge moves to Checking, unpaid payment refused (nothing to pay)"
   );
   const s40RestoreArchived = await s33("POST", "/api/expenses/restore", { ids: [s40Charge.body.id] });
   assert(
@@ -6238,14 +6240,28 @@ async function runTestSuite() {
     "An unpaid charge on the archived card is restored onto Primary Checking, still unpaid, and says why"
   );
   assert((await s40CheckingBal()) === s40CheckingBefore, "Restoring the unpaid bill leaves Checking's balance alone until it is paid");
-  // A mixed Undo: the paid row is refused, the unpaid payment to the card becomes a Checking bill
-  const s40Mixed = await s33("POST", "/api/expenses/restore", { ids: [s40Charge.body.id, s40PendingPay.body.id] });
-  const s40PayRow = await Transaction.findByPk(s40PendingPay.body.id);
+  // An unpaid payment TO the archived card: archiving ended it, so there is nothing left to pay
+  const s40CheckingRowsBefore = await s40Live({ fromAccountId: s40Checking.id });
+  const s40PayRestore = await s33("POST", "/api/expenses/restore", { ids: [s40PendingPay.body.id] });
   assert(
-    s40Mixed.status === 200 && s40Mixed.body.restoredCount === 1 && s40Mixed.body.refused?.[0]?.id === s40Charge.body.id &&
-      s40Mixed.body.refused[0].archivedAccount === "Suite 40 Store Card" &&
-      s40PayRow.toAccountId === null && s40PayRow.fromAccountId === s40Checking.id && s40PayRow.type === "EXPENSE",
-    `A mixed restore brings back what it can: the unpaid card payment returns as a Checking bill, the paid charge is listed as refused (got ${JSON.stringify(s40Mixed.body.refused)})`
+    s40PayRestore.status === 409 &&
+      s40PayRestore.body.error === "Can't restore 'Payment for Suite 40 Store Card': Suite 40 Store Card is archived, so there's nothing left to pay.",
+    `Restoring "Payment for <archived card>" is refused with a plain message (got ${s40PayRestore.status} "${s40PayRestore.body.error}")`
+  );
+  assert(
+    (await s40Live({ fromAccountId: s40Checking.id })) === s40CheckingRowsBefore &&
+      (await Transaction.findByPk(s40PendingPay.body.id, { paranoid: false })).deletedAt &&
+      (await s40Live({ title: "Payment for Suite 40 Store Card" })) === 0,
+    "The refused payment creates no Checking row and stays in the Trash"
+  );
+  // A mixed Undo: the unpaid charge comes back on Checking, the paid charge and the payment are listed as refused
+  const s40Mixed = await s33("POST", "/api/expenses/restore", { ids: [s40Charge.body.id, s40PendingPay.body.id, s40Pending2.body.id] });
+  const s40Pend2Row = await Transaction.findByPk(s40Pending2.body.id);
+  assert(
+    s40Mixed.status === 200 && s40Mixed.body.restoredCount === 1 && s40Mixed.body.moved?.[0]?.id === s40Pending2.body.id &&
+      s40Mixed.body.refused?.length === 2 && s40Mixed.body.refused.every((r) => r.archivedAccount === "Suite 40 Store Card") &&
+      s40Pend2Row.fromAccountId === s40Checking.id && s40Pend2Row.isCleared === false,
+    `A mixed restore brings back what it can and lists the refused rows (got ${JSON.stringify(s40Mixed.body.refused?.map((r) => r.reason))})`
   );
   assert((await s40Bal(s40Card2Id)) === 0, "The archived card's balance never changed");
   const s40Upcoming = await s33("GET", "/api/dashboard");
@@ -6254,8 +6270,16 @@ async function runTestSuite() {
       (s40Upcoming.body.upcomingBills || []).every((b) => b.fromAccountId !== s40Card2Id),
     "No bill shows on the archived card again"
   );
-  const s40Pend2Restore = await s33("POST", "/api/expenses/restore", { ids: [s40Pending2.body.id] });
-  assert(s40Pend2Restore.body.moved?.length === 1 && (await Transaction.findByPk(s40Pending2.body.id)).fromAccountId === s40Checking.id, "Each unpaid row on the archived card is moved, one by one too");
+
+  // 40.7c Editing a series row onto a date a trashed occurrence holds explains why
+  const s40Clash = await s33("POST", "/api/expenses", { name: "Suite 40 Weekly Clash", amount: 5, category: "Other", due_date: s40Today, is_paid: true, recurrence: "weekly" });
+  const s40ClashRows = await Transaction.findAll({ where: { recurringGroupId: s40Clash.body.recurringGroupId }, order: [["date", "ASC"]] });
+  await s33("DELETE", `/api/expenses/${s40ClashRows[1].id}`);
+  const s40ClashPut = await s33("PUT", `/api/expenses/${s40ClashRows[2].id}`, { due_date: s40ClashRows[1].date });
+  assert(
+    s40ClashPut.status === 409 && s40ClashPut.body.error === `A deleted occurrence of this series in the Trash holds ${s40ClashRows[1].date}. Restore it, or pick another date.`,
+    `Moving a row onto a date held by a Trash row says so (got ${s40ClashPut.status} "${s40ClashPut.body.error}")`
+  );
 
   // 40.7b Trash the newest row of a running series, restore it: the series continues with no duplicate date
   const s40Series = await s33("POST", "/api/expenses", { name: "Suite 40 Weekly Class", amount: 9, category: "Other", due_date: s40Today, is_paid: true, recurrence: "weekly" });

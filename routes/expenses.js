@@ -5,7 +5,7 @@ const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateQuery, validateIdParam, schemas } = require("../middleware/validate");
-const { asyncHandler } = require("../middleware/errorHandler");
+const { asyncHandler, HttpError } = require("../middleware/errorHandler");
 const { createRecurringExpenses } = require("./recurring");
 const { isClientRefConflict } = require("../services/clientRefService");
 const {
@@ -591,6 +591,29 @@ router.put(
         }
       } else if (!trx.recurringGroupId) {
         nextRecurringGroupId = null;
+      }
+
+      // A trashed occurrence still holds its date in the series' unique index; say so instead of the
+      // generic "another occurrence" 409, since nothing shows on that date
+      const nextDate = req.body.due_date || req.body.payment_date || trx.date;
+      if (nextRecurringGroupId && nextDate !== trx.date) {
+        const trashedOnDate = await Transaction.findOne({
+          where: {
+            recurringGroupId: nextRecurringGroupId,
+            date: nextDate,
+            id: { [Op.ne]: trx.id },
+            deletedAt: { [Op.ne]: null },
+          },
+          paranoid: false,
+          transaction: dbTx,
+        });
+        if (trashedOnDate) {
+          throw new HttpError(
+            409,
+            `A deleted occurrence of this series in the Trash holds ${nextDate}. Restore it, or pick another date.`,
+            { trashedId: trashedOnDate.id }
+          );
+        }
       }
 
       const prevRecurrence = trx.recurrence;
