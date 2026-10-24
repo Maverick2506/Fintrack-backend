@@ -489,9 +489,11 @@ const legacySeriesKey = (trx) => `${trx.type}:${String(trx.title || "").toLowerC
 // Every such title group with at least one recurring row (Trash included) gets one new id on all of its
 // rows, Trash included; groups that never recurred are left alone. Two rows of a group on the same date
 // can't share an id (unique index on recurringGroupId + date): the one that joins is, in order, the
-// recurring one, then the paid one, then the oldest (createdAt); the others stay single rows.
+// recurring one, then the paid one, then the oldest (createdAt); the others stay single rows. A left-out
+// row that still recurs is set to One-time, or it would generate as a series of its own and the bill
+// would be charged twice. Grouping ignores the account, as the old title grouping did.
 // Loads the rows without an id into memory, which is fine for a one-off at this app's size.
-// Returns { seriesCount, rowCount, leftOut: [{ title, date, amount }] }.
+// Returns { seriesCount, rowCount, leftOut: [{ title, date, amount, setToOneTime }] }.
 const assignLegacySeriesIds = async (dbTx = null) => {
   const rows = await Transaction.findAll({
     where: { recurringGroupId: null },
@@ -519,17 +521,26 @@ const assignLegacySeriesIds = async (dbTx = null) => {
       byDate.get(row.date).push(row);
     }
     const ids = [];
+    const stopIds = [];
     for (const sameDate of byDate.values()) {
       const [joining, ...excluded] = [...sameDate].sort(joinsFirst);
       ids.push(joining.id);
       for (const r of excluded) {
-        result.leftOut.push({ title: r.title, date: r.date, amount: parseFloat(r.amount) || 0 });
+        const setToOneTime = ACTIVE_RECURRENCES.includes(r.recurrence);
+        if (setToOneTime) stopIds.push(r.id);
+        result.leftOut.push({ title: r.title, date: r.date, amount: parseFloat(r.amount) || 0, setToOneTime });
       }
     }
     await Transaction.update(
       { recurringGroupId: crypto.randomUUID() },
       { where: { id: { [Op.in]: ids } }, paranoid: false, transaction: dbTx }
     );
+    if (stopIds.length > 0) {
+      await Transaction.update(
+        { recurrence: "none" },
+        { where: { id: { [Op.in]: stopIds } }, paranoid: false, transaction: dbTx }
+      );
+    }
     result.seriesCount++;
     result.rowCount += ids.length;
   }

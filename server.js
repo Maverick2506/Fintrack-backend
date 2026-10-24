@@ -676,9 +676,14 @@ async function initialize() {
         console.log(
           `✅ Assigned series IDs to ${assigned.seriesCount} old series (${assigned.rowCount} rows).`
         );
-        // A row on the same date as one that joined its series (unique index) stays a single row
+        // A row on the same date as one that joined its series (unique index) stays a single row; a
+        // recurring one is set to One-time so it is not charged as a second series
         for (const row of assigned.leftOut) {
-          console.log(`   ${row.title} ${row.date} $${row.amount.toFixed(2)} (kept as a single row)`);
+          console.log(
+            `   ${row.title} ${row.date} $${row.amount.toFixed(2)} (kept as a single row${
+              row.setToOneTime ? ", set to One-time" : ""
+            })`
+          );
         }
       }
       legacySeriesIdsDone = true;

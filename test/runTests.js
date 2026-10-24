@@ -6809,6 +6809,11 @@ async function runTestSuite() {
     { title: "Suite 43 Old Club", amount: 77, date: getTorontoOffsetDate(6), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none" },
     { title: "Suite 43 Old Club", amount: 78, date: getTorontoOffsetDate(5), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
   ]);
+  // Two recurring rows of an old series on the same date (an old duplicate)
+  const [s43TwinA, s43TwinB] = await Transaction.bulkCreate([
+    { title: "Suite 43 Twin Gym", amount: 40, date: s43Base, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
+    { title: "Suite 43 Twin Gym", amount: 40, date: s43Base, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
+  ]);
   // Rows that never recurred: same title among themselves, and an income with the rent's title
   const s43Dentist = await Transaction.bulkCreate([
     { title: "Suite 43 Dentist", amount: 120, date: getTorontoOffsetDate(-90), type: "EXPENSE", category: "Health", isCleared: true, recurrence: "none" },
@@ -6901,6 +6906,16 @@ async function runTestSuite() {
     "Rows that never recurred are left alone, even an income with a series' title"
   );
 
+  // Two recurring rows on one date: one joins, the other is set to One-time, and the bill is generated once
+  const s43Twins = await s43Rows({ id: [s43TwinA.id, s43TwinB.id] });
+  const s43TwinJoined = s43Twins.find((r) => r.recurringGroupId);
+  const s43TwinLeft = s43Twins.find((r) => !r.recurringGroupId);
+  assert(
+    s43TwinJoined?.recurrence === "monthly" && s43TwinLeft?.recurrence === "none" &&
+      s43Result.leftOut.some((r) => r.title === "Suite 43 Twin Gym" && r.setToOneTime === true),
+    `A left-out same-date recurring row is set to One-time and reported (got ${s43Twins.map((r) => `${r.recurringGroupId ? "joined" : "single"}:${r.recurrence}`).join(",")})`
+  );
+
   // 43.4 The migration runs only once
   assert((await s43RunMigration()) === null, "The series-id migration runs only once");
   await s43Generate(null, { todayStr: s43Today });
@@ -6908,6 +6923,10 @@ async function runTestSuite() {
     (await Transaction.count({ where: { recurringGroupId: s43ProbeGroup } })) > 1 &&
       (await Transaction.count({ where: { title: "Suite 43 Dentist" } })) === 2,
     "Once it has run, generation resumes, and the one-off rows generate nothing"
+  );
+  assert(
+    (await Transaction.count({ where: { title: "Suite 43 Twin Gym", date: s43Slot1 } })) === 1,
+    `The same-date recurring duplicate is generated once on ${s43Slot1}, not twice`
   );
 
   // 43.5 The old series' newest row moved earlier and set to One-time: its old date is not charged twice
@@ -6947,6 +6966,26 @@ async function runTestSuite() {
   assert(
     Boolean(s43Direct.recurringGroupId) && Boolean((await Transaction.findByPk(s43Direct.id)).recurringGroupId),
     "Creating or updating a recurring row through the model fills in the series id"
+  );
+
+  // The hook does not run for bulk writes (bulkCreate, Model.update), so none in the app may set a
+  // recurrence other than "none"
+  const s43Fs = require("fs");
+  const s43Path = require("path");
+  const s43Sources = ["routes", "services"].flatMap((dir) =>
+    s43Fs.readdirSync(s43Path.join(__dirname, "..", dir)).filter((f) => f.endsWith(".js")).map((f) => s43Path.join(__dirname, "..", dir, f))
+  );
+  const s43BulkWrites = [];
+  for (const file of s43Sources) {
+    const src = s43Fs.readFileSync(file, "utf8");
+    if (/Transaction\.bulkCreate\(/.test(src)) s43BulkWrites.push(`${s43Path.basename(file)}: bulkCreate`);
+    for (const m of src.matchAll(/Transaction\.update\(\s*\{([^}]*)\}/g)) {
+      if (/recurrence/.test(m[1]) && !/recurrence:\s*"none"/.test(m[1])) s43BulkWrites.push(`${s43Path.basename(file)}: ${m[1].trim()}`);
+    }
+  }
+  assert(
+    s43BulkWrites.length === 0,
+    `No bulk write sets a recurrence the model hook would miss (got ${s43BulkWrites.join("; ")})`
   );
 
   // Cleanup
