@@ -5764,7 +5764,9 @@ async function runTestSuite() {
   await sequelize.query("UPDATE Accounts SET createdAt = :c WHERE id = :id", { replacements: { c: `${s38MissStart} 12:00:00.000 +00:00`, id: s38MissId } });
   assert((await s38MissFlag()) === s38MissLast, `No payment since the ${s38MissLast} due date is flagged (got ${await s38MissFlag()})`);
   const s38AdjRow = await Transaction.create({ title: "Statement sync – Suite 38 Missed", amount: 5, date: s38MissLast, type: "TRANSFER", category: "Adjustment", isCleared: true, toAccountId: s38MissId });
-  assert((await s38MissFlag()) === s38MissLast, "A statement-sync adjustment is not a payment");
+  assert((await s38MissFlag()) === null, "A statement-sync Adjustment down (paid at the bank, then synced) counts as a payment");
+  await s38AdjRow.update({ category: "Interest" });
+  assert((await s38MissFlag()) === s38MissLast, "A row paid to the debt but labelled Interest is not a payment");
   const s38Paid = await Transaction.create({ title: "Payment for Suite 38 Missed", amount: 50, date: s38MissLast, type: "TRANSFER", category: "Debt", isCleared: true, fromAccountId: (await s39GetCheckingForS38()).id, toAccountId: s38MissId });
   assert((await s38MissFlag()) === null, "A payment between the previous and the last due date clears the flag");
   await s38Paid.update({ date: getTorontoToday() });
@@ -5829,32 +5831,41 @@ async function runTestSuite() {
   const s39Checking = await s39GetChecking();
   const s39CheckingBefore = await s39CheckingBal(s39Checking, s39Today);
   s39Before = await s39Count();
+  // The statement is dated before today's $12.34 of interest, so it is compared with the $1,000 owed then
   const s39Down = await s39Reconcile(s39DebtId, { actualBalance: 990, reason: "adjustment", date: "2026-10-01" });
   s39Row = await Transaction.findByPk(s39Down.body.transactionId);
   assert(s39Down.status === 201 && (await s39Count()) === s39Before + 1, "Debt down: exactly one row");
   assert(
     s39Row.type === "TRANSFER" && s39Row.category === "Adjustment" && s39Row.title === "Statement sync – Suite 39 Loan" &&
-      parseFloat(s39Row.amount) === 22.34 && s39Row.toAccountId === s39DebtId && !s39Row.fromAccountId && s39Row.date === "2026-10-01",
-    "Debt down: Adjustment TRANSFER of $22.34 towards the debt, dated the statement date"
+      parseFloat(s39Row.amount) === 10 && s39Row.toAccountId === s39DebtId && !s39Row.fromAccountId && s39Row.date === "2026-10-01",
+    `Debt down: a past statement is compared with the balance on its date ($1,000), so $10 towards the debt (got ${s39Row.amount})`
   );
-  assert((await s39Bal(s39DebtId)) === 990, "A past statement date still sets today's balance to $990");
+  assert(s39Down.body.balanceOnDate === 1000 && s39Down.body.difference === -10, "Response shows the balance on the statement date and the difference");
+  assert((await s39Bal(s39DebtId)) === 1002.34, "Today's balance moves by the $10 difference and keeps the later interest ($1,002.34)");
   assert((await s39CheckingBal(await s39GetChecking(), s39Today)) === s39CheckingBefore, "Adjusting a debt does not touch Checking");
 
   // 39.3 Card up and down
   const s39CardUp = await s39Reconcile(s39CardId, { actualBalance: 250, reason: "adjustment" });
   s39Row = await Transaction.findByPk(s39CardUp.body.transactionId);
   assert(s39CardUp.status === 201 && s39Row.type === "TRANSFER" && s39Row.category === "Adjustment" && s39Row.fromAccountId === s39CardId && !s39Row.toAccountId && parseFloat(s39Row.amount) === 50 && (await s39Bal(s39CardId)) === 250, "Card up (adjustment): $50 TRANSFER out of the card to no account, balance $250");
-  const s39CardDown = await s39Reconcile(s39CardId, { actualBalance: 180.5, reason: "interest" });
+  s39Before = await s39Count();
+  const s39CardDownInterest = await s39Reconcile(s39CardId, { actualBalance: 180.5, reason: "interest" });
+  assert(s39CardDownInterest.status === 400 && (await s39Count()) === s39Before && (await s39Bal(s39CardId)) === 250, `A lower statement can't be recorded as interest: 400, nothing recorded (got ${s39CardDownInterest.status})`);
+  const s39DebtDownInterest = await s39Reconcile(s39DebtId, { actualBalance: 900, reason: "interest" });
+  assert(s39DebtDownInterest.status === 400 && (await s39Bal(s39DebtId)) === 1002.34, "Same for a debt: a lower statement as interest is refused");
+  const s39CardDown = await s39Reconcile(s39CardId, { actualBalance: 180.5, reason: "adjustment" });
   s39Row = await Transaction.findByPk(s39CardDown.body.transactionId);
-  assert(s39CardDown.status === 201 && s39Row.type === "TRANSFER" && s39Row.toAccountId === s39CardId && s39Row.category === "Interest" && parseFloat(s39Row.amount) === 69.5 && (await s39Bal(s39CardId)) === 180.5, "Card down: $69.50 credit towards the card, balance $180.50");
+  assert(s39CardDown.status === 201 && s39Row.type === "TRANSFER" && s39Row.toAccountId === s39CardId && s39Row.category === "Adjustment" && parseFloat(s39Row.amount) === 69.5 && (await s39Bal(s39CardId)) === 180.5, "Card down: $69.50 Adjustment credit towards the card, balance $180.50");
 
   // 39.4 Checking up and down, with the right sign
   const s39C0 = await s39CheckingBal(await s39GetChecking(), s39Today);
   s39Before = await s39Count();
-  const s39CUp = await s39Reconcile(s39Checking.id, { actualBalance: s39C0 + 100, reason: "interest" });
+  assert((await s39Reconcile(s39Checking.id, { actualBalance: s39C0 + 100, reason: "interest" })).status === 400, "Checking can't be synced as interest (400)");
+  assert((await s39Count()) === s39Before, "The refused Checking interest sync records nothing");
+  const s39CUp = await s39Reconcile(s39Checking.id, { actualBalance: s39C0 + 100, reason: "adjustment" });
   s39Row = await Transaction.findByPk(s39CUp.body.transactionId);
   assert(s39CUp.status === 201 && (await s39Count()) === s39Before + 1, "Checking up: exactly one row");
-  assert(s39Row.type === "TRANSFER" && s39Row.toAccountId === s39Checking.id && !s39Row.fromAccountId && parseFloat(s39Row.amount) === 100 && s39Row.category === "Interest", "Checking up: $100 TRANSFER into Checking");
+  assert(s39Row.type === "TRANSFER" && s39Row.toAccountId === s39Checking.id && !s39Row.fromAccountId && parseFloat(s39Row.amount) === 100 && s39Row.category === "Adjustment", "Checking up: $100 Adjustment TRANSFER into Checking");
   assert((await s39CheckingBal(await s39GetChecking(), s39Today)) === Math.round((s39C0 + 100) * 100) / 100, "Checking balance went up by $100");
   const s39CDown = await s39Reconcile(s39Checking.id, { actualBalance: Math.round((s39C0 - 25.5) * 100) / 100 });
   s39Row = await Transaction.findByPk(s39CDown.body.transactionId);
@@ -5954,6 +5965,33 @@ async function runTestSuite() {
   assert(/Interest: \$[\d.]+ spent of \$1\.00/.test(s39DigestMsg), "Digest flags the Interest budget as over");
   assert(!/Adjustment: \$/.test(s39DigestMsg), "Digest never counts adjustments against a budget");
   await Budget.destroy({ where: { category: ["Interest", "Adjustment"] } });
+
+  // 39.8 A past statement date on Checking, and a double submit
+  const s39Past = "2026-09-15";
+  const { getBalanceAsOf: s39AsOf } = require("../services/reconcileService");
+  const s39ThenBefore = await s39AsOf(await s39GetChecking(), s39Past, s39Today);
+  const s39CNow = await s39CheckingBal(await s39GetChecking(), s39Today);
+  const s39Later = await Transaction.create({ title: "Suite 39 later spend", amount: 30, date: s39Today, type: "EXPENSE", category: "Groceries", isCleared: true, fromAccountId: s39Checking.id });
+  const s39LaterIncome = await Transaction.create({ title: "Suite 39 later pay", amount: 200, date: s39Today, type: "INCOME", category: "Salary", isCleared: true, toAccountId: null });
+  assert((await s39CheckingBal(await s39GetChecking(), s39Today)) === Math.round((s39CNow + 170) * 100) / 100, "Today's spend and pay change today's Checking balance");
+  const s39ThenAfter = await s39AsOf(await s39GetChecking(), s39Past, s39Today);
+  assert(s39ThenAfter === s39ThenBefore, `Checking balance on ${s39Past} leaves out today's $30 spend and $200 pay (got ${s39ThenAfter}, expected ${s39ThenBefore})`);
+  const s39CPast = await s39Reconcile(s39Checking.id, { actualBalance: Math.round((s39ThenBefore + 5) * 100) / 100, date: s39Past });
+  assert(s39CPast.status === 201 && s39CPast.body.difference === 5 && s39CPast.body.balanceOnDate === s39ThenBefore, `Checking statement from ${s39Past} records only the $5 difference back then (got ${s39CPast.body.difference})`);
+  assert((await s39CheckingBal(await s39GetChecking(), s39Today)) === Math.round((s39CNow + 170 + 5) * 100) / 100, "Today's Checking balance moves by that $5 and keeps the later rows");
+  await s39Later.destroy();
+  await s39LaterIncome.destroy();
+  s39Before = await s39Count();
+  const s39Twice = await Promise.all([
+    s39Reconcile(s39CardId, { actualBalance: 199.99, reason: "adjustment" }),
+    s39Reconcile(s39CardId, { actualBalance: 199.99, reason: "adjustment" }),
+  ]);
+  const s39TwiceCodes = s39Twice.map((r) => r.status).sort();
+  // Postgres: the row lock makes the second wait and get 409. SQLite (tests) may refuse it as busy instead.
+  assert(
+    s39TwiceCodes[0] === 201 && s39TwiceCodes[1] !== 201 && (await s39Count()) === s39Before + 1 && (await s39Bal(s39CardId)) === 199.99,
+    `A double submit records one row (got ${s39TwiceCodes})`
+  );
 
   // 39.6 PUT /checking stays for compatibility
   const s39Put = await s33("PUT", "/api/checking", { balance: 4321.09 });

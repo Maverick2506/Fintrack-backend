@@ -68,13 +68,14 @@ const interestClientRef = (debtId, dueDate) =>
 const getPreviousDebtDueDate = (dueDate, frequency, anchorDay) =>
   getNextOccurrenceDate(dueDate, frequency || "monthly", -1, anchorDay || null);
 
-// Rows that count as a payment towards a debt: anything paid to it except statement-sync rows
-const NOT_A_PAYMENT_CATEGORIES = ["Adjustment", "Interest"];
+// Rows paid TO a debt that count as a payment. A statement-sync Adjustment down (a payment made at
+// the bank, then synced) counts; an "Interest" row paid to a debt is an old mislabelled sync, not a payment.
+const NOT_A_PAYMENT_CATEGORIES = ["Interest"];
 
 /**
  * Missed payment (Debts page): the due date that most recently passed (before today) had no cleared
  * payment to the debt between the due date before it and today. Returns that due date, or null.
- * payments: [{ date, category }] of cleared rows paid to this debt.
+ * payments: [{ date, category }] of cleared rows paid to this debt (toAccountId = the debt).
  */
 const findMissedPayment = (debt, payments, todayStr) => {
   if (!debt.dueDate || debt.isActive === false || !((parseFloat(debt.initialBalance) || 0) > 0)) {

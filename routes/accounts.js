@@ -69,7 +69,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     try {
-      const account = await Account.findByPk(req.params.id, { transaction: dbTx });
+      // Row lock: a second sync of the same account waits, then sees the new balance (409 if it
+      // was the same statement), so a double submit can't record the difference twice on Postgres
+      const account = await Account.findByPk(req.params.id, { transaction: dbTx, lock: dbTx.LOCK.UPDATE });
       if (!account) {
         await dbTx.rollback();
         return res.status(404).json({ error: "Account not found" });
