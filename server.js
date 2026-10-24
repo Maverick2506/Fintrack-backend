@@ -674,12 +674,12 @@ async function initialize() {
       const assigned = await runLegacySeriesIdMigration();
       if (assigned !== null) {
         console.log(
-          `✅ Assigned series IDs to ${assigned.seriesCount} old series (${assigned.rowCount} rows${
-            assigned.leftOutCount > 0
-              ? `; ${assigned.leftOutCount} same-date duplicates left as single rows`
-              : ""
-          }).`
+          `✅ Assigned series IDs to ${assigned.seriesCount} old series (${assigned.rowCount} rows).`
         );
+        // A row on the same date as one that joined its series (unique index) stays a single row
+        for (const row of assigned.leftOut) {
+          console.log(`   ${row.title} ${row.date} $${row.amount.toFixed(2)} (kept as a single row)`);
+        }
       }
       legacySeriesIdsDone = true;
     } catch (legacyErr) {

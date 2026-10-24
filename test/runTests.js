@@ -6774,15 +6774,40 @@ async function runTestSuite() {
   const s43AnchorDay = s43Anchor([s43Base, s43Prev, s43PrevPrev]);
   const s43Slot1 = s43Next(s43Base, "monthly", 1, s43AnchorDay);
   const s43Slot2 = s43Next(s43Base, "monthly", 2, s43AnchorDay);
+  // A same-titled One-time row on the date of one of the series' rows (an old duplicate), saved first so
+  // it is the oldest row on that date
+  const s43RentDup = await Transaction.bulkCreate([
+    { title: "Suite 43 Old Rent", amount: 50, date: s43Prev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "none" },
+  ]);
+  await new Promise((r) => setTimeout(r, 20));
   const s43Rent = await Transaction.bulkCreate([
     { title: "Suite 43 Old Rent", amount: 900, date: s43PrevPrev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", deletedAt: new Date() },
     { title: "Suite 43 Old Rent", amount: 900, date: s43Prev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly" },
     { title: "suite 43 old rent ", amount: 900, date: s43Base, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly" },
     { title: "Suite 43 Old Rent", amount: 900, date: s43Slot1, type: "EXPENSE", category: "Essentials", isCleared: false, recurrence: "monthly" },
   ]);
-  // A same-titled row on the same date as one of the series' rows (an old duplicate)
-  const s43RentDup = await Transaction.bulkCreate([
-    { title: "Suite 43 Old Rent", amount: 50, date: s43Prev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "none" },
+  // Two One-time rows on one date of a weekly series: the unpaid one saved first, the paid one second
+  await Transaction.bulkCreate([
+    { title: "Suite 43 Gym", amount: 10, date: getTorontoOffsetDate(-21), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
+  ]);
+  const [s43GymUnpaid] = await Transaction.bulkCreate([
+    { title: "Suite 43 Gym", amount: 11, date: getTorontoOffsetDate(-14), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
+  ]);
+  await new Promise((r) => setTimeout(r, 20));
+  const [s43GymPaid] = await Transaction.bulkCreate([
+    { title: "Suite 43 Gym", amount: 12, date: getTorontoOffsetDate(-14), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none" },
+  ]);
+  // An old monthly series with same-titled old one-off rows: past paid, past unpaid, future paid, future unpaid
+  const s43Club = await Transaction.bulkCreate([
+    { title: "Suite 43 Old Club", amount: 30, date: s43Prev, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
+    { title: "Suite 43 Old Club", amount: 30, date: s43Base, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
+    { title: "Suite 43 Old Club", amount: 30, date: s43Slot1, type: "EXPENSE", category: "Other", isCleared: false, recurrence: "monthly" },
+  ]);
+  const [s43ClubPastPaid, s43ClubPastUnpaid, s43ClubFuturePaid, s43ClubFutureUnpaid] = await Transaction.bulkCreate([
+    { title: "Suite 43 Old Club", amount: 75, date: getTorontoOffsetDate(-3), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none" },
+    { title: "Suite 43 Old Club", amount: 76, date: getTorontoOffsetDate(-4), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
+    { title: "Suite 43 Old Club", amount: 77, date: getTorontoOffsetDate(6), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none" },
+    { title: "Suite 43 Old Club", amount: 78, date: getTorontoOffsetDate(5), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
   ]);
   // Rows that never recurred: same title among themselves, and an income with the rent's title
   const s43Dentist = await Transaction.bulkCreate([
@@ -6834,9 +6859,41 @@ async function runTestSuite() {
       (await Setting.findByPk(s43MigKey))?.value === "true",
     `An old monthly series gets one id on all of its rows, Trash included (got ${s43RentAfter.map((r) => r.recurringGroupId).join(",")})`
   );
+  const { groupSeries: s43GroupSeries } = require("../routes/recurring");
+  const s43Template = Object.values(s43GroupSeries(
+    (await Transaction.findAll({ where: { recurringGroupId: s43RentGroup }, order: [["date", "DESC"], ["createdAt", "DESC"]] }))
+  ).seriesTemplates)[0];
   assert(
-    (await Transaction.findByPk(s43RentDup[0].id)).recurringGroupId === null && s43Result.leftOutCount >= 1,
-    "A same-date duplicate stays a single row (the unique index allows one row per series and date)"
+    (await Transaction.findByPk(s43RentDup[0].id)).recurringGroupId === null &&
+      s43Result.leftOut.some((r) => r.title === "Suite 43 Old Rent" && r.date === s43Prev && r.amount === 50),
+    `On a shared date the recurring row joins over an older One-time row, which stays single and is reported (got ${JSON.stringify(s43Result.leftOut)})`
+  );
+  assert(
+    s43Template?.template.id === s43Rent[3].id && s43Template.newestDate === s43Slot1 && s43Template.anchorDay === s43AnchorDay &&
+      parseFloat(s43Template.template.amount) === 900,
+    "The series template is unchanged by the excluded row"
+  );
+  const s43GymGroup = (await Transaction.findByPk(s43GymPaid.id)).recurringGroupId;
+  assert(
+    Boolean(s43GymGroup) && (await Transaction.findByPk(s43GymUnpaid.id)).recurringGroupId === null,
+    "Between two One-time rows on one date, the paid one joins even when the unpaid one is older"
+  );
+
+  // The old series' same-titled one-off rows join it; End series keeps the past or paid ones and
+  // removes only the unpaid one after today
+  const s43ClubIds = [...s43Club, s43ClubPastPaid, s43ClubPastUnpaid, s43ClubFuturePaid, s43ClubFutureUnpaid].map((r) => r.id);
+  const s43ClubGroup = (await Transaction.findByPk(s43Club[0].id)).recurringGroupId;
+  assert(
+    Boolean(s43ClubGroup) && (await s43Rows({ id: s43ClubIds })).every((r) => r.recurringGroupId === s43ClubGroup),
+    "Same-titled old one-off rows get the old series' id"
+  );
+  const s43ClubEnd = await s33("POST", `/api/recurring/${s43ClubGroup}/end`, {});
+  const s43ClubLeft = new Set((await Transaction.findAll({ where: { id: s43ClubIds } })).map((r) => r.id));
+  assert(
+    s43ClubEnd.status === 200 && s43ClubEnd.body.removedUpcomingCount === 2 &&
+      s43ClubLeft.has(s43ClubPastPaid.id) && s43ClubLeft.has(s43ClubPastUnpaid.id) && s43ClubLeft.has(s43ClubFuturePaid.id) &&
+      !s43ClubLeft.has(s43ClubFutureUnpaid.id) && !s43ClubLeft.has(s43Club[2].id),
+    `End series keeps the past or paid one-offs and removes the unpaid ones after today (got ${s43ClubEnd.status}, ${s43ClubEnd.body.removedUpcomingCount})`
   );
   const s43DentistAfter = await s43Rows({ id: s43Dentist.map((r) => r.id) });
   assert(
