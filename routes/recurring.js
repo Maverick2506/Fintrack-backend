@@ -5,6 +5,16 @@ const { Op } = require("sequelize");
 const { addDays, addMonths, addYears } = require("date-fns");
 const { toZonedTime, format } = require("date-fns-tz");
 const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
+const authMiddleware = require("../middleware/authMiddleware");
+const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
+const { asyncHandler } = require("../middleware/errorHandler");
+const {
+  endSeries,
+  resolveSeries,
+  ACTIVE_RECURRENCES,
+  SERIES_RESTART_PREFIX,
+  SERIES_VACATED_PREFIX,
+} = require("../services/seriesService");
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
@@ -95,14 +105,98 @@ const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
   }
 };
 
-const ACTIVE_RECURRENCES = ["weekly", "bi-weekly", "monthly", "yearly"];
+// Set once the one-off series-end migration (runSeriesEndMigration) has committed. The generator
+// does not run before it: it would restart series that stopped under the old rule, with a backfill.
+const SERIES_END_MIGRATION_KEY = "series_end_explicit_v1";
+
+// A series restarted by setting one of its rows back to recurring (after it had ended) generates
+// only from the restart date, so missed occurrences are not backfilled as overdue bills or as
+// income already received. Stored per series as `${SERIES_RESTART_PREFIX}${recurringGroupId}`.
+const markSeriesRestart = (recurringGroupId, todayStr, dbTx = null) =>
+  Setting.upsert(
+    { key: `${SERIES_RESTART_PREFIX}${recurringGroupId}`, value: todayStr },
+    { transaction: dbTx }
+  );
+
+// The slot a moved series row left stays taken: moving the newest row earlier (Nov 21 to Nov 19,
+// set to One-time) must not let the generator charge Nov 21 again. Stored per series as
+// `${SERIES_VACATED_PREFIX}${groupId}` = JSON { rowId: the date that row first held }. Only the
+// exact original date is kept, and moving the row back onto it clears it, so correcting a mistyped
+// date never hides other occurrences. endSeries removes the Setting; otherwise it is one small row
+// per series with a moved row.
+const markSeriesRowMoved = async (recurringGroupId, rowId, fromDate, toDate, dbTx = null) => {
+  const key = `${SERIES_VACATED_PREFIX}${recurringGroupId}`;
+  const existing = await Setting.findByPk(key, { transaction: dbTx });
+  let slots = {};
+  try {
+    slots = existing ? JSON.parse(existing.value) || {} : {};
+  } catch {
+    slots = {};
+  }
+  const original = slots[rowId] || fromDate;
+  if (toDate === original) delete slots[rowId];
+  else slots[rowId] = original;
+  if (Object.keys(slots).length === 0) {
+    if (existing) await existing.destroy({ transaction: dbTx });
+    return;
+  }
+  await Setting.upsert({ key, value: JSON.stringify(slots) }, { transaction: dbTx });
+};
+
+const getSettingsByPrefix = async (prefix, dbTx) => {
+  const rows = await Setting.findAll({
+    where: { key: { [Op.like]: `${prefix}%` } },
+    transaction: dbTx,
+  });
+  return new Map(rows.map((r) => [r.key.slice(prefix.length), r.value]));
+};
+
+const getSeriesRestarts = (dbTx) => getSettingsByPrefix(SERIES_RESTART_PREFIX, dbTx);
+
+// Per series: the set of slot dates moved rows left (see markSeriesRowMoved). The generator and the
+// forecast skip them.
+const getSeriesVacatedDates = async (dbTx) => {
+  const raw = await getSettingsByPrefix(SERIES_VACATED_PREFIX, dbTx);
+  const byGroup = new Map();
+  for (const [groupId, value] of raw) {
+    try {
+      byGroup.set(groupId, new Set(Object.values(JSON.parse(value) || {})));
+    } catch {
+      // A bad value skips nothing
+    }
+  }
+  return byGroup;
+};
+
+const latestOf = (...dates) =>
+  dates.filter(Boolean).reduce((max, d) => (!max || d > max ? d : max), null);
 
 // Groups rows (newest first) into series, keyed by recurringGroupId or by type and title for older rows.
-// The generator follows the newest row of each series.
 const getSeriesKey = (trx) =>
   trx.recurringGroupId
     ? `series:${trx.recurringGroupId}`
     : `${trx.type}:${trx.title.toLowerCase().trim()}`;
+
+// What a series generates from, given its rows newest first. The template is the newest row that
+// still recurs: a row set to One-time changes only itself, so it never stops the series (B3). Ending a
+// series sets recurrence "none" on all of its rows, so a series with no recurring row left has ended
+// (returns null). New occurrences come only after newestDate, the newest row of any recurrence, so a
+// One-time row is never duplicated on its date. The anchor day comes from the recurring rows only, so
+// a One-time row on another day does not move the series.
+const getSeriesTemplate = (rowsNewestFirst) => {
+  const rows = rowsNewestFirst || [];
+  const index = rows.findIndex((r) => ACTIVE_RECURRENCES.includes(r.recurrence));
+  if (index === -1) return null;
+  const recurringDates = rows
+    .slice(index)
+    .filter((r) => ACTIVE_RECURRENCES.includes(r.recurrence))
+    .map((r) => r.date);
+  return {
+    template: rows[index],
+    newestDate: rows[0].date,
+    anchorDay: getSeriesAnchorDay(recurringDates),
+  };
+};
 
 const groupSeries = (rowsNewestFirst) => {
   const latestOccurrences = {};
@@ -118,7 +212,13 @@ const groupSeries = (rowsNewestFirst) => {
     seriesDates[key].push(trx.date);
     seriesRows[key].push(trx);
   }
-  return { latestOccurrences, seriesDates, seriesRows };
+  // Only series that are still running
+  const seriesTemplates = {};
+  for (const [key, rows] of Object.entries(seriesRows)) {
+    const series = getSeriesTemplate(rows);
+    if (series) seriesTemplates[key] = series;
+  }
+  return { latestOccurrences, seriesDates, seriesRows, seriesTemplates };
 };
 
 // A series whose card, debt or goal is archived (or no longer exists) stops generating
@@ -144,16 +244,24 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
     const todayStr =
       options.todayStr ||
       format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const migrated = await Setting.findByPk(SERIES_END_MIGRATION_KEY, { transaction: dbTx });
+    if (!migrated || migrated.value !== "true") {
+      console.warn(
+        `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`
+      );
+      return { skipped: true };
+    }
     const quickAddCatchupFrom = await getQuickAddCatchupFrom(todayStr, dbTx);
+    const seriesRestarts = await getSeriesRestarts(dbTx);
+    const seriesVacated = await getSeriesVacatedDates(dbTx);
     
     // Horizon is 30 calendar days from today in America/Toronto
     const [tY, tM, tD] = todayStr.split("-").map(Number);
     const horizonUtc = new Date(Date.UTC(tY, tM - 1, tD, 12, 0, 0) + 30 * 24 * 60 * 60 * 1000);
     const horizonString = `${horizonUtc.getUTCFullYear()}-${String(horizonUtc.getUTCMonth() + 1).padStart(2, "0")}-${String(horizonUtc.getUTCDate()).padStart(2, "0")}`;
 
-    // Fetch all INCOME, EXPENSE, and TRANSFER transactions ordered newest first so that
-    // if the latest instance of a series was changed to recurrence: "none",
-    // we respect that and do not resurrect it from an older historical row.
+    // Fetch all INCOME, EXPENSE, and TRANSFER transactions newest first; each series generates from
+    // its newest row that still recurs (see getSeriesTemplate)
     const allTransactions = await Transaction.findAll({
       where: {
         type: { [Op.in]: ["EXPENSE", "INCOME", "TRANSFER"] },
@@ -165,24 +273,25 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
       transaction: dbTx,
     });
 
-    const { latestOccurrences, seriesDates } = groupSeries(allTransactions);
+    const { seriesTemplates } = groupSeries(allTransactions);
     const accounts = await Account.findAll({
       attributes: ["id", "isActive"],
       transaction: dbTx,
     });
     const accountsById = new Map(accounts.map((a) => [a.id, a]));
 
-    for (const [seriesKey, baseTrx] of Object.entries(latestOccurrences)) {
-      if (!ACTIVE_RECURRENCES.includes(baseTrx.recurrence)) {
-        continue;
-      }
+    for (const { template: baseTrx, newestDate, anchorDay } of Object.values(seriesTemplates)) {
       if (isSeriesAccountRetired(baseTrx, accountsById)) {
         continue;
       }
+      const vacated = seriesVacated.get(baseTrx.recurringGroupId);
 
-      const anchorDay = getSeriesAnchorDay(seriesDates[seriesKey]);
-      const skipBefore =
+      const quickAddSkip =
         baseTrx.clientRef && baseTrx.date < quickAddCatchupFrom ? quickAddCatchupFrom : null;
+      const restartSkip = baseTrx.recurringGroupId
+        ? seriesRestarts.get(baseTrx.recurringGroupId) || null
+        : null;
+      const skipBefore = latestOf(quickAddSkip, restartSkip);
       let step = 1;
       while (true) {
         const nextDateStr = getNextOccurrenceDate(
@@ -194,7 +303,7 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
         if (!nextDateStr || nextDateStr > horizonString) {
           break;
         }
-        if (skipBefore && nextDateStr < skipBefore) {
+        if ((skipBefore && nextDateStr < skipBefore) || nextDateStr <= newestDate || vacated?.has(nextDateStr)) {
           step++;
           continue;
         }
@@ -310,10 +419,93 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
   }
 };
 
+// One-off (guarded in server.js): before series ended explicitly, a series stopped when its newest
+// row was set to One-time. The generator now looks past such a row, so those series are ended for real
+// (every row "none", Trash included) instead of coming back with a backfill of missed occurrences.
+// Loads every transaction into memory, which is fine for a one-off at this app's size.
+// Returns the titles of the series it ended.
+const endSeriesStoppedByNewestRow = async (dbTx = null) => {
+  const rows = await Transaction.findAll({
+    where: { type: { [Op.in]: ["EXPENSE", "INCOME", "TRANSFER"] } },
+    order: [
+      ["date", "DESC"],
+      ["createdAt", "DESC"],
+    ],
+    transaction: dbTx,
+  });
+  const { latestOccurrences, seriesRows } = groupSeries(rows);
+  const endedTitles = [];
+  for (const [key, newest] of Object.entries(latestOccurrences)) {
+    if (ACTIVE_RECURRENCES.includes(newest.recurrence)) continue;
+    const where = newest.recurringGroupId
+      ? { recurringGroupId: newest.recurringGroupId }
+      : { id: { [Op.in]: seriesRows[key].map((r) => r.id) } };
+    const [count] = await Transaction.update(
+      { recurrence: "none" },
+      {
+        where: { ...where, recurrence: { [Op.in]: ACTIVE_RECURRENCES } },
+        paranoid: false,
+        transaction: dbTx,
+      }
+    );
+    if (count > 0) endedTitles.push(newest.title);
+  }
+  return endedTitles;
+};
+
+// Runs the one-off migration in one DB transaction together with its Setting flag, so a failure
+// leaves both untouched (and the generator skipped) until the next boot retries it.
+// Returns the titles of the series it ended, or null when it had already run.
+const runSeriesEndMigration = async (migrate = endSeriesStoppedByNewestRow) => {
+  const done = await Setting.findByPk(SERIES_END_MIGRATION_KEY);
+  if (done && done.value === "true") return null;
+  return Transaction.sequelize.transaction(async (dbTx) => {
+    const endedTitles = await migrate(dbTx);
+    await Setting.upsert({ key: SERIES_END_MIGRATION_KEY, value: "true" }, { transaction: dbTx });
+    return endedTitles;
+  });
+};
+
 router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
-  await createRecurringExpenses();
+  const result = await createRecurringExpenses();
+  if (result?.skipped) {
+    // Not a success: the cron log should show that nothing was generated
+    return res.status(503).json({
+      skipped: true,
+      error: `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`,
+    });
+  }
   res.status(200).json({ message: "Advanced recurring job triggered successfully." });
 });
+
+// POST /api/recurring/:recurringGroupId/end { dryRun? } ends any series: expense, income or transfer.
+// The id may also be a row id of an older series without a group id. Returns { seriesEnded,
+// removedUpcomingCount, removedUpcomingTotal }; with dryRun it only reports.
+router.post(
+  "/:recurringGroupId/end",
+  authMiddleware,
+  (req, res, next) => validateIdParam(req, res, next, req.params.recurringGroupId),
+  validateBody(schemas.endSeries),
+  asyncHandler(async (req, res) => {
+    const dryRun = req.body.dryRun === true;
+    const dbTx = await Transaction.sequelize.transaction();
+    let result;
+    try {
+      const series = await resolveSeries(req.params.recurringGroupId, dbTx);
+      if (!series) {
+        await dbTx.rollback();
+        return res.status(404).json({ error: "Recurring series not found." });
+      }
+      result = await endSeries(series, { dryRun, dbTx });
+      await dbTx.commit();
+    } catch (err) {
+      if (!dbTx.finished) await dbTx.rollback();
+      throw err;
+    }
+    const { keptCount, ...body } = result;
+    res.json({ ...body, dryRun });
+  })
+);
 
 module.exports = {
   router,
@@ -321,7 +513,14 @@ module.exports = {
   getNextDueDate,
   getNextOccurrenceDate,
   getSeriesAnchorDay,
+  getSeriesTemplate,
   groupSeries,
+  endSeriesStoppedByNewestRow,
+  runSeriesEndMigration,
+  markSeriesRestart,
+  markSeriesRowMoved,
+  getSeriesVacatedDates,
+  SERIES_END_MIGRATION_KEY,
   ACTIVE_RECURRENCES,
   QUICK_ADD_CATCHUP_KEY,
 };

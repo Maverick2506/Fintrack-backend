@@ -6335,6 +6335,424 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 40 %" } }, { title: { [Op.like]: "%Suite 40 %" } }, { fromAccountId: s40AccountIds }, { toAccountId: s40AccountIds }] }, force: true });
   await Account.destroy({ where: { id: s40AccountIds } });
 
+  // --- Suite 41: A One-time edit to a later row does not end its series ---
+  console.log("\n--- Suite 41: A One-time edit to a later row does not end its series ---");
+  const { createRecurringExpenses: s41Generate, endSeriesStoppedByNewestRow: s41EndStopped } = require("../routes/recurring");
+  const { getForecast: s41Forecast } = require("../services/forecastService");
+  const s41Rows = (groupId) =>
+    Transaction.findAll({ where: { recurringGroupId: groupId }, paranoid: false, order: [["date", "ASC"]] });
+  const s41Subs = async () => (await s33("GET", "/api/subscriptions")).body.subscriptions || [];
+
+  // 41.1 Weekly series: the newest upcoming row set to One-time changes only itself
+  const s41Gym = await s33("POST", "/api/expenses", { name: "Suite 41 Weekly Gym", amount: 9, category: "Other", due_date: getTorontoOffsetDate(0), is_paid: true, recurrence: "weekly" });
+  const s41GymGroup = s41Gym.body.recurringGroupId;
+  const s41GymBefore = await s41Rows(s41GymGroup);
+  const s41GymNewest = s41GymBefore[s41GymBefore.length - 1];
+  assert(s41GymNewest.date === getTorontoOffsetDate(28), `The series has generated up to ${getTorontoOffsetDate(28)} (got ${s41GymNewest.date})`);
+  const s41GymDry = await s33("PUT", `/api/expenses/${s41GymNewest.id}?dryRun=1`, { recurrence: "none", amount: 15 });
+  assert(
+    s41GymDry.status === 200 && s41GymDry.body.seriesEnded === false && s41GymDry.body.removedUpcomingCount === 0,
+    `Dry run on the newest upcoming row reports that the series continues (got ${JSON.stringify({ e: s41GymDry.body.seriesEnded, n: s41GymDry.body.removedUpcomingCount })})`
+  );
+  const s41GymPut = await s33("PUT", `/api/expenses/${s41GymNewest.id}`, { recurrence: "none", amount: 15 });
+  assert(s41GymPut.status === 200 && s41GymPut.body.seriesEnded === false && s41GymPut.body.removedUpcomingCount === 0, "Saving it changes only that row");
+  assert(
+    (await s41Subs()).some((sub) => sub.recurringGroupId === s41GymGroup && sub.cadence === "weekly" && sub.latestAmount === 9),
+    "Subscriptions still lists the series as weekly at $9.00"
+  );
+  const s41Fc = await s41Forecast(60);
+  assert(
+    s41Fc.days.some((d) => d.date === getTorontoOffsetDate(35) && d.items.some((i) => i.title === "Suite 41 Weekly Gym")),
+    "The forecast still projects the series past the One-time row"
+  );
+  await s41Generate(null, { todayStr: getTorontoOffsetDate(14) });
+  const s41GymAfter = await s41Rows(s41GymGroup);
+  const s41GymDates = s41GymAfter.map((r) => r.date);
+  const s41GymEdited = s41GymAfter.find((r) => r.id === s41GymNewest.id);
+  assert(
+    s41GymDates.includes(getTorontoOffsetDate(35)) && s41GymDates.includes(getTorontoOffsetDate(42)) &&
+      s41GymAfter.filter((r) => r.date > getTorontoOffsetDate(28)).every((r) => r.recurrence === "weekly" && parseFloat(r.amount) === 9),
+    `Later weekly rows keep coming at the series amount (got ${s41GymDates.join(",")})`
+  );
+  assert(
+    s41GymEdited.recurrence === "none" && parseFloat(s41GymEdited.amount) === 15 &&
+      s41GymDates.filter((d) => d === getTorontoOffsetDate(28)).length === 1 && new Set(s41GymDates).size === s41GymDates.length,
+    "The edited row stays One-time at $15.00, with no duplicate on its date"
+  );
+
+  // 41.2 Ending the series through its current occurrence: nothing more is generated
+  const s41Club = await s33("POST", "/api/expenses", { name: "Suite 41 Weekly Club", amount: 6, category: "Other", due_date: getTorontoOffsetDate(0), is_paid: true, recurrence: "weekly" });
+  const s41ClubGroup = s41Club.body.recurringGroupId;
+  const s41ClubRows = await s41Rows(s41ClubGroup);
+  // A later row was set to One-time first, and another one is in the Trash
+  await s33("PUT", `/api/expenses/${s41ClubRows[2].id}`, { recurrence: "none" });
+  await s33("DELETE", `/api/expenses/${s41ClubRows[3].id}`);
+  const s41ClubEnd = await s33("PUT", `/api/expenses/${s41Club.body.id}`, { recurrence: "none" });
+  await s41Generate(null, { todayStr: getTorontoOffsetDate(14) });
+  const s41ClubAfter = await s41Rows(s41ClubGroup);
+  assert(
+    s41ClubEnd.body.seriesEnded === true && s41ClubAfter.every((r) => r.recurrence === "none") &&
+      (await Transaction.count({ where: { recurringGroupId: s41ClubGroup } })) === 1,
+    `Ending the series through its current occurrence stops every row, Trash included, and nothing more is generated (got ${s41ClubAfter.map((r) => `${r.date}:${r.recurrence}`).join(",")})`
+  );
+
+  // 41.3 Cancelling a subscription whose newest row is One-time: nothing more
+  const s41Stream = await s33("POST", "/api/expenses", { name: "Suite 41 Streaming", amount: 20, category: "Subscriptions", due_date: getTorontoOffsetDate(0), is_paid: true, recurrence: "weekly" });
+  const s41StreamGroup = s41Stream.body.recurringGroupId;
+  const s41StreamRows = await s41Rows(s41StreamGroup);
+  await s33("PUT", `/api/expenses/${s41StreamRows[s41StreamRows.length - 1].id}`, { recurrence: "none" });
+  const s41Cancel = await s33("POST", `/api/subscriptions/${s41StreamGroup}/cancel`);
+  await s41Generate(null, { todayStr: getTorontoOffsetDate(14) });
+  assert(
+    s41Cancel.status === 200 && (await Transaction.count({ where: { recurringGroupId: s41StreamGroup } })) === 1 &&
+      (await s41Rows(s41StreamGroup)).every((r) => r.recurrence === "none") &&
+      !(await s41Subs()).some((sub) => sub.recurringGroupId === s41StreamGroup),
+    "A cancelled subscription generates nothing more and is no longer listed"
+  );
+
+  // 41.3b Archiving a card with "end": every row of its series stops recurring, Trash included
+  const s41Card = await s33("POST", "/api/credit-cards", { name: "Suite 41 Card", creditLimit: 500, currentBalance: 0 });
+  const s41CardId = s41Card.body.id;
+  const s41OnCard = await s33("POST", "/api/expenses", { name: "Suite 41 Card Plan", amount: 4, category: "Other", creditCardId: s41CardId, due_date: getTorontoOffsetDate(1), is_paid: false, recurrence: "weekly" });
+  const s41OnCardGroup = s41OnCard.body.recurringGroupId;
+  const s41OnCardRows = await s41Rows(s41OnCardGroup);
+  await s33("DELETE", `/api/expenses/${s41OnCardRows[1].id}`);
+  const s41Archive = await s33("DELETE", `/api/credit-cards/${s41CardId}`, { mode: "archive", series: "end" });
+  const s41Trashed = await Transaction.findByPk(s41OnCardRows[1].id, { paranoid: false });
+  assert(
+    [200, 204].includes(s41Archive.status) && s41Trashed?.recurrence === "none",
+    `Archiving the card ends its series, including the row in the Trash (got ${s41Archive.status}, ${s41Trashed?.recurrence})`
+  );
+
+  // 41.4 The anchor day is kept: a month-end series whose newest row is One-time
+  const s41RentGroup = require("crypto").randomUUID();
+  await Transaction.bulkCreate([
+    { title: "Suite 41 Month-End Rent", amount: 100, date: "2027-01-31", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s41RentGroup },
+    { title: "Suite 41 Month-End Rent", amount: 130, date: "2027-02-28", type: "EXPENSE", category: "Essentials", isCleared: false, recurrence: "none", recurringGroupId: s41RentGroup },
+  ]);
+  await s41Generate(null, { todayStr: "2027-03-05" });
+  const s41RentRows = await s41Rows(s41RentGroup);
+  assert(
+    s41RentRows.length === 3 && s41RentRows[2].date === "2027-03-31" && parseFloat(s41RentRows[2].amount) === 100 &&
+      s41RentRows[2].recurrence === "monthly" && s41RentRows[1].recurrence === "none",
+    `After a One-time Feb 28 row the series continues on Mar 31 at $100.00 (got ${s41RentRows.map((r) => `${r.date}:${r.amount}:${r.recurrence}`).join(",")})`
+  );
+
+  // 41.5 One-off migration: series that stopped under the old rule (newest row One-time) end for good
+  const s41OldGroup = require("crypto").randomUUID();
+  const [, , s41OldTrashed] = await Transaction.bulkCreate([
+    { title: "Suite 41 Old Stopped", amount: 5, date: "2026-01-01", type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s41OldGroup },
+    { title: "Suite 41 Old Stopped", amount: 5, date: "2026-01-08", type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s41OldGroup },
+    { title: "Suite 41 Old Stopped", amount: 5, date: "2026-01-15", type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s41OldGroup, deletedAt: new Date() },
+  ]);
+  const s41Ended = await s41EndStopped();
+  await s41Generate(null, { todayStr: getTorontoOffsetDate(0) });
+  const s41OldRows = await s41Rows(s41OldGroup);
+  assert(
+    s41Ended.includes("Suite 41 Old Stopped") && s41OldRows.length === 3 && s41OldRows.every((r) => r.recurrence === "none") &&
+      (await Transaction.findByPk(s41OldTrashed.id, { paranoid: false })).deletedAt,
+    `The migration ends it (Trash row included) so no missed weeks are backfilled (got ${s41OldRows.length} rows)`
+  );
+  assert(
+    (await s41Rows(s41GymGroup)).filter((r) => r.recurrence === "weekly").length >= 4,
+    "The migration leaves a running series alone"
+  );
+
+  // 41.6 The migration runs in one transaction; until it has, the generator creates nothing
+  const { runSeriesEndMigration: s41RunMigration, SERIES_END_MIGRATION_KEY: s41MigKey } = require("../routes/recurring");
+  const s41MigGroup = require("crypto").randomUUID();
+  const s41MigRow = await Transaction.create({ title: "Suite 41 Migration Probe", amount: 3, date: getTorontoOffsetDate(0), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s41MigGroup });
+  await Setting.destroy({ where: { key: s41MigKey } });
+  let s41MigErr = null;
+  try {
+    await s41RunMigration(async (dbTx) => {
+      await Transaction.update({ recurrence: "none" }, { where: { id: s41MigRow.id }, transaction: dbTx });
+      throw new Error("Suite 41 migration failure");
+    });
+  } catch (err) {
+    s41MigErr = err;
+  }
+  await s41Generate(null);
+  assert(
+    s41MigErr?.message === "Suite 41 migration failure" && (await Setting.findByPk(s41MigKey)) === null &&
+      (await Transaction.findByPk(s41MigRow.id)).recurrence === "weekly",
+    "A migration that throws rolls back its changes and leaves the flag unset"
+  );
+  assert((await Transaction.count({ where: { recurringGroupId: s41MigGroup } })) === 1, "Until the migration has run, the generator creates nothing");
+  const s41Trigger = await s33("POST", "/api/recurring/trigger-recurring");
+  assert(s41Trigger.status === 503 && s41Trigger.body.skipped === true, `The cron trigger reports the skip instead of success (got ${s41Trigger.status})`);
+  const s41MigCount = await s41RunMigration();
+  await s41Generate(null);
+  assert(
+    Array.isArray(s41MigCount) && (await Setting.findByPk(s41MigKey))?.value === "true" &&
+      (await Transaction.count({ where: { recurringGroupId: s41MigGroup } })) > 1,
+    `Once it has run, the flag is set and generation resumes (ended ${s41MigCount?.length})`
+  );
+  assert((await s41RunMigration()) === null, "The migration runs only once");
+
+  // 41.7 Restarting an ended series (a row set back to recurring) does not backfill
+  const { getPrimaryCheckingAccount: s41GetChecking, getCalculatedCheckingBalance: s41CheckingCalc } = require("../services/checkingService");
+  const s41CheckingBal = async () => s41CheckingCalc(await s41GetChecking(), getTorontoOffsetDate(0));
+  const s41FirstOnOrAfterToday = (fromDate, recurrence) => {
+    const anchor = Number(fromDate.split("-")[2]);
+    let step = 1;
+    let next = getNextOccurrenceDate(fromDate, recurrence, step, anchor);
+    while (next < getTorontoOffsetDate(0)) next = getNextOccurrenceDate(fromDate, recurrence, ++step, anchor);
+    return next;
+  };
+  // Monthly income stopped about two months ago, set back to monthly today
+  const s41PayGroup = require("crypto").randomUUID();
+  const s41PayChecking = await s41GetChecking();
+  const [, s41PayLast] = await Transaction.bulkCreate([
+    { title: "Suite 41 Side Pay", amount: 500, date: getTorontoOffsetDate(-100), type: "INCOME", category: "Income", isCleared: true, recurrence: "none", recurringGroupId: s41PayGroup, toAccountId: s41PayChecking.id },
+    { title: "Suite 41 Side Pay", amount: 500, date: getTorontoOffsetDate(-70), type: "INCOME", category: "Income", isCleared: true, recurrence: "none", recurringGroupId: s41PayGroup, toAccountId: s41PayChecking.id },
+  ]);
+  const s41PayBalBefore = await s41CheckingBal();
+  const s41PayPut = await s33("PUT", `/api/expenses/${s41PayLast.id}`, { recurrence: "monthly" });
+  const s41PayRows = await s41Rows(s41PayGroup);
+  const s41PayNext = s41FirstOnOrAfterToday(getTorontoOffsetDate(-70), "monthly");
+  assert(
+    s41PayPut.status === 200 && s41PayRows.length === 3 && s41PayRows[2].date === s41PayNext &&
+      !s41PayRows.some((r) => r.date > getTorontoOffsetDate(-70) && r.date < getTorontoOffsetDate(0)),
+    `A restarted monthly income series starts at ${s41PayNext}, with no missed months (got ${s41PayRows.map((r) => r.date).join(",")})`
+  );
+  assert(
+    s41PayRows.filter((r) => r.date < getTorontoOffsetDate(0)).length === 2 && (await s41CheckingBal()) === s41PayBalBefore,
+    "No past income is generated as received, and Checking is unchanged"
+  );
+  // Weekly expense stopped three weeks ago, set back to weekly: no overdue bills
+  const s41BillGroup = require("crypto").randomUUID();
+  const [, s41BillLast] = await Transaction.bulkCreate([
+    { title: "Suite 41 Cleaner", amount: 40, date: getTorontoOffsetDate(-30), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s41BillGroup },
+    { title: "Suite 41 Cleaner", amount: 40, date: getTorontoOffsetDate(-23), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s41BillGroup },
+  ]);
+  await s33("PUT", `/api/expenses/${s41BillLast.id}`, { recurrence: "weekly" });
+  const s41BillRows = await s41Rows(s41BillGroup);
+  assert(
+    s41BillRows[2]?.date === s41FirstOnOrAfterToday(getTorontoOffsetDate(-23), "weekly") &&
+      !s41BillRows.some((r) => !r.isCleared && r.date < getTorontoOffsetDate(0)),
+    `A restarted weekly expense series has no overdue backfill (got ${s41BillRows.map((r) => r.date).join(",")})`
+  );
+  // A One-time row set back to recurring while the series still runs is not a restart
+  await s33("PUT", `/api/expenses/${s41GymNewest.id}`, { recurrence: "weekly" });
+  assert(
+    (await Setting.findByPk(`recurring_restart_from:${s41GymGroup}`)) === null &&
+      (await Setting.findByPk(`recurring_restart_from:${s41BillGroup}`))?.value === getTorontoOffsetDate(0),
+    "Only a series with no recurring row left is marked as restarted"
+  );
+  await Setting.destroy({ where: { key: [`recurring_restart_from:${s41PayGroup}`, `recurring_restart_from:${s41BillGroup}`] } });
+
+  // Cleanup
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 41 %" } }, { fromAccountId: s41CardId }, { toAccountId: s41CardId }] }, force: true });
+  await Account.destroy({ where: { id: s41CardId } });
+
+  // --- Suite 42: End series for any recurring series ---
+  console.log("\n--- Suite 42: End series for any recurring series ---");
+  const { createRecurringExpenses: s42Generate } = require("../routes/recurring");
+  const { getPrimaryCheckingAccount: s42GetChecking, getCalculatedCheckingBalance: s42CheckingCalc } = require("../services/checkingService");
+  const s42Today = getTorontoOffsetDate(0);
+  const s42Rows = (where) => Transaction.findAll({ where, paranoid: false, order: [["date", "ASC"]] });
+  const s42Count = (where) => Transaction.count({ where });
+  const s42End = (id, body = {}) => s33("POST", `/api/recurring/${id}/end`, body);
+  const s42CheckingBal = async () => s42CheckingCalc(await s42GetChecking(), s42Today);
+
+  // 42.1 An income series (paycheque) ends: no more paycheques, Checking unchanged
+  const s42Pay = await s33("POST", "/api/paycheques", { name: "Suite 42 Paycheque", amount: 1000, payment_date: getTorontoOffsetDate(-14), recurrence: "bi-weekly" });
+  const s42PayGroup = (await Transaction.findByPk(s42Pay.body.id)).recurringGroupId;
+  const s42PayFuture = (await s42Rows({ recurringGroupId: s42PayGroup })).filter((r) => r.date > s42Today);
+  const s42BalBefore = await s42CheckingBal();
+  const s42PayEnd = await s42End(s42PayGroup);
+  await s42Generate(null, { todayStr: getTorontoOffsetDate(45) });
+  const s42PayAfter = await s42Rows({ recurringGroupId: s42PayGroup });
+  assert(
+    s42Pay.status === 201 && s42PayGroup && s42PayFuture.length > 0 && s42PayEnd.status === 200 &&
+      s42PayEnd.body.seriesEnded === true && s42PayEnd.body.removedUpcomingCount === s42PayFuture.length &&
+      s42PayEnd.body.removedUpcomingTotal === 1000 * s42PayFuture.length,
+    `Ending a paycheque series removes its ${s42PayFuture.length} upcoming paycheques (got ${JSON.stringify(s42PayEnd.body)})`
+  );
+  assert(
+    s42PayAfter.every((r) => r.recurrence === "none" && r.date <= s42Today) && (await s42CheckingBal()) === s42BalBefore,
+    `No more paycheques are generated and Checking is unchanged (got ${s42PayAfter.map((r) => r.date).join(",")})`
+  );
+
+  // 42.2 Transfer series: a goal contribution and a card payment
+  const s42Goal = await s33("POST", "/api/savings-goals", { name: "Suite 42 Fund", target_amount: 1000, current_amount: 0 });
+  const s42Card = await s33("POST", "/api/credit-cards", { name: "Suite 42 Card", creditLimit: 1000, currentBalance: 0 });
+  const s42GoalId = s42Goal.body.id;
+  const s42CardId = s42Card.body.id;
+  // A recurring goal contribution is a TRANSFER from Checking to the goal
+  const s42ContribGroup = require("crypto").randomUUID();
+  await Transaction.create({ title: "Suite 42 Weekly Saving", amount: 50, date: getTorontoOffsetDate(3), type: "TRANSFER", category: "Savings Transfer", isCleared: false, recurrence: "weekly", recurringGroupId: s42ContribGroup, fromAccountId: (await s42GetChecking()).id, toAccountId: s42GoalId });
+  await s42Generate(null);
+  const s42Contrib = { body: { recurringGroupId: s42ContribGroup } };
+  const s42CardPay = await s33("POST", "/api/expenses", { name: "Payment for Suite 42 Card", amount: 25, category: "Debt", targetAccountId: s42CardId, due_date: getTorontoOffsetDate(2), is_paid: false, recurrence: "weekly" });
+  const s42GoalCard = async () => ((await s33("GET", "/api/savings-goals")).body || []).find((g) => g.id === s42GoalId);
+  const s42GoalBefore = await s42GoalCard();
+  assert(
+    s42GoalBefore?.recurringContribution?.recurringGroupId === s42ContribGroup &&
+      s42GoalBefore.recurringContribution.amount === 50 && s42GoalBefore.recurringContribution.recurrence === "weekly",
+    `The goal lists its running contribution series ($50 weekly) (got ${JSON.stringify(s42GoalBefore?.recurringContribution)})`
+  );
+  for (const [label, created] of [["goal contribution", s42Contrib], ["card payment", s42CardPay]]) {
+    const groupId = created.body.recurringGroupId;
+    const before = await s42Rows({ recurringGroupId: groupId });
+    const ended = await s42End(groupId);
+    await s42Generate(null, { todayStr: getTorontoOffsetDate(30) });
+    const after = await s42Rows({ recurringGroupId: groupId });
+    assert(
+      before.length > 1 && before[0].type === "TRANSFER" && ended.status === 200 &&
+        ended.body.removedUpcomingCount === before.length && after.length === 0,
+      `Ending a ${label} series removes its ${before.length} upcoming transfers and nothing more is generated (got ${before[0]?.type}, ${JSON.stringify(ended.body)}, ${after.length} rows)`
+    );
+  }
+
+  assert((await s42GoalCard())?.recurringContribution === null, "Once ended, the goal no longer lists it");
+
+  // 42.3 A series whose current row is already One-time can still be ended
+  const s42OddGroup = require("crypto").randomUUID();
+  await Transaction.bulkCreate([
+    { title: "Suite 42 Odd Current", amount: 7, date: getTorontoOffsetDate(-7), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s42OddGroup },
+    { title: "Suite 42 Odd Current", amount: 7, date: s42Today, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s42OddGroup },
+    { title: "Suite 42 Odd Current", amount: 7, date: getTorontoOffsetDate(7), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "weekly", recurringGroupId: s42OddGroup },
+  ]);
+  // 42.4 The dry run reports and changes nothing
+  const s42Dry = await s42End(s42OddGroup, { dryRun: true });
+  const s42OddDry = await s42Rows({ recurringGroupId: s42OddGroup });
+  assert(
+    s42Dry.status === 200 && s42Dry.body.dryRun === true && s42Dry.body.seriesEnded === true &&
+      s42Dry.body.removedUpcomingCount === 1 && s42Dry.body.removedUpcomingTotal === 7 &&
+      s42OddDry.length === 3 && s42OddDry.filter((r) => r.recurrence === "weekly").length === 2,
+    `Dry run: removes 1 upcoming charge ($7.00) and changes nothing (got ${JSON.stringify(s42Dry.body)})`
+  );
+  const s42Odd = await s42End(s42OddGroup);
+  await s42Generate(null, { todayStr: getTorontoOffsetDate(14) });
+  const s42OddAfter = await s42Rows({ recurringGroupId: s42OddGroup });
+  assert(
+    s42Odd.status === 200 && s42OddAfter.length === 2 && s42OddAfter.every((r) => r.recurrence === "none" && r.date <= s42Today),
+    "A series whose current row is already One-time ends: past and paid rows stay, nothing more is generated"
+  );
+  assert((await s42End("not-a-uuid")).status === 400 && (await s42End(require("crypto").randomUUID())).status === 404, "A bad id is 400 and an unknown series is 404");
+
+  // 42.5 Subscriptions cancel still works, now through the shared path
+  const s42Sub = await s33("POST", "/api/expenses", { name: "Suite 42 Music", amount: 11, category: "Subscriptions", due_date: s42Today, is_paid: true, recurrence: "weekly" });
+  const s42SubGroup = s42Sub.body.recurringGroupId;
+  const s42SubUpcoming = (await s42Rows({ recurringGroupId: s42SubGroup })).filter((r) => r.date > s42Today).length;
+  const s42Cancel = await s33("POST", `/api/subscriptions/${s42SubGroup}/cancel`);
+  assert(
+    s42Cancel.status === 200 && s42Cancel.body.deletedRows === s42SubUpcoming && s42Cancel.body.cancelledRows === 1 &&
+      (await s42Rows({ recurringGroupId: s42SubGroup })).every((r) => r.recurrence === "none"),
+    `Cancelling a subscription removes its ${s42SubUpcoming} upcoming charges and stops the rest (got ${JSON.stringify(s42Cancel.body)})`
+  );
+
+  // 42.6 Restoring a trashed row of an ended series does not restart it
+  const s42Gym = await s33("POST", "/api/expenses", { name: "Suite 42 Gym", amount: 9, category: "Other", due_date: s42Today, is_paid: true, recurrence: "weekly" });
+  const s42GymGroup = s42Gym.body.recurringGroupId;
+  await s33("DELETE", `/api/expenses/${s42Gym.body.id}`);
+  await s42End(s42GymGroup);
+  const s42GymRestore = await s33("POST", "/api/expenses/restore", { ids: [s42Gym.body.id] });
+  await s42Generate(null, { todayStr: getTorontoOffsetDate(14) });
+  const s42GymAfter = await s42Rows({ recurringGroupId: s42GymGroup });
+  assert(
+    s42GymRestore.status === 200 && s42GymAfter.length === 1 && s42GymAfter[0].recurrence === "none",
+    `Restoring a Trash row of an ended series does not restart it (got ${s42GymAfter.length} rows)`
+  );
+
+  // 42.7 An older series without a group id ends when its current row is set to One-time (review R1)
+  const s42Legacy = await Transaction.bulkCreate([
+    { title: "Suite 42 Legacy Gym", amount: 5, date: getTorontoOffsetDate(-14), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
+    { title: "Suite 42 Legacy Gym", amount: 5, date: getTorontoOffsetDate(-7), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
+    { title: "Suite 42 Legacy Gym", amount: 5, date: s42Today, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
+  ]);
+  const s42LegacyPut = await s33("PUT", `/api/expenses/${s42Legacy[2].id}`, { recurrence: "none" });
+  await s42Generate(null, { todayStr: s42Today });
+  const s42LegacyAfter = await s42Rows({ title: "Suite 42 Legacy Gym" });
+  assert(
+    s42LegacyPut.body.seriesEnded === true && s42LegacyAfter.length === 3 && s42LegacyAfter.every((r) => r.recurrence === "none"),
+    `A series without a group id ends through its current row (got ${s42LegacyAfter.map((r) => `${r.date}:${r.recurrence}`).join(",")})`
+  );
+
+  // 42.8 The newest row moved earlier and set to One-time: its old date is not charged again
+  const s42Week = await s33("POST", "/api/expenses", { name: "Suite 42 Weekly Box", amount: 9, category: "Other", due_date: s42Today, is_paid: true, recurrence: "weekly" });
+  const s42WeekGroup = s42Week.body.recurringGroupId;
+  const s42WeekRows = await s42Rows({ recurringGroupId: s42WeekGroup });
+  const s42WeekNewest = s42WeekRows[s42WeekRows.length - 1];
+  const s42Moved = getTorontoOffsetDate(26);
+  const s42MovePut = await s33("PUT", `/api/expenses/${s42WeekNewest.id}`, { recurrence: "none", due_date: s42Moved });
+  await s42Generate(null, { todayStr: getTorontoOffsetDate(7) });
+  const s42WeekDates = (await s42Rows({ recurringGroupId: s42WeekGroup })).map((r) => r.date);
+  assert(
+    s42MovePut.status === 200 && s42WeekNewest.date === getTorontoOffsetDate(28) &&
+      !s42WeekDates.includes(getTorontoOffsetDate(28)) && s42WeekDates.includes(s42Moved) && s42WeekDates.includes(getTorontoOffsetDate(35)),
+    `Moving the newest row to ${s42Moved} as One-time leaves its old date empty, and the series continues a week later (got ${s42WeekDates.join(",")})`
+  );
+  const { getForecast: s42Forecast } = require("../services/forecastService");
+  const s42Fc = await s42Forecast(60);
+  assert(
+    !s42Fc.days.some((d) => d.date === getTorontoOffsetDate(28) && d.items.some((i) => i.title === "Suite 42 Weekly Box")),
+    "The forecast does not project the vacated date either"
+  );
+
+  // 42.9 Correcting a mistyped date (move away and back) drops no occurrence (review R2)
+  const s42Fix = await s33("POST", "/api/expenses", { name: "Suite 42 Weekly Fix", amount: 9, category: "Other", due_date: s42Today, is_paid: true, recurrence: "weekly" });
+  const s42FixGroup = s42Fix.body.recurringGroupId;
+  const s42FixRows = await s42Rows({ recurringGroupId: s42FixGroup });
+  const s42FixNewest = s42FixRows[s42FixRows.length - 1];
+  await s33("PUT", `/api/expenses/${s42FixNewest.id}`, { due_date: getTorontoOffsetDate(45) });
+  await s33("PUT", `/api/expenses/${s42FixNewest.id}`, { due_date: getTorontoOffsetDate(28) });
+  // A second row moved onto a future slot and back as well
+  await s33("PUT", `/api/expenses/${s42FixRows[3].id}`, { due_date: getTorontoOffsetDate(35) });
+  await s33("PUT", `/api/expenses/${s42FixRows[3].id}`, { due_date: getTorontoOffsetDate(21) });
+  await s42Generate(null, { todayStr: getTorontoOffsetDate(20) });
+  const s42FixDates = (await s42Rows({ recurringGroupId: s42FixGroup })).map((r) => r.date);
+  assert(
+    [21, 28, 35, 42, 49].every((d) => s42FixDates.includes(getTorontoOffsetDate(d))) &&
+      (await Setting.findByPk(`recurring_vacated:${s42FixGroup}`)) === null,
+    `Moving rows away and back leaves every weekly slot (got ${s42FixDates.join(",")})`
+  );
+
+  // 42.10 A plain one-off row is not a series: End series and Subscriptions cancel touch nothing
+  const s42Plain = await Transaction.bulkCreate([
+    { title: "Suite 42 Probe Rent", amount: 50, date: getTorontoOffsetDate(-3), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none" },
+    { title: "Suite 42 Probe Rent", amount: 50, date: getTorontoOffsetDate(10), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
+    { title: "Suite 42 Probe Rent", amount: 50, date: getTorontoOffsetDate(40), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
+  ]);
+  const s42PlainEnd = await s42End(s42Plain[0].id);
+  const s42PlainCancel = await s33("POST", `/api/subscriptions/${s42Plain[0].id}/cancel`);
+  assert(
+    s42PlainEnd.status === 404 && s42PlainCancel.status === 404 && (await s42Count({ title: "Suite 42 Probe Rent" })) === 3,
+    `Ending a plain one-off row is 404 and removes no same-titled bill (got ${s42PlainEnd.status}/${s42PlainCancel.status})`
+  );
+  // An older series without a group id keeps a one-off bill with the same title
+  await Transaction.bulkCreate([
+    { title: "Suite 42 Legacy Club", amount: 6, date: getTorontoOffsetDate(-7), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
+    { title: "Suite 42 Legacy Club", amount: 6, date: getTorontoOffsetDate(7), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "weekly" },
+  ]);
+  const s42LegacyOneOff = await Transaction.create({ title: "Suite 42 Legacy Club", amount: 60, date: getTorontoOffsetDate(12), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" });
+  const s42LegacyClubEnd = await s42End(s42LegacyOneOff.id);
+  assert(
+    s42LegacyClubEnd.status === 200 && s42LegacyClubEnd.body.removedUpcomingCount === 1 &&
+      (await Transaction.findByPk(s42LegacyOneOff.id)) !== null,
+    `Ending an older series removes its recurring upcoming row but keeps the one-off bill (got ${s42LegacyClubEnd.body.removedUpcomingCount})`
+  );
+
+  // 42.11 Ending a series that has already ended changes nothing and says so
+  const s42Done = await s33("POST", "/api/expenses", { name: "Suite 42 Done", amount: 4, category: "Other", due_date: s42Today, is_paid: true, recurrence: "weekly" });
+  const s42DoneGroup = s42Done.body.recurringGroupId;
+  await s42End(s42DoneGroup);
+  const s42DoneLater = await Transaction.create({ title: "Suite 42 Done", amount: 4, date: getTorontoOffsetDate(9), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none", recurringGroupId: s42DoneGroup });
+  const s42Again = await s42End(s42DoneGroup);
+  assert(
+    s42Again.status === 200 && s42Again.body.alreadyEnded === true && s42Again.body.seriesEnded === false &&
+      (await Transaction.findByPk(s42DoneLater.id)) !== null,
+    `Ending it again reports alreadyEnded and keeps its later One-time row (got ${JSON.stringify(s42Again.body)})`
+  );
+
+  // Cleanup
+  const s42AccountIds = [s42GoalId, s42CardId];
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 42 %" } }, { title: { [Op.like]: "%Suite 42 %" } }, { fromAccountId: s42AccountIds }, { toAccountId: s42AccountIds }] }, force: true });
+  await Account.destroy({ where: { id: s42AccountIds } });
+  await Setting.destroy({ where: { key: { [Op.like]: "recurring_%:%" } } });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

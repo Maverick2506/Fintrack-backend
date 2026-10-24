@@ -298,6 +298,12 @@ const schemas = {
     ids: z.array(z.string().uuid("Invalid transaction id")).min(1, "No transaction IDs provided.").max(500),
   }),
 
+  // POST /recurring/:recurringGroupId/end
+  endSeries: z
+    .object({ dryRun: z.boolean().optional() })
+    .optional()
+    .default({}),
+
   // PUT /expenses/:id?dryRun=1 previews the change (e.g. ending a series) and saves nothing
   dryRunQuery: z.object({
     dryRun: z.enum(["0", "1", "true", "false"]).optional(),

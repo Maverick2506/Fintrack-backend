@@ -167,15 +167,14 @@ const listTrash = async () => {
   }));
 };
 
-// The generator follows the newest live row of a series and steps forward from it, skipping dates
-// that already have a row (deleted ones included). A deleted occurrence after that newest live row
-// is what stops the generator from re-creating it, so it is kept until the series moves past it.
-const isSeriesPlaceholder = (trx, newestLiveByGroup) => {
+// The generator steps forward from the newest recurring live row of a series and only creates dates
+// after its newest live row, skipping dates that already have a row (deleted ones included). A deleted
+// occurrence after that newest live row is what stops the generator from re-creating it, so it is kept
+// until the series moves past it or ends.
+const isSeriesPlaceholder = (trx, liveByGroup) => {
   if (!trx.recurringGroupId) return false;
-  const newest = newestLiveByGroup.get(trx.recurringGroupId);
-  return Boolean(
-    newest && ACTIVE_RECURRENCES.includes(newest.recurrence) && newest.date < trx.date
-  );
+  const live = liveByGroup.get(trx.recurringGroupId);
+  return Boolean(live && live.recurring && live.newestDate < trx.date);
 };
 
 // Permanently removes rows deleted more than TRASH_RETENTION_DAYS before `now`. Returns the count.
@@ -190,7 +189,7 @@ const purgeDeletedTransactions = async ({ now = new Date(), dbTx = null } = {}) 
   if (expired.length === 0) return 0;
 
   const groupIds = [...new Set(expired.map((t) => t.recurringGroupId).filter(Boolean))];
-  const newestLiveByGroup = new Map();
+  const liveByGroup = new Map();
   if (groupIds.length > 0) {
     const live = await Transaction.findAll({
       where: { recurringGroupId: { [Op.in]: groupIds } },
@@ -202,14 +201,17 @@ const purgeDeletedTransactions = async ({ now = new Date(), dbTx = null } = {}) 
       transaction: dbTx,
     });
     for (const row of live) {
-      if (!newestLiveByGroup.has(row.recurringGroupId)) {
-        newestLiveByGroup.set(row.recurringGroupId, row);
+      if (!liveByGroup.has(row.recurringGroupId)) {
+        liveByGroup.set(row.recurringGroupId, { newestDate: row.date, recurring: false });
+      }
+      if (ACTIVE_RECURRENCES.includes(row.recurrence)) {
+        liveByGroup.get(row.recurringGroupId).recurring = true;
       }
     }
   }
 
   const purgeIds = expired
-    .filter((t) => !isSeriesPlaceholder(t, newestLiveByGroup))
+    .filter((t) => !isSeriesPlaceholder(t, liveByGroup))
     .map((t) => t.id);
   if (purgeIds.length === 0) return 0;
   return Transaction.destroy({

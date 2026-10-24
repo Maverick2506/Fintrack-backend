@@ -6,7 +6,13 @@ const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateQuery, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler, HttpError } = require("../middleware/errorHandler");
-const { createRecurringExpenses } = require("./recurring");
+const {
+  createRecurringExpenses,
+  markSeriesRestart,
+  markSeriesRowMoved,
+  ACTIVE_RECURRENCES,
+} = require("./recurring");
+const { endSeries, findSeriesRows, findCurrentOccurrence } = require("../services/seriesService");
 const { isClientRefConflict } = require("../services/clientRefService");
 const {
   snapshotArchivedBalances,
@@ -617,6 +623,10 @@ router.put(
       }
 
       const prevRecurrence = trx.recurrence;
+      const prevType = trx.type;
+      const prevTitle = trx.title;
+      const prevDate = trx.date;
+      const prevGroupId = trx.recurringGroupId;
       await trx.update(
         {
           title: nextTitle,
@@ -640,76 +650,59 @@ router.put(
         { transaction: dbTx }
       );
 
-      // Stopping a recurring series (B3): the generator follows the newest row of a series, which is
-      // usually an already-generated future row. When the *current* occurrence (the newest row dated
-      // today or earlier, or the first row if none has come due) is set to "none", the series ends:
-      // its unpaid rows after this one are removed and the rest marked non-recurring. Setting any
-      // other occurrence to "none" changes only that row; it keeps its series id so generation
-      // does not recreate it.
+      // One-time on a series row changes only that row (B3), except on the series' *current*
+      // occurrence (the newest row dated today or earlier, or the first row if none has come due)
+      // when that row was recurring: then the series ends through the shared path (endSeries), which
+      // removes its unpaid rows after today and stops every row, Trash included. A row that is
+      // already One-time can't end the series this way; POST /recurring/:id/end does.
       let seriesEnded = false;
       let removedUpcomingCount = 0;
       let removedUpcomingTotal = 0;
       const wasRecurring = prevRecurrence && prevRecurrence !== "none";
-      if (wasRecurring && nextRecurrence === "none" && nextRecurringGroupId) {
+      if (wasRecurring && nextRecurrence === "none") {
+        // An older series without a group id is grouped by its type and title before this edit
+        const series = nextRecurringGroupId
+          ? { recurringGroupId: nextRecurringGroupId }
+          : { type: prevType, title: prevTitle };
         const todayStr = getTodayString();
-        const currentOccurrence =
-          (await Transaction.findOne({
-            where: {
-              recurringGroupId: nextRecurringGroupId,
-              date: { [Op.lte]: todayStr },
-            },
-            order: [
-              ["date", "DESC"],
-              ["createdAt", "DESC"],
-            ],
-            transaction: dbTx,
-          })) ||
-          (await Transaction.findOne({
-            where: { recurringGroupId: nextRecurringGroupId },
-            order: [
-              ["date", "ASC"],
-              ["createdAt", "ASC"],
-            ],
-            transaction: dbTx,
-          }));
-
+        const currentOccurrence = findCurrentOccurrence(
+          await findSeriesRows(series, dbTx),
+          todayStr
+        );
         if (currentOccurrence && currentOccurrence.id === trx.id) {
-          seriesEnded = true;
-          const upcoming = await Transaction.findAll({
-            where: {
-              recurringGroupId: nextRecurringGroupId,
-              id: { [Op.ne]: trx.id },
-              isCleared: false,
-              date: { [Op.gt]: trx.date },
-            },
-            attributes: ["id", "amount"],
-            transaction: dbTx,
+          const ended = await endSeries(series, {
+            keepIds: [trx.id],
+            todayStr,
+            requireRecurring: false,
+            dbTx,
           });
-          removedUpcomingCount = upcoming.length;
-          removedUpcomingTotal =
-            Math.round(upcoming.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0) * 100) / 100;
-          // Generated upcoming rows are removed for good, not sent to the Trash: restoring one would
-          // restart the series it belonged to
-          if (upcoming.length > 0) {
-            await Transaction.destroy({
-              where: { id: { [Op.in]: upcoming.map((r) => r.id) } },
-              force: true,
-              transaction: dbTx,
-            });
-          }
-          // Rows of the series already in the Trash stop recurring too, so restoring one later
-          // does not bring the series back
-          await Transaction.update(
-            { recurrence: "none" },
-            {
-              where: {
-                recurringGroupId: nextRecurringGroupId,
-                id: { [Op.ne]: trx.id },
-              },
-              paranoid: false,
-              transaction: dbTx,
-            }
-          );
+          seriesEnded = true;
+          removedUpcomingCount = ended.removedUpcomingCount;
+          removedUpcomingTotal = ended.removedUpcomingTotal;
+        }
+      }
+
+      // A series row moved off its date keeps the slot it first held, so the generator does not fill
+      // it (the newest row moved earlier and set to One-time would be charged twice). Moving it back
+      // clears the slot (markSeriesRowMoved).
+      if (prevGroupId && prevDate !== trx.date) {
+        await markSeriesRowMoved(prevGroupId, trx.id, prevDate, trx.date, dbTx);
+      }
+
+      // Restarting an ended series (a row set back to recurring when no other row of its series still
+      // recurs): it generates from today on, with no backfill of the occurrences it missed
+      const isRecurringNow = nextRecurrence && nextRecurrence !== "none";
+      if (!wasRecurring && isRecurringNow && nextRecurringGroupId) {
+        const stillRecurring = await Transaction.count({
+          where: {
+            recurringGroupId: nextRecurringGroupId,
+            id: { [Op.ne]: trx.id },
+            recurrence: { [Op.in]: ACTIVE_RECURRENCES },
+          },
+          transaction: dbTx,
+        });
+        if (stillRecurring === 0) {
+          await markSeriesRestart(nextRecurringGroupId, getTodayString(), dbTx);
         }
       }
 

@@ -5,12 +5,11 @@ const {
   getTodayString,
 } = require("./accountBalanceService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
+const { endSeries, seriesOf } = require("./seriesService");
 const { HttpError } = require("../middleware/errorHandler");
 const {
   groupSeries,
   getNextOccurrenceDate,
-  getSeriesAnchorDay,
-  ACTIVE_RECURRENCES,
 } = require("../routes/recurring");
 
 const round2 = (n) => Math.round(n * 100) / 100;
@@ -60,15 +59,13 @@ const loadAccountCommitments = async (account, dbTx = null) => {
     }),
   ]);
 
-  const { latestOccurrences, seriesDates, seriesRows } = groupSeries(allRows);
-  const activeSeries = Object.keys(latestOccurrences)
-    .filter((key) => {
-      const latest = latestOccurrences[key];
-      return ACTIVE_RECURRENCES.includes(latest.recurrence) && isLinkedTo(latest, account.id);
-    })
+  // A series follows its newest recurring row (see getSeriesTemplate), so that row decides the account
+  const { seriesTemplates, seriesRows } = groupSeries(allRows);
+  const activeSeries = Object.keys(seriesTemplates)
+    .filter((key) => isLinkedTo(seriesTemplates[key].template, account.id))
     .map((key) => ({
-      latest: latestOccurrences[key],
-      dates: seriesDates[key],
+      latest: seriesTemplates[key].template,
+      anchorDay: seriesTemplates[key].anchorDay,
       rows: seriesRows[key],
     }));
 
@@ -150,10 +147,12 @@ const retireAccount = async (account, options, dbTx) => {
   }
 
   // 2. Recurring series: continue on Checking, or end so the generator never brings them back
-  for (const { latest, dates, rows } of activeSeries) {
+  const removedIds = new Set(unpaidRows.filter((r) => !movedIds.has(r.id)).map((r) => r.id));
+  for (const { latest, anchorDay, rows } of activeSeries) {
     if (moving && isMovableToChecking(latest, account.id)) {
-      if (movedIds.has(latest.id)) continue; // newest row is already on Checking
-      // The newest row is a paid one on this account: start the next occurrence on Checking
+      if (movedIds.has(latest.id)) continue; // newest recurring row is already on Checking
+      // The newest recurring row is a paid one on this account: start the next occurrence on
+      // Checking, after every row the series keeps (a One-time row included)
       const groupId = latest.recurringGroupId || latest.id;
       if (!latest.recurringGroupId) {
         await Transaction.update(
@@ -161,10 +160,11 @@ const retireAccount = async (account, options, dbTx) => {
           { where: { id: rows.map((r) => r.id) }, transaction: dbTx }
         );
       }
-      const anchorDay = getSeriesAnchorDay(dates);
+      const keptDates = rows.filter((r) => !removedIds.has(r.id)).map((r) => r.date);
+      const newestKept = keptDates.reduce((max, d) => (d > max ? d : max), latest.date);
       let step = 1;
       let nextDate = getNextOccurrenceDate(latest.date, latest.recurrence, step, anchorDay);
-      while (nextDate && nextDate < todayStr) {
+      while (nextDate && (nextDate < todayStr || nextDate <= newestKept)) {
         step++;
         nextDate = getNextOccurrenceDate(latest.date, latest.recurrence, step, anchorDay);
       }
@@ -192,19 +192,9 @@ const retireAccount = async (account, options, dbTx) => {
         { transaction: dbTx }
       );
     } else {
-      const remainingIds = rows.filter((r) => !unpaidRows.some((u) => u.id === r.id)).map((r) => r.id);
-      if (remainingIds.length > 0) {
-        await Transaction.update(
-          { recurrence: "none" },
-          {
-            where: {
-              id: remainingIds,
-              [Op.or]: [{ fromAccountId: account.id }, { toAccountId: account.id }],
-            },
-            transaction: dbTx,
-          }
-        );
-      }
+      // Ended through the shared path: every row stops recurring, Trash included, and any unpaid
+      // rows after today left on other accounts go too
+      await endSeries(seriesOf(latest), { todayStr, requireRecurring: false, dbTx });
     }
   }
 

@@ -3,7 +3,12 @@ const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
-const { getNextOccurrenceDate, getSeriesAnchorDay } = require("../routes/recurring");
+const {
+  getNextOccurrenceDate,
+  groupSeries,
+  getSeriesVacatedDates,
+  ACTIVE_RECURRENCES,
+} = require("../routes/recurring");
 const { usesArchivedAccount } = require("./accountArchiveService");
 const {
   DEBT_INTEREST_START_KEY,
@@ -56,8 +61,20 @@ const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, d
   });
   if (recent.length < 2) return null;
 
-  // A recurring series is already projected by step 3
+  // A recurring series is already projected by step 3, also when its newest paycheque was a One-time edit
   if (recent[0].recurrence && recent[0].recurrence !== "none") return null;
+  if (
+    recent[0].recurringGroupId &&
+    (await Transaction.count({
+      where: {
+        recurringGroupId: recent[0].recurringGroupId,
+        recurrence: { [Op.in]: ACTIVE_RECURRENCES },
+      },
+      transaction: dbTx,
+    })) > 0
+  ) {
+    return null;
+  }
 
   const gaps = [];
   for (let i = 0; i < recent.length - 1; i++) gaps.push(dayDiff(recent[i].date, recent[i + 1].date));
@@ -252,32 +269,21 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     transaction: dbTx,
   });
 
-  const latestSeriesMap = {};
-  const seriesDates = {};
-  for (const t of recurringTrxs) {
-    const key = t.recurringGroupId
-      ? `group:${t.recurringGroupId}`
-      : `${t.type}:${t.title.toLowerCase().trim()}`;
-    if (!latestSeriesMap[key]) {
-      latestSeriesMap[key] = t;
-      seriesDates[key] = [];
-    }
-    seriesDates[key].push(t.date);
-  }
+  // Each series projects from its newest recurring row, after its newest row of any kind (getSeriesTemplate)
+  const { seriesTemplates } = groupSeries(recurringTrxs);
+  const seriesVacated = await getSeriesVacatedDates(dbTx);
 
-  for (const key of Object.keys(latestSeriesMap)) {
-    const latest = latestSeriesMap[key];
-    if (!latest.recurrence || latest.recurrence === "none") continue;
+  for (const { template: latest, newestDate, anchorDay } of Object.values(seriesTemplates)) {
     if (usesArchivedAccount(latest)) continue;
+    const vacated = seriesVacated.get(latest.recurringGroupId);
 
-    const anchorDay = getSeriesAnchorDay(seriesDates[key]);
     let curDate = latest.date;
     while (true) {
       const nextDate = getNextOccurrenceDate(curDate, latest.recurrence, 1, anchorDay);
       if (!nextDate || nextDate > endDateStr) break;
       curDate = nextDate;
 
-      if (nextDate >= todayStr && daysMap[nextDate]) {
+      if (nextDate > newestDate && !vacated?.has(nextDate) && nextDate >= todayStr && daysMap[nextDate]) {
         // Skip if this occurrence already exists in database
         const existsInDb = dbTransactions.some((dbt) => {
           if (latest.recurringGroupId && dbt.recurringGroupId === latest.recurringGroupId) {
