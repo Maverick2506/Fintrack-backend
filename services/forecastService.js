@@ -6,7 +6,7 @@ const { getPrimaryCheckingAccount } = require("./checkingService");
 const {
   getNextOccurrenceDate,
   groupSeries,
-  getSeriesCoveredThrough,
+  getSeriesVacatedDates,
   ACTIVE_RECURRENCES,
 } = require("../routes/recurring");
 const { usesArchivedAccount } = require("./accountArchiveService");
@@ -271,12 +271,11 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
   // Each series projects from its newest recurring row, after its newest row of any kind (getSeriesTemplate)
   const { seriesTemplates } = groupSeries(recurringTrxs);
-  const seriesCovered = await getSeriesCoveredThrough(dbTx);
+  const seriesVacated = await getSeriesVacatedDates(dbTx);
 
   for (const { template: latest, newestDate, anchorDay } of Object.values(seriesTemplates)) {
     if (usesArchivedAccount(latest)) continue;
-    const coveredThrough = seriesCovered.get(latest.recurringGroupId);
-    const takenThrough = coveredThrough && coveredThrough > newestDate ? coveredThrough : newestDate;
+    const vacated = seriesVacated.get(latest.recurringGroupId);
 
     let curDate = latest.date;
     while (true) {
@@ -284,7 +283,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
       if (!nextDate || nextDate > endDateStr) break;
       curDate = nextDate;
 
-      if (nextDate > takenThrough && nextDate >= todayStr && daysMap[nextDate]) {
+      if (nextDate > newestDate && !vacated?.has(nextDate) && nextDate >= todayStr && daysMap[nextDate]) {
         // Skip if this occurrence already exists in database
         const existsInDb = dbTransactions.some((dbt) => {
           if (latest.recurringGroupId && dbt.recurringGroupId === latest.recurringGroupId) {

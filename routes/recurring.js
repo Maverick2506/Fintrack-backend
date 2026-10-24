@@ -8,7 +8,13 @@ const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
-const { endSeries, resolveSeries } = require("../services/seriesService");
+const {
+  endSeries,
+  resolveSeries,
+  ACTIVE_RECURRENCES,
+  SERIES_RESTART_PREFIX,
+  SERIES_VACATED_PREFIX,
+} = require("../services/seriesService");
 const router = express.Router();
 
 const TIMEZONE = "America/Toronto";
@@ -99,8 +105,6 @@ const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
   }
 };
 
-const ACTIVE_RECURRENCES = ["weekly", "bi-weekly", "monthly", "yearly"];
-
 // Set once the one-off series-end migration (runSeriesEndMigration) has committed. The generator
 // does not run before it: it would restart series that stopped under the old rule, with a backfill.
 const SERIES_END_MIGRATION_KEY = "series_end_explicit_v1";
@@ -108,24 +112,35 @@ const SERIES_END_MIGRATION_KEY = "series_end_explicit_v1";
 // A series restarted by setting one of its rows back to recurring (after it had ended) generates
 // only from the restart date, so missed occurrences are not backfilled as overdue bills or as
 // income already received. Stored per series as `${SERIES_RESTART_PREFIX}${recurringGroupId}`.
-const SERIES_RESTART_PREFIX = "recurring_restart_from:";
-
 const markSeriesRestart = (recurringGroupId, todayStr, dbTx = null) =>
   Setting.upsert(
     { key: `${SERIES_RESTART_PREFIX}${recurringGroupId}`, value: todayStr },
     { transaction: dbTx }
   );
 
-// The newest date a series row was moved away from, stored as `${SERIES_COVERED_PREFIX}${groupId}`.
-// That slot stays covered: moving the newest row earlier (e.g. Nov 21 to Nov 19, set to One-time)
-// must not let the generator charge Nov 21 again.
-const SERIES_COVERED_PREFIX = "recurring_covered_through:";
-
-const markSeriesCoveredThrough = async (recurringGroupId, dateStr, dbTx = null) => {
-  const key = `${SERIES_COVERED_PREFIX}${recurringGroupId}`;
+// The slot a moved series row left stays taken: moving the newest row earlier (Nov 21 to Nov 19,
+// set to One-time) must not let the generator charge Nov 21 again. Stored per series as
+// `${SERIES_VACATED_PREFIX}${groupId}` = JSON { rowId: the date that row first held }. Only the
+// exact original date is kept, and moving the row back onto it clears it, so correcting a mistyped
+// date never hides other occurrences. endSeries removes the Setting; otherwise it is one small row
+// per series with a moved row.
+const markSeriesRowMoved = async (recurringGroupId, rowId, fromDate, toDate, dbTx = null) => {
+  const key = `${SERIES_VACATED_PREFIX}${recurringGroupId}`;
   const existing = await Setting.findByPk(key, { transaction: dbTx });
-  if (existing && existing.value >= dateStr) return;
-  await Setting.upsert({ key, value: dateStr }, { transaction: dbTx });
+  let slots = {};
+  try {
+    slots = existing ? JSON.parse(existing.value) || {} : {};
+  } catch {
+    slots = {};
+  }
+  const original = slots[rowId] || fromDate;
+  if (toDate === original) delete slots[rowId];
+  else slots[rowId] = original;
+  if (Object.keys(slots).length === 0) {
+    if (existing) await existing.destroy({ transaction: dbTx });
+    return;
+  }
+  await Setting.upsert({ key, value: JSON.stringify(slots) }, { transaction: dbTx });
 };
 
 const getSettingsByPrefix = async (prefix, dbTx) => {
@@ -138,9 +153,20 @@ const getSettingsByPrefix = async (prefix, dbTx) => {
 
 const getSeriesRestarts = (dbTx) => getSettingsByPrefix(SERIES_RESTART_PREFIX, dbTx);
 
-// Per series: the newest date that is already taken, from its newest row of any recurrence and any
-// slot a moved row left (see markSeriesCoveredThrough). Only later dates are generated or projected.
-const getSeriesCoveredThrough = (dbTx) => getSettingsByPrefix(SERIES_COVERED_PREFIX, dbTx);
+// Per series: the set of slot dates moved rows left (see markSeriesRowMoved). The generator and the
+// forecast skip them.
+const getSeriesVacatedDates = async (dbTx) => {
+  const raw = await getSettingsByPrefix(SERIES_VACATED_PREFIX, dbTx);
+  const byGroup = new Map();
+  for (const [groupId, value] of raw) {
+    try {
+      byGroup.set(groupId, new Set(Object.values(JSON.parse(value) || {})));
+    } catch {
+      // A bad value skips nothing
+    }
+  }
+  return byGroup;
+};
 
 const latestOf = (...dates) =>
   dates.filter(Boolean).reduce((max, d) => (!max || d > max ? d : max), null);
@@ -223,11 +249,11 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
       console.warn(
         `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`
       );
-      return;
+      return { skipped: true };
     }
     const quickAddCatchupFrom = await getQuickAddCatchupFrom(todayStr, dbTx);
     const seriesRestarts = await getSeriesRestarts(dbTx);
-    const seriesCovered = await getSeriesCoveredThrough(dbTx);
+    const seriesVacated = await getSeriesVacatedDates(dbTx);
     
     // Horizon is 30 calendar days from today in America/Toronto
     const [tY, tM, tD] = todayStr.split("-").map(Number);
@@ -258,7 +284,7 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
       if (isSeriesAccountRetired(baseTrx, accountsById)) {
         continue;
       }
-      const takenThrough = latestOf(newestDate, seriesCovered.get(baseTrx.recurringGroupId));
+      const vacated = seriesVacated.get(baseTrx.recurringGroupId);
 
       const quickAddSkip =
         baseTrx.clientRef && baseTrx.date < quickAddCatchupFrom ? quickAddCatchupFrom : null;
@@ -277,7 +303,7 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
         if (!nextDateStr || nextDateStr > horizonString) {
           break;
         }
-        if ((skipBefore && nextDateStr < skipBefore) || nextDateStr <= takenThrough) {
+        if ((skipBefore && nextDateStr < skipBefore) || nextDateStr <= newestDate || vacated?.has(nextDateStr)) {
           step++;
           continue;
         }
@@ -441,7 +467,14 @@ const runSeriesEndMigration = async (migrate = endSeriesStoppedByNewestRow) => {
 };
 
 router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
-  await createRecurringExpenses();
+  const result = await createRecurringExpenses();
+  if (result?.skipped) {
+    // Not a success: the cron log should show that nothing was generated
+    return res.status(503).json({
+      skipped: true,
+      error: `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`,
+    });
+  }
   res.status(200).json({ message: "Advanced recurring job triggered successfully." });
 });
 
@@ -485,8 +518,8 @@ module.exports = {
   endSeriesStoppedByNewestRow,
   runSeriesEndMigration,
   markSeriesRestart,
-  markSeriesCoveredThrough,
-  getSeriesCoveredThrough,
+  markSeriesRowMoved,
+  getSeriesVacatedDates,
   SERIES_END_MIGRATION_KEY,
   ACTIVE_RECURRENCES,
   QUICK_ADD_CATCHUP_KEY,

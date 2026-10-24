@@ -194,7 +194,7 @@ const retireAccount = async (account, options, dbTx) => {
     } else {
       // Ended through the shared path: every row stops recurring, Trash included, and any unpaid
       // rows after today left on other accounts go too
-      await endSeries(seriesOf(latest), { todayStr, dbTx });
+      await endSeries(seriesOf(latest), { todayStr, requireRecurring: false, dbTx });
     }
   }
 

@@ -7,6 +7,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
+const { groupSeries, ACTIVE_RECURRENCES } = require("./recurring");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -47,6 +48,39 @@ router.get(
       for (const c of contributions) {
         contributionMap[c.toAccountId] =
           (contributionMap[c.toAccountId] || 0) + (parseFloat(c.amount) || 0);
+      }
+    }
+
+    // A running contribution series per goal (its newest recurring row), for "Recurring: $X every
+    // <cadence> · End" on the goal card. A goal with several picks the latest one.
+    const recurringByGoal = {};
+    if (goalIds.length > 0) {
+      const seriesRows = await Transaction.findAll({
+        where: {
+          toAccountId: { [Op.in]: goalIds },
+          [Op.or]: [
+            { recurrence: { [Op.in]: ACTIVE_RECURRENCES } },
+            { recurringGroupId: { [Op.ne]: null } },
+          ],
+        },
+        order: [
+          ["date", "DESC"],
+          ["createdAt", "DESC"],
+        ],
+      });
+      for (const { template } of Object.values(groupSeries(seriesRows).seriesTemplates)) {
+        const current = recurringByGoal[template.toAccountId];
+        if (current && current.date >= template.date) continue;
+        recurringByGoal[template.toAccountId] = {
+          date: template.date,
+          contribution: {
+            recurringGroupId: template.recurringGroupId || template.id,
+            title: template.title,
+            type: template.type.toLowerCase(),
+            amount: Math.round((parseFloat(template.amount) || 0) * 100) / 100,
+            recurrence: template.recurrence,
+          },
+        };
       }
     }
 
@@ -119,6 +153,7 @@ router.get(
         roomLeft,
         isOverContributed,
         roomReturnsNextYear,
+        recurringContribution: recurringByGoal[g.id]?.contribution || null,
       };
     });
     res.json(formatted);

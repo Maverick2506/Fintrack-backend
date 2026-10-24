@@ -9,7 +9,7 @@ const { asyncHandler, HttpError } = require("../middleware/errorHandler");
 const {
   createRecurringExpenses,
   markSeriesRestart,
-  markSeriesCoveredThrough,
+  markSeriesRowMoved,
   ACTIVE_RECURRENCES,
 } = require("./recurring");
 const { endSeries, findSeriesRows, findCurrentOccurrence } = require("../services/seriesService");
@@ -670,17 +670,23 @@ router.put(
           todayStr
         );
         if (currentOccurrence && currentOccurrence.id === trx.id) {
-          const ended = await endSeries(series, { keepIds: [trx.id], todayStr, dbTx });
+          const ended = await endSeries(series, {
+            keepIds: [trx.id],
+            todayStr,
+            requireRecurring: false,
+            dbTx,
+          });
           seriesEnded = true;
           removedUpcomingCount = ended.removedUpcomingCount;
           removedUpcomingTotal = ended.removedUpcomingTotal;
         }
       }
 
-      // A series row moved off its date keeps that date covered, so the generator does not fill the
-      // slot it left (e.g. the newest row moved earlier and set to One-time would be charged twice)
+      // A series row moved off its date keeps the slot it first held, so the generator does not fill
+      // it (the newest row moved earlier and set to One-time would be charged twice). Moving it back
+      // clears the slot (markSeriesRowMoved).
       if (prevGroupId && prevDate !== trx.date) {
-        await markSeriesCoveredThrough(prevGroupId, prevDate, dbTx);
+        await markSeriesRowMoved(prevGroupId, trx.id, prevDate, trx.date, dbTx);
       }
 
       // Restarting an ended series (a row set back to recurring when no other row of its series still
