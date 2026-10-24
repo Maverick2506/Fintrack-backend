@@ -781,19 +781,21 @@ router.post(
   validateBody(schemas.restoreExpenses),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
-    let restored;
+    let result;
     try {
-      restored = await restoreTransactions(req.body.ids, dbTx);
+      result = await restoreTransactions(req.body.ids, dbTx);
       await dbTx.commit();
     } catch (error) {
       await dbTx.rollback();
       throw error;
     }
+    const { restored, moved, refused } = result;
     // A restored row may be the newest of a series again (runs after commit, like every save)
     if (restored.some((t) => t.recurrence && t.recurrence !== "none")) {
       await generateAfterSave();
     }
-    res.json({ restoredCount: restored.length, ids: restored.map((t) => t.id) });
+    // moved: unpaid rows put on Checking because their account is archived; refused: left in the Trash
+    res.json({ restoredCount: restored.length, ids: restored.map((t) => t.id), moved, refused });
   })
 );
 

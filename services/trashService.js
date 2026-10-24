@@ -6,6 +6,8 @@ const {
   assertArchivedBalancesUnchanged,
 } = require("./accountArchiveService");
 const { ACTIVE_RECURRENCES } = require("../routes/recurring");
+const { getPrimaryCheckingAccount } = require("./checkingService");
+const { HttpError } = require("../middleware/errorHandler");
 
 // Trash (soft delete): a deleted transaction keeps its row with deletedAt set, so it can be restored.
 // Delete takes its balance off any card, debt or goal; restore puts exactly that back.
@@ -33,27 +35,86 @@ const softDeleteTransactions = async (rows, dbTx) => {
   });
 };
 
+// What restoring a Trash row does when it uses an archived card, debt or goal (batch 1 retired it):
+// - "restore": no archived account, or a paid row whose delete changed no balance (history only)
+// - "moveToChecking": an unpaid row; putting it back on the archived account would bring back a
+//   phantom bill, so it comes back on Primary Checking instead
+// - "refuse": a paid row whose restore would change the archived account's balance
+const archivedAccountOf = (trx) =>
+  trx.fromAccount?.isActive === false
+    ? trx.fromAccount
+    : trx.toAccount?.isActive === false
+    ? trx.toAccount
+    : null;
+
+const planRestore = (trx) => {
+  const archived = archivedAccountOf(trx);
+  if (!archived) return { action: "restore", archivedAccount: null };
+  if (!trx.isCleared) return { action: "moveToChecking", archivedAccount: archived.name };
+  if (trx.balanceReversedOnDelete) return { action: "refuse", archivedAccount: archived.name };
+  return { action: "restore", archivedAccount: archived.name };
+};
+
+const refusalMessage = (trx, accountName) =>
+  `"${trx.title}" can't be restored: ${accountName} is archived, and restoring this paid transaction would change its balance.`;
+
 // Restores deleted rows by id and re-applies the balance their delete took off. Must run inside dbTx.
-// Returns the restored rows. Restoring onto an archived account is refused (409) only when it would
-// change that account's balance, the same rule as delete.
+// Unpaid rows on an archived account come back on Primary Checking; paid rows that would change an
+// archived account's balance are left in the Trash. Throws 409 (naming the account) when nothing
+// could be restored because of that.
+// Returns { restored, moved: [{ id, title, archivedAccount }], refused: [{ id, title, archivedAccount, message }] }.
 const restoreTransactions = async (ids, dbTx) => {
   const rows = await Transaction.findAll({
     where: { id: { [Op.in]: ids }, deletedAt: { [Op.ne]: null } },
+    include: [
+      { model: Account, as: "fromAccount" },
+      { model: Account, as: "toAccount" },
+    ],
     paranoid: false,
     transaction: dbTx,
   });
+  const checking = await getPrimaryCheckingAccount(dbTx);
   const archivedBefore = await snapshotArchivedBalances(dbTx);
+  const restored = [];
+  const moved = [];
+  const refused = [];
   for (const trx of rows) {
+    const plan = planRestore(trx);
+    if (plan.action === "refuse") {
+      refused.push({
+        id: trx.id,
+        title: trx.title,
+        archivedAccount: plan.archivedAccount,
+        message: refusalMessage(trx, plan.archivedAccount),
+      });
+      continue;
+    }
     await trx.restore({ transaction: dbTx });
-    if (trx.balanceReversedOnDelete) {
+    if (plan.action === "moveToChecking") {
+      const changes = { recurrence: "none" }; // the archived account's series ended with it
+      if (trx.fromAccount?.isActive === false) changes.fromAccountId = checking.id;
+      if (trx.toAccount?.isActive === false) {
+        // A payment or contribution to the archived account becomes an ordinary Checking bill
+        changes.toAccountId = null;
+        changes.fromAccountId = checking.id;
+        if (trx.type === "TRANSFER") changes.type = "EXPENSE";
+      }
+      await trx.update(changes, { transaction: dbTx });
+      moved.push({ id: trx.id, title: trx.title, archivedAccount: plan.archivedAccount });
+    } else if (trx.balanceReversedOnDelete) {
       // forceApply: the row was applied before its delete, whatever its date
       await adjustAccountForTransaction(trx, 1, dbTx, true);
     }
     trx.balanceReversedOnDelete = false;
     await trx.save({ fields: ["balanceReversedOnDelete"], transaction: dbTx });
+    restored.push(trx);
   }
+  if (restored.length === 0 && refused.length > 0) {
+    throw new HttpError(409, refused.map((r) => r.message).join(" "), { refused });
+  }
+  // Safety net: nothing above should change an archived balance
   await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
-  return rows;
+  return { restored, moved, refused };
 };
 
 const purgeDateFor = (deletedAt) =>
@@ -91,6 +152,9 @@ const listTrash = async () => {
     toAccountArchived: t.toAccount?.isActive === false,
     deletedAt: t.deletedAt,
     purgeAfter: purgeDateFor(t.deletedAt),
+    // Set when the row uses an archived account: restoreAction says what Restore will do with it
+    archivedAccount: planRestore(t).archivedAccount,
+    restoreAction: planRestore(t).action,
   }));
 };
 
@@ -150,6 +214,7 @@ module.exports = {
   TRASH_RETENTION_DAYS,
   softDeleteTransactions,
   restoreTransactions,
+  planRestore,
   listTrash,
   purgeDeletedTransactions,
 };

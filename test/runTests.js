@@ -6205,16 +6205,74 @@ async function runTestSuite() {
   const s40Card2Id = s40Card2.body.id;
   const s40Charge = await s33("POST", "/api/expenses", { name: "Suite 40 Store Charge", amount: 20, category: "Shopping", creditCardId: s40Card2Id, due_date: s40Today, is_paid: true });
   const s40Pending = await s33("POST", "/api/expenses", { name: "Suite 40 Store Pending", amount: 7, category: "Shopping", creditCardId: s40Card2Id, due_date: getTorontoOffsetDate(-1), is_paid: false });
-  await s33("POST", "/api/expenses/bulk-delete", { ids: [s40Charge.body.id, s40Pending.body.id] });
+  const s40PendingPay = await s33("POST", "/api/expenses", { name: "Payment for Suite 40 Store Card", amount: 15, category: "Debt", targetAccountId: s40Card2Id, due_date: getTorontoOffsetDate(5), is_paid: false });
+  const s40Pending2 = await s33("POST", "/api/expenses", { name: "Suite 40 Store Pending Two", amount: 3, category: "Shopping", creditCardId: s40Card2Id, due_date: getTorontoOffsetDate(2), is_paid: false });
+  await s33("POST", "/api/expenses/bulk-delete", { ids: [s40Charge.body.id, s40Pending.body.id, s40PendingPay.body.id, s40Pending2.body.id] });
   const s40Archive = await s33("DELETE", `/api/credit-cards/${s40Card2Id}`, { mode: "archive", series: "end" });
   assert(s40Archive.status === 204 && (await s40Bal(s40Card2Id)) === 0, "Archives the store card at $0 after its charge was deleted");
+  const s40ArchTrash = await s40Trash();
+  const s40ArchCharge = s40ArchTrash.find((r) => r.id === s40Charge.body.id);
+  const s40ArchPending = s40ArchTrash.find((r) => r.id === s40Pending.body.id);
+  assert(
+    s40ArchCharge?.archivedAccount === "Suite 40 Store Card" && s40ArchCharge.restoreAction === "refuse" &&
+      s40ArchPending?.archivedAccount === "Suite 40 Store Card" && s40ArchPending.restoreAction === "moveToChecking",
+    "The Trash names the archived account and says what Restore will do (refuse a paid row, move an unpaid one to Checking)"
+  );
   const s40RestoreArchived = await s33("POST", "/api/expenses/restore", { ids: [s40Charge.body.id] });
   assert(
     s40RestoreArchived.status === 409 && (await s40Bal(s40Card2Id)) === 0 && (await Transaction.findByPk(s40Charge.body.id, { paranoid: false })).deletedAt,
-    `Restoring a charge onto the archived card is refused (409) and it stays in the Trash (got ${s40RestoreArchived.status})`
+    `Restoring a paid charge onto the archived card is refused (409) and it stays in the Trash (got ${s40RestoreArchived.status})`
   );
-  const s40RestoreNeutral = await s33("POST", "/api/expenses/restore", { ids: [s40Pending.body.id] });
-  assert(s40RestoreNeutral.status === 200 && s40RestoreNeutral.body.restoredCount === 1 && (await s40Bal(s40Card2Id)) === 0, "An unpaid row on the archived card can be restored: it changes no balance");
+  assert(
+    /Suite 40 Store Card is archived/.test(s40RestoreArchived.body.error || "") && s40RestoreArchived.body.error.includes("Suite 40 Store Charge"),
+    `The refusal names the row and the archived account (got "${s40RestoreArchived.body.error}")`
+  );
+  const s40Checking = await s40GetChecking();
+  const s40CheckingBefore = await s40CheckingBal();
+  const s40RestoreUnpaid = await s33("POST", "/api/expenses/restore", { ids: [s40Pending.body.id] });
+  const s40PendingRow = await Transaction.findByPk(s40Pending.body.id);
+  assert(
+    s40RestoreUnpaid.status === 200 && s40RestoreUnpaid.body.restoredCount === 1 &&
+      s40RestoreUnpaid.body.moved?.[0]?.archivedAccount === "Suite 40 Store Card" &&
+      s40PendingRow.fromAccountId === s40Checking.id && s40PendingRow.isCleared === false && (await s40Bal(s40Card2Id)) === 0,
+    "An unpaid charge on the archived card is restored onto Primary Checking, still unpaid, and says why"
+  );
+  assert((await s40CheckingBal()) === s40CheckingBefore, "Restoring the unpaid bill leaves Checking's balance alone until it is paid");
+  // A mixed Undo: the paid row is refused, the unpaid payment to the card becomes a Checking bill
+  const s40Mixed = await s33("POST", "/api/expenses/restore", { ids: [s40Charge.body.id, s40PendingPay.body.id] });
+  const s40PayRow = await Transaction.findByPk(s40PendingPay.body.id);
+  assert(
+    s40Mixed.status === 200 && s40Mixed.body.restoredCount === 1 && s40Mixed.body.refused?.[0]?.id === s40Charge.body.id &&
+      s40Mixed.body.refused[0].archivedAccount === "Suite 40 Store Card" &&
+      s40PayRow.toAccountId === null && s40PayRow.fromAccountId === s40Checking.id && s40PayRow.type === "EXPENSE",
+    `A mixed restore brings back what it can: the unpaid card payment returns as a Checking bill, the paid charge is listed as refused (got ${JSON.stringify(s40Mixed.body.refused)})`
+  );
+  assert((await s40Bal(s40Card2Id)) === 0, "The archived card's balance never changed");
+  const s40Upcoming = await s33("GET", "/api/dashboard");
+  assert(
+    !(s40Upcoming.body.creditCardSummary || []).some((c) => c.id === s40Card2Id) &&
+      (s40Upcoming.body.upcomingBills || []).every((b) => b.fromAccountId !== s40Card2Id),
+    "No bill shows on the archived card again"
+  );
+  const s40Pend2Restore = await s33("POST", "/api/expenses/restore", { ids: [s40Pending2.body.id] });
+  assert(s40Pend2Restore.body.moved?.length === 1 && (await Transaction.findByPk(s40Pending2.body.id)).fromAccountId === s40Checking.id, "Each unpaid row on the archived card is moved, one by one too");
+
+  // 40.7b Trash the newest row of a running series, restore it: the series continues with no duplicate date
+  const s40Series = await s33("POST", "/api/expenses", { name: "Suite 40 Weekly Class", amount: 9, category: "Other", due_date: s40Today, is_paid: true, recurrence: "weekly" });
+  const s40SGroup = s40Series.body.recurringGroupId;
+  const s40SRows = await Transaction.findAll({ where: { recurringGroupId: s40SGroup }, order: [["date", "ASC"]] });
+  const s40SNewest = s40SRows[s40SRows.length - 1];
+  await s33("DELETE", `/api/expenses/${s40SNewest.id}`);
+  await s40Generate();
+  const s40SRestore = await s33("POST", "/api/expenses/restore", { ids: [s40SNewest.id] });
+  await s40Generate({}.transaction, { todayStr: getTorontoOffsetDate(14) });
+  const s40SDates = (await Transaction.findAll({ where: { recurringGroupId: s40SGroup }, paranoid: false, order: [["date", "ASC"]] })).map((r) => r.date);
+  const s40SUnique = new Set(s40SDates);
+  assert(
+    s40SRestore.status === 200 && s40SDates.length === s40SUnique.size && s40SDates.includes(s40SNewest.date) &&
+      s40SDates[s40SDates.length - 1] === getTorontoOffsetDate(42) && (await s40Live({ recurringGroupId: s40SGroup })) === s40SDates.length,
+    `After restoring the newest row the series carries on from it with no duplicate date (got ${s40SDates.join(",")})`
+  );
 
   // 40.8 PUT ?dryRun=1 reports what ending a series would remove, and saves nothing (R4)
   const s40Rent = await s33("POST", "/api/expenses", { name: "Suite 40 Weekly Rent", amount: 12, category: "Essentials", due_date: s40Today, is_paid: true, recurrence: "weekly" });
