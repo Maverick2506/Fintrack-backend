@@ -411,7 +411,12 @@ router.put(
       await adjustAccountForTransaction(trx, -1, dbTx);
 
       let fromAccountId = trx.fromAccountId;
-      if (req.body.creditCardId !== undefined) {
+      // Interest and statement-sync rows are charged to a debt. The edit form only knows cards, so an
+      // empty card keeps the debt instead of moving the charge to Checking.
+      const fromDebt =
+        trx.fromAccountId &&
+        (await Account.findByPk(trx.fromAccountId, { transaction: dbTx }))?.type === "DEBT";
+      if (req.body.creditCardId !== undefined && !(fromDebt && !req.body.creditCardId)) {
         if (req.body.creditCardId) {
           fromAccountId = req.body.creditCardId;
         } else {

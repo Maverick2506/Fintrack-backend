@@ -1002,3 +1002,4 @@ BEHAVIOR GUIDELINES:
 
 module.exports = router;
 module.exports.getContextAccounts = getContextAccounts;
+module.exports.executeTool = executeTool;

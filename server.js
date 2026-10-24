@@ -26,6 +26,7 @@ const cron = require("node-cron");
 const { assertAuthConfiguration } = require("./config/auth");
 const { runDailySweep } = require("./services/dailySweepService");
 const { getPrimaryCheckingAccount } = require("./services/checkingService");
+const { backfillDebtDueDays } = require("./services/debtInterestService");
 const authRoutes = require("./routes/auth");
 const expenseRoutes = require("./routes/expenses");
 const debtRoutes = require("./routes/debts");
@@ -250,6 +251,13 @@ async function initialize() {
         }
         if (!accountTableDesc.roomYear) {
           await queryInterface.addColumn("Accounts", "roomYear", {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+          });
+        }
+        // Debt due-date anchor day (R3)
+        if (!accountTableDesc.dueDay) {
+          await queryInterface.addColumn("Accounts", "dueDay", {
             type: DataTypes.INTEGER,
             allowNull: true,
           });
@@ -635,6 +643,9 @@ async function initialize() {
           value: "true",
         });
       }
+
+      // One-off backfill (R3): store each debt's due day from its current due date
+      await backfillDebtDueDays(Account, Setting);
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
     }

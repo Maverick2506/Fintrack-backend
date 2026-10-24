@@ -1,8 +1,16 @@
 const { sequelize, Account, Transaction, Setting, NetWorthSnapshot } = require("../models");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
-const { getNextDueDate } = require("../routes/recurring");
 const { adjustAccountForTransaction } = require("./accountBalanceService");
+const {
+  DEBT_INTEREST_START_KEY,
+  computePeriodInterest,
+  getDebtAnchorDay,
+  getNextDebtDueDate,
+  interestClientRef,
+  interestTitle,
+  isDebtInterestEnabled,
+} = require("./debtInterestService");
 const { getBalancesSummary } = require("./netWorthService");
 
 const TIMEZONE = "America/Toronto";
@@ -21,7 +29,50 @@ const tryAcquireSweepLock = async (dbTx) => {
   return Boolean(rows[0] && rows[0].locked);
 };
 
-const runDailySweep = async () => {
+// First sweep date with interest (see DEBT_INTEREST_START_KEY)
+const getInterestStartDate = async (todayStr, dbTx) => {
+  const [setting] = await Setting.findOrCreate({
+    where: { key: DEBT_INTEREST_START_KEY },
+    defaults: { value: todayStr },
+    transaction: dbTx,
+  });
+  return setting.value;
+};
+
+// Records one cleared "Interest – <debt>" EXPENSE on the debt for this due date, once (R2).
+// Returns the interest charged, or 0 when there is none or it was already recorded.
+const recordDebtInterest = async (debt, dueDate, dbTx) => {
+  const amount = computePeriodInterest(
+    debt.initialBalance,
+    debt.interestRate,
+    debt.paymentFrequency || "monthly"
+  );
+  if (amount <= 0) return 0;
+  const clientRef = interestClientRef(debt.id, dueDate);
+  const existing = await Transaction.findOne({ where: { clientRef }, transaction: dbTx });
+  if (existing) return 0;
+  const row = await Transaction.create(
+    {
+      title: interestTitle(debt.name),
+      amount,
+      date: dueDate,
+      type: "EXPENSE",
+      category: "Interest",
+      isCleared: true,
+      balanceApplied: false,
+      fromAccountId: debt.id,
+      toAccountId: null,
+      clientRef,
+    },
+    { transaction: dbTx }
+  );
+  // forceApply: a due date the sweep catches up on is past-dated, but the interest is new
+  await adjustAccountForTransaction(row, 1, dbTx, true);
+  return amount;
+};
+
+// options.todayStr overrides "today" (America/Toronto) so tests can use fixed dates.
+const runDailySweep = async (options = {}) => {
   if (isLocalSweepRunning) {
     console.log("Daily sweep already executing in-process. Skipping.");
     return { skipped: true, reason: "in_process_lock" };
@@ -39,11 +90,55 @@ const runDailySweep = async () => {
 
     const nowUtc = new Date();
     const nowZoned = toZonedTime(nowUtc, TIMEZONE);
-    const todayString = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
+    const todayString =
+      options.todayStr || format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
 
     let clearedExpenseCount = 0;
     let clearedIncomeCount = 0;
     let autoPayCount = 0;
+    let interestCount = 0;
+
+    // 0. Debt interest on each due date, before any payment that day (R2). Debts only, not cards;
+    //    archived debts keep their balance. Auto-pay debts move to the next due date in step 3; other
+    //    debts move here, so interest comes back every period whether or not auto-pay is on.
+    const interestEnabled = await isDebtInterestEnabled(Setting, dbTx);
+    const interestStartDate = interestEnabled
+      ? await getInterestStartDate(todayString, dbTx)
+      : null;
+    const dueDebts = await Account.findAll({
+      where: {
+        type: "DEBT",
+        isActive: { [Op.ne]: false },
+        dueDate: { [Op.lte]: todayString },
+        initialBalance: { [Op.gt]: 0 },
+      },
+      transaction: dbTx,
+    });
+
+    for (const debt of dueDebts) {
+      const frequency = debt.paymentFrequency || "monthly";
+      const anchorDay = getDebtAnchorDay(debt);
+      const paidByAutoPay = Boolean(debt.autoPay) && (parseFloat(debt.minimumPayment) || 0) > 0;
+      let dueDate = debt.dueDate;
+      let guard = 0;
+      while (dueDate && dueDate <= todayString && guard++ < 600) {
+        if (interestEnabled && dueDate >= interestStartDate) {
+          if ((await recordDebtInterest(debt, dueDate, dbTx)) > 0) {
+            interestCount++;
+            await debt.reload({ transaction: dbTx });
+          }
+        }
+        // Step 3 pays this due date and moves it on
+        if (paidByAutoPay) break;
+        dueDate = getNextDebtDueDate(dueDate, frequency, anchorDay);
+      }
+      if (!paidByAutoPay && dueDate !== debt.dueDate) {
+        await Account.update(
+          { dueDate },
+          { where: { id: debt.id, dueDate: debt.dueDate }, transaction: dbTx }
+        );
+      }
+    }
 
     // 1. Process Due Pending Expenses & Transfers (Credit Card charges, Paydown bills, & Checking bills)
     const pendingBillsDue = await Transaction.findAll({
@@ -159,9 +254,10 @@ const runDailySweep = async () => {
         const newBal =
           Math.round(Math.max(0, remaining - paymentAmount) * 100) / 100;
 
-        const nextDueStr = getNextDueDate(
+        const nextDueStr = getNextDebtDueDate(
           debt.dueDate,
-          debt.paymentFrequency || "monthly"
+          debt.paymentFrequency || "monthly",
+          getDebtAnchorDay(debt)
         );
 
         const updatePayload = {};
@@ -228,6 +324,7 @@ const runDailySweep = async () => {
           clearedExpenses: clearedExpenseCount,
           clearedIncome: clearedIncomeCount,
           autoPayProcessed: autoPayCount,
+          interestRecorded: interestCount,
           date: todayString,
         }),
       },
@@ -273,6 +370,7 @@ const runDailySweep = async () => {
       clearedExpenses: clearedExpenseCount,
       clearedIncome: clearedIncomeCount,
       autoPayProcessed: autoPayCount,
+      interestRecorded: interestCount,
       date: todayString,
       netWorth: balances.netWorth,
     };

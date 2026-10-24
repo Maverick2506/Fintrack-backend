@@ -6,7 +6,11 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
+const { findMissedPayment } = require("../services/debtInterestService");
 const router = express.Router();
+
+// Day of month from a YYYY-MM-DD due date (R3)
+const dueDayOf = (dateStr) => (dateStr ? parseInt(String(dateStr).split("-")[2], 10) || null : null);
 router.param("id", validateIdParam);
 
 router.use("/debts", authMiddleware);
@@ -41,7 +45,29 @@ router.get(
       where: { type: "DEBT", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
-    res.json(debts.map(formatDebtResponse));
+    // Cleared rows paid to each debt, to flag a due date with no payment recorded
+    const payments = debts.length
+      ? await Transaction.findAll({
+          where: {
+            toAccountId: debts.map((d) => d.id),
+            isCleared: true,
+            type: { [Op.in]: ["TRANSFER", "EXPENSE"] },
+          },
+          attributes: ["toAccountId", "date", "category"],
+          raw: true,
+        })
+      : [];
+    const todayStr = getTodayString();
+    res.json(
+      debts.map((d) => ({
+        ...formatDebtResponse(d),
+        missed_payment_due_date: findMissedPayment(
+          d,
+          payments.filter((p) => p.toAccountId === d.id),
+          todayStr
+        ),
+      }))
+    );
   })
 );
 
@@ -74,6 +100,7 @@ router.post(
       targetAmount: total_amount,
       minimumPayment: monthly_payment || null,
       dueDate: next_due_date || null,
+      dueDay: dueDayOf(next_due_date),
       autoPay: Boolean(auto_pay),
       paymentFrequency: payment_frequency || "monthly",
       interestRate: parsedRate !== null && !isNaN(parsedRate) ? parsedRate : null,
@@ -208,6 +235,11 @@ router.put(
       dueDate:
         next_due_date !== undefined ? next_due_date || null : debt.dueDate,
     };
+
+    // A due date the user sets is the new anchor day
+    if (next_due_date !== undefined && (next_due_date || null) !== debt.dueDate) {
+      updates.dueDay = dueDayOf(next_due_date);
+    }
 
     if (
       total_remaining !== undefined &&

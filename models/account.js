@@ -37,6 +37,12 @@ const Account = sequelize.define(
       type: DataTypes.DATEONLY,
       allowNull: true,
     },
+    // Debts: day of month the payment is meant to fall on, so a 31st due date returns to the 31st
+    // after a short month (R3). Set from dueDate when the user sets it; the sweep never changes it.
+    dueDay: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
     minimumPayment: {
       type: DataTypes.DECIMAL(10, 2),
       allowNull: true,

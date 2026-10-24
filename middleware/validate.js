@@ -227,6 +227,20 @@ const schemas = {
     reason: z.enum(["written_off", "closed_by_bank", "spent"]),
   }),
 
+  // POST /accounts/:id/reconcile
+  reconcile: z.object({
+    actualBalance: z.coerce.number().finite(),
+    date: optionalDate,
+    reason: z.enum(["interest", "adjustment"]).optional().default("adjustment"),
+  }),
+
+  setDebtInterest: z.object({
+    enabled: z.union([
+      z.boolean(),
+      z.enum(["true", "false"]).transform((v) => v === "true"),
+    ]),
+  }),
+
   updateChecking: z.object({
     balance: z.coerce.number(),
   }),

@@ -44,10 +44,10 @@ const adjustAccountForTransaction = async (
     }
 
     let applied = false;
-    // 1. Cleared expense charged FROM a Credit Card
+    // 1. Cleared expense charged FROM a Credit Card, or interest/adjustment charged to a Debt
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
-      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+      if (fromAcc && (fromAcc.type === "CREDIT_CARD" || fromAcc.type === "DEBT")) {
         await Account.increment("initialBalance", {
           by: amount,
           where: { id: trx.fromAccountId },
@@ -80,11 +80,24 @@ const adjustAccountForTransaction = async (
 
     // 3. Cleared TRANSFER out of a Savings Goal (money moved back to checking).
     //    Only the archive, final-payment and adjust-to-$0 flows (accountArchiveService) create these rows.
+    //    A TRANSFER out of a card or debt to no account is a statement-sync Adjustment that raises
+    //    what is owed (reconcileService); it is not spending.
     if (trx.type === "TRANSFER" && trx.fromAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
       if (fromAcc && fromAcc.type === "SAVINGS_GOAL") {
         await Account.increment("initialBalance", {
           by: -amount,
+          where: { id: trx.fromAccountId },
+          transaction: dbTx,
+        });
+        applied = true;
+      } else if (
+        fromAcc &&
+        !trx.toAccountId &&
+        (fromAcc.type === "CREDIT_CARD" || fromAcc.type === "DEBT")
+      ) {
+        await Account.increment("initialBalance", {
+          by: amount,
           where: { id: trx.fromAccountId },
           transaction: dbTx,
         });
@@ -100,10 +113,10 @@ const adjustAccountForTransaction = async (
     // Only reverse if balance was actually applied!
     if (!trx.balanceApplied) return;
 
-    // 1. Reverse expense charged FROM a Credit Card
+    // 1. Reverse expense charged FROM a Credit Card or a Debt
     if (trx.type === "EXPENSE" && trx.fromAccountId && !trx.toAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
-      if (fromAcc && fromAcc.type === "CREDIT_CARD") {
+      if (fromAcc && (fromAcc.type === "CREDIT_CARD" || fromAcc.type === "DEBT")) {
         await Account.increment("initialBalance", {
           by: -amount,
           where: { id: trx.fromAccountId },
@@ -131,12 +144,22 @@ const adjustAccountForTransaction = async (
       }
     }
 
-    // 3. Reverse TRANSFER out of a Savings Goal
+    // 3. Reverse TRANSFER out of a Savings Goal, or a statement-sync Adjustment up on a card or debt
     if (trx.type === "TRANSFER" && trx.fromAccountId) {
       const fromAcc = await Account.findByPk(trx.fromAccountId, { transaction: dbTx });
       if (fromAcc && fromAcc.type === "SAVINGS_GOAL") {
         await Account.increment("initialBalance", {
           by: amount,
+          where: { id: trx.fromAccountId },
+          transaction: dbTx,
+        });
+      } else if (
+        fromAcc &&
+        !trx.toAccountId &&
+        (fromAcc.type === "CREDIT_CARD" || fromAcc.type === "DEBT")
+      ) {
+        await Account.increment("initialBalance", {
+          by: -amount,
           where: { id: trx.fromAccountId },
           transaction: dbTx,
         });

@@ -3,6 +3,10 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { Setting } = require("../models");
+const {
+  DEBT_INTEREST_SETTING_KEY,
+  isDebtInterestEnabled,
+} = require("../services/debtInterestService");
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -47,6 +51,24 @@ router.put(
       key: "forecast_estimate_income",
       value: String(enabled),
     });
+    res.json({ enabled });
+  })
+);
+
+// Debt interest (R2): the daily sweep records interest on each debt's due date while this is on
+router.get(
+  "/debt-interest",
+  asyncHandler(async (req, res) => {
+    res.json({ enabled: await isDebtInterestEnabled(Setting) });
+  })
+);
+
+router.put(
+  "/debt-interest",
+  validateBody(schemas.setDebtInterest),
+  asyncHandler(async (req, res) => {
+    const enabled = Boolean(req.body.enabled);
+    await Setting.upsert({ key: DEBT_INTEREST_SETTING_KEY, value: String(enabled) });
     res.json({ enabled });
   })
 );
