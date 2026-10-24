@@ -6657,12 +6657,15 @@ async function runTestSuite() {
     `Restoring a Trash row of an ended series does not restart it (got ${s42GymAfter.length} rows)`
   );
 
-  // 42.7 An older series without a group id ends when its current row is set to One-time (review R1)
+  // 42.7 An older series (saved without a group id, given one at boot by legacy_series_ids_v1) ends
+  // when its current row is set to One-time (review R1)
+  const { assignLegacySeriesIds: s42AssignLegacy } = require("../routes/recurring");
   const s42Legacy = await Transaction.bulkCreate([
     { title: "Suite 42 Legacy Gym", amount: 5, date: getTorontoOffsetDate(-14), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
     { title: "Suite 42 Legacy Gym", amount: 5, date: getTorontoOffsetDate(-7), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
     { title: "Suite 42 Legacy Gym", amount: 5, date: s42Today, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
   ]);
+  await s42AssignLegacy();
   const s42LegacyPut = await s33("PUT", `/api/expenses/${s42Legacy[2].id}`, { recurrence: "none" });
   await s42Generate(null, { todayStr: s42Today });
   const s42LegacyAfter = await s42Rows({ title: "Suite 42 Legacy Gym" });
@@ -6722,17 +6725,15 @@ async function runTestSuite() {
     s42PlainEnd.status === 404 && s42PlainCancel.status === 404 && (await s42Count({ title: "Suite 42 Probe Rent" })) === 3,
     `Ending a plain one-off row is 404 and removes no same-titled bill (got ${s42PlainEnd.status}/${s42PlainCancel.status})`
   );
-  // An older series without a group id keeps a one-off bill with the same title
-  await Transaction.bulkCreate([
-    { title: "Suite 42 Legacy Club", amount: 6, date: getTorontoOffsetDate(-7), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly" },
-    { title: "Suite 42 Legacy Club", amount: 6, date: getTorontoOffsetDate(7), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "weekly" },
-  ]);
-  const s42LegacyOneOff = await Transaction.create({ title: "Suite 42 Legacy Club", amount: 60, date: getTorontoOffsetDate(12), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" });
-  const s42LegacyClubEnd = await s42End(s42LegacyOneOff.id);
+  // A one-off row without a group id is a single row, even next to a same-titled series that has one
+  const s42Club = await s33("POST", "/api/expenses", { name: "Suite 42 Club", amount: 6, category: "Other", due_date: getTorontoOffsetDate(-7), is_paid: true, recurrence: "weekly" });
+  const s42ClubOneOff = await Transaction.create({ title: "Suite 42 Club", amount: 60, date: getTorontoOffsetDate(12), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" });
+  const s42ClubOneOffEnd = await s42End(s42ClubOneOff.id);
+  const s42ClubEnd = await s42End(s42Club.body.recurringGroupId);
   assert(
-    s42LegacyClubEnd.status === 200 && s42LegacyClubEnd.body.removedUpcomingCount === 1 &&
-      (await Transaction.findByPk(s42LegacyOneOff.id)) !== null,
-    `Ending an older series removes its recurring upcoming row but keeps the one-off bill (got ${s42LegacyClubEnd.body.removedUpcomingCount})`
+    s42ClubOneOffEnd.status === 404 && s42ClubEnd.status === 200 && s42ClubEnd.body.removedUpcomingCount >= 1 &&
+      (await Transaction.findByPk(s42ClubOneOff.id)) !== null,
+    `Ending the series keeps the same-titled one-off bill, which is not part of it (got ${s42ClubOneOffEnd.status}, ${s42ClubEnd.body.removedUpcomingCount})`
   );
 
   // 42.11 Ending a series that has already ended changes nothing and says so
@@ -6751,6 +6752,148 @@ async function runTestSuite() {
   const s42AccountIds = [s42GoalId, s42CardId];
   await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 42 %" } }, { title: { [Op.like]: "%Suite 42 %" } }, { fromAccountId: s42AccountIds }, { toAccountId: s42AccountIds }] }, force: true });
   await Account.destroy({ where: { id: s42AccountIds } });
+  await Setting.destroy({ where: { key: { [Op.like]: "recurring_%:%" } } });
+
+  // --- Suite 43: Older series (no group id) get a series id at boot ---
+  console.log("\n--- Suite 43: Older series (no group id) get a series id at boot ---");
+  const {
+    createRecurringExpenses: s43Generate,
+    runLegacySeriesIdMigration: s43RunMigration,
+    LEGACY_SERIES_IDS_KEY: s43MigKey,
+    getNextOccurrenceDate: s43Next,
+    getSeriesAnchorDay: s43Anchor,
+  } = require("../routes/recurring");
+  const s43Rows = (where) => Transaction.findAll({ where, paranoid: false, order: [["date", "ASC"], ["createdAt", "ASC"]] });
+  const s43Today = getTorontoOffsetDate(0);
+
+  // Older data, saved before every recurring row had a group id (bulkCreate skips the model hook).
+  // A monthly bill: two paid rows, a deleted one in the Trash, and its upcoming row
+  const s43Base = getTorontoOffsetDate(-10);
+  const s43Prev = s43Next(s43Base, "monthly", -1);
+  const s43PrevPrev = s43Next(s43Base, "monthly", -2);
+  const s43AnchorDay = s43Anchor([s43Base, s43Prev, s43PrevPrev]);
+  const s43Slot1 = s43Next(s43Base, "monthly", 1, s43AnchorDay);
+  const s43Slot2 = s43Next(s43Base, "monthly", 2, s43AnchorDay);
+  const s43Rent = await Transaction.bulkCreate([
+    { title: "Suite 43 Old Rent", amount: 900, date: s43PrevPrev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", deletedAt: new Date() },
+    { title: "Suite 43 Old Rent", amount: 900, date: s43Prev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly" },
+    { title: "suite 43 old rent ", amount: 900, date: s43Base, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly" },
+    { title: "Suite 43 Old Rent", amount: 900, date: s43Slot1, type: "EXPENSE", category: "Essentials", isCleared: false, recurrence: "monthly" },
+  ]);
+  // A same-titled row on the same date as one of the series' rows (an old duplicate)
+  const s43RentDup = await Transaction.bulkCreate([
+    { title: "Suite 43 Old Rent", amount: 50, date: s43Prev, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "none" },
+  ]);
+  // Rows that never recurred: same title among themselves, and an income with the rent's title
+  const s43Dentist = await Transaction.bulkCreate([
+    { title: "Suite 43 Dentist", amount: 120, date: getTorontoOffsetDate(-90), type: "EXPENSE", category: "Health", isCleared: true, recurrence: "none" },
+    { title: "Suite 43 Dentist", amount: 120, date: getTorontoOffsetDate(-30), type: "EXPENSE", category: "Health", isCleared: true, recurrence: "none" },
+    { title: "Suite 43 Old Rent", amount: 900, date: getTorontoOffsetDate(-5), type: "INCOME", category: "Income", isCleared: true, recurrence: "none" },
+  ]);
+  // A running series that already has an id, to show the generator waits
+  const s43ProbeGroup = require("crypto").randomUUID();
+  await Transaction.create({ title: "Suite 43 Probe", amount: 3, date: s43Today, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s43ProbeGroup });
+
+  // 43.1 Until the migration has run, the generator creates nothing and the cron trigger says why
+  await Setting.destroy({ where: { key: s43MigKey } });
+  const s43Skipped = await s43Generate(null, { todayStr: s43Today });
+  const s43Trigger = await s33("POST", "/api/recurring/trigger-recurring");
+  assert(
+    s43Skipped?.skipped === true && s43Skipped.pending.includes(s43MigKey) &&
+      (await Transaction.count({ where: { recurringGroupId: s43ProbeGroup } })) === 1,
+    `The generator is blocked until ${s43MigKey} is set (got ${JSON.stringify(s43Skipped)})`
+  );
+  assert(
+    s43Trigger.status === 503 && String(s43Trigger.body.error).includes(s43MigKey),
+    `The cron trigger reports the pending migration (got ${s43Trigger.status} ${s43Trigger.body.error})`
+  );
+
+  // 43.2 A migration that throws rolls back and leaves the flag unset
+  let s43Err = null;
+  try {
+    await s43RunMigration(async (dbTx) => {
+      await Transaction.update({ recurringGroupId: s43ProbeGroup }, { where: { id: s43Rent[1].id }, transaction: dbTx });
+      throw new Error("Suite 43 migration failure");
+    });
+  } catch (err) {
+    s43Err = err;
+  }
+  assert(
+    s43Err?.message === "Suite 43 migration failure" && (await Setting.findByPk(s43MigKey)) === null &&
+      (await Transaction.findByPk(s43Rent[1].id)).recurringGroupId === null,
+    "A failed series-id migration changes nothing"
+  );
+
+  // 43.3 The migration: one id across the old series' rows (Trash and title case/spaces included)
+  const s43Result = await s43RunMigration();
+  const s43RentAfter = await s43Rows({ id: s43Rent.map((r) => r.id) });
+  const s43RentGroup = s43RentAfter[0].recurringGroupId;
+  assert(
+    s43Result && s43Result.seriesCount >= 1 && s43RentGroup &&
+      s43RentAfter.length === 4 && s43RentAfter.every((r) => r.recurringGroupId === s43RentGroup) &&
+      (await Setting.findByPk(s43MigKey))?.value === "true",
+    `An old monthly series gets one id on all of its rows, Trash included (got ${s43RentAfter.map((r) => r.recurringGroupId).join(",")})`
+  );
+  assert(
+    (await Transaction.findByPk(s43RentDup[0].id)).recurringGroupId === null && s43Result.leftOutCount >= 1,
+    "A same-date duplicate stays a single row (the unique index allows one row per series and date)"
+  );
+  const s43DentistAfter = await s43Rows({ id: s43Dentist.map((r) => r.id) });
+  assert(
+    s43DentistAfter.every((r) => r.recurringGroupId === null),
+    "Rows that never recurred are left alone, even an income with a series' title"
+  );
+
+  // 43.4 The migration runs only once
+  assert((await s43RunMigration()) === null, "The series-id migration runs only once");
+  await s43Generate(null, { todayStr: s43Today });
+  assert(
+    (await Transaction.count({ where: { recurringGroupId: s43ProbeGroup } })) > 1 &&
+      (await Transaction.count({ where: { title: "Suite 43 Dentist" } })) === 2,
+    "Once it has run, generation resumes, and the one-off rows generate nothing"
+  );
+
+  // 43.5 The old series' newest row moved earlier and set to One-time: its old date is not charged twice
+  const s43Day = (dateStr) => Math.round((Date.parse(dateStr) - Date.parse(s43Today)) / 86400000);
+  const s43Moved = getTorontoOffsetDate(s43Day(s43Slot1) - 6);
+  const s43MovePut = await s33("PUT", `/api/expenses/${s43Rent[3].id}`, { recurrence: "none", due_date: s43Moved });
+  await s43Generate(null, { todayStr: getTorontoOffsetDate(10) });
+  const s43AfterMove = await s43Rows({ recurringGroupId: s43RentGroup });
+  assert(
+    s43MovePut.status === 200 && s43MovePut.body.seriesEnded === false && !s43AfterMove.some((r) => r.date === s43Slot1) &&
+      s43AfterMove.length === 4,
+    `No duplicate on ${s43Slot1} after the newest row moved to ${s43Moved} (got ${s43AfterMove.map((r) => `${r.date}:${r.recurrence}`).join(",")})`
+  );
+  await s43Generate(null, { todayStr: getTorontoOffsetDate(s43Day(s43Slot2) - 5) });
+  const s43Later = await s43Rows({ recurringGroupId: s43RentGroup });
+  assert(
+    s43Later.filter((r) => r.date === s43Slot2).length === 1 && !s43Later.some((r) => r.date === s43Slot1),
+    `The series continues on ${s43Slot2} (got ${s43Later.map((r) => r.date).join(",")})`
+  );
+
+  // 43.6 A row saved as recurring without an id always gets one
+  const s43Pay = await s33("POST", "/api/paycheques", { name: "Suite 43 Side Pay", amount: 100, payment_date: getTorontoOffsetDate(5), recurrence: "monthly" });
+  assert(s43Pay.status === 201 && Boolean(s43Pay.body.recurringGroupId), `A recurring paycheque gets a series id (got ${s43Pay.body.recurringGroupId})`);
+  const [s43Single] = await Transaction.bulkCreate([
+    { title: "Suite 43 Single", amount: 8, date: getTorontoOffsetDate(2), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "none" },
+  ]);
+  const s43SinglePut = await s33("PUT", `/api/expenses/${s43Single.id}`, { recurrence: "monthly", recurringGroupId: null });
+  assert(
+    s43SinglePut.status === 200 && Boolean((await Transaction.findByPk(s43Single.id)).recurringGroupId),
+    "Editing a row to a recurrence gives it a series id, even when the request clears it"
+  );
+  const s43Direct = await Transaction.create({ title: "Suite 43 Direct", amount: 1, date: getTorontoOffsetDate(3), type: "EXPENSE", category: "Other", isCleared: false, recurrence: "weekly" });
+  const s43DirectRow = await Transaction.findByPk(s43Direct.id);
+  await s43DirectRow.update({ recurrence: "none" });
+  const s43Reload = await Transaction.findByPk(s43Direct.id);
+  await s43Reload.update({ recurringGroupId: null, recurrence: "yearly" });
+  assert(
+    Boolean(s43Direct.recurringGroupId) && Boolean((await Transaction.findByPk(s43Direct.id)).recurringGroupId),
+    "Creating or updating a recurring row through the model fills in the series id"
+  );
+
+  // Cleanup
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 43 %" } }, { title: "suite 43 old rent " }] }, force: true });
   await Setting.destroy({ where: { key: { [Op.like]: "recurring_%:%" } } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");

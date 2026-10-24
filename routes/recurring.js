@@ -109,6 +109,26 @@ const getQuickAddCatchupFrom = async (todayStr, dbTx) => {
 // does not run before it: it would restart series that stopped under the old rule, with a backfill.
 const SERIES_END_MIGRATION_KEY = "series_end_explicit_v1";
 
+// Set once runLegacySeriesIdMigration has committed. It runs before the series-end migration, and the
+// generator waits for both: until then older series are still grouped by title and could be charged twice.
+const LEGACY_SERIES_IDS_KEY = "legacy_series_ids_v1";
+const GENERATOR_MIGRATION_KEYS = [LEGACY_SERIES_IDS_KEY, SERIES_END_MIGRATION_KEY];
+
+// The one-off migrations the generator still waits for (empty once both have run)
+const getPendingMigrations = async (dbTx = null) => {
+  const done = await Setting.findAll({
+    where: { key: GENERATOR_MIGRATION_KEYS, value: "true" },
+    transaction: dbTx,
+  });
+  const doneKeys = new Set(done.map((s) => s.key));
+  return GENERATOR_MIGRATION_KEYS.filter((key) => !doneKeys.has(key));
+};
+
+const skippedMessage = (pending) =>
+  `Recurring job skipped: the one-off migration${pending.length > 1 ? "s" : ""} (${pending.join(", ")}) ${
+    pending.length > 1 ? "have" : "has"
+  } not completed.`;
+
 // A series restarted by setting one of its rows back to recurring (after it had ended) generates
 // only from the restart date, so missed occurrences are not backfilled as overdue bills or as
 // income already received. Stored per series as `${SERIES_RESTART_PREFIX}${recurringGroupId}`.
@@ -171,11 +191,11 @@ const getSeriesVacatedDates = async (dbTx) => {
 const latestOf = (...dates) =>
   dates.filter(Boolean).reduce((max, d) => (!max || d > max ? d : max), null);
 
-// Groups rows (newest first) into series, keyed by recurringGroupId or by type and title for older rows.
+// Groups rows (newest first) into series by recurringGroupId. A row without one is a single row, not a
+// series: every recurring row gets an id when saved (models/transaction.js), and older series got
+// theirs from the legacy_series_ids_v1 migration (assignLegacySeriesIds).
 const getSeriesKey = (trx) =>
-  trx.recurringGroupId
-    ? `series:${trx.recurringGroupId}`
-    : `${trx.type}:${trx.title.toLowerCase().trim()}`;
+  trx.recurringGroupId ? `series:${trx.recurringGroupId}` : `row:${trx.id}`;
 
 // What a series generates from, given its rows newest first. The template is the newest row that
 // still recurs: a row set to One-time changes only itself, so it never stops the series (B3). Ending a
@@ -244,12 +264,10 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
     const todayStr =
       options.todayStr ||
       format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", { timeZone: TIMEZONE });
-    const migrated = await Setting.findByPk(SERIES_END_MIGRATION_KEY, { transaction: dbTx });
-    if (!migrated || migrated.value !== "true") {
-      console.warn(
-        `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`
-      );
-      return { skipped: true };
+    const pending = await getPendingMigrations(dbTx);
+    if (pending.length > 0) {
+      console.warn(skippedMessage(pending));
+      return { skipped: true, pending };
     }
     const quickAddCatchupFrom = await getQuickAddCatchupFrom(todayStr, dbTx);
     const seriesRestarts = await getSeriesRestarts(dbTx);
@@ -308,16 +326,13 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
           continue;
         }
 
-        // When recurringGroupId is present, match strictly by recurringGroupId to avoid colliding distinct series with identical names
-        const duplicateCondition = baseTrx.recurringGroupId
-          ? { recurringGroupId: baseTrx.recurringGroupId }
-          : { type: baseTrx.type, title: baseTrx.title };
-
+        // Match strictly by series id, so distinct series with identical names never collide. A
+        // recurring row saved without one becomes a series under its own id below.
         // A deleted occurrence (in the Trash) counts as taken: deleting a row must not bring it back
         const existing = await Transaction.findOne({
           where: {
             date: nextDateStr,
-            ...duplicateCondition,
+            recurringGroupId: baseTrx.recurringGroupId || baseTrx.id,
           },
           paranoid: false,
           transaction: dbTx,
@@ -466,14 +481,72 @@ const runSeriesEndMigration = async (migrate = endSeriesStoppedByNewestRow) => {
   });
 };
 
+// The type and title older rows (no recurringGroupId) were grouped by before legacy_series_ids_v1
+const legacySeriesKey = (trx) => `${trx.type}:${String(trx.title || "").toLowerCase().trim()}`;
+
+// One-off (guarded in server.js): older series had no recurringGroupId and were grouped by type and
+// title, so no vacated slot was kept for them and a newest row moved earlier could be charged twice.
+// Every such title group with at least one recurring row (Trash included) gets one new id on all of its
+// rows, Trash included; groups that never recurred are left alone. Two rows of a group on the same date
+// can't share an id (unique index on recurringGroupId + date): the recurring, live, earliest-created
+// one joins the series and the other stays a single row.
+// Loads the rows without an id into memory, which is fine for a one-off at this app's size.
+// Returns { seriesCount, rowCount, leftOutCount }.
+const assignLegacySeriesIds = async (dbTx = null) => {
+  const rows = await Transaction.findAll({
+    where: { recurringGroupId: null },
+    order: [
+      ["date", "ASC"],
+      ["createdAt", "ASC"],
+    ],
+    paranoid: false,
+    transaction: dbTx,
+  });
+  const groups = new Map();
+  for (const row of rows) {
+    const key = legacySeriesKey(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const rank = (row) =>
+    (ACTIVE_RECURRENCES.includes(row.recurrence) ? 0 : 2) + (row.deletedAt ? 1 : 0);
+  const result = { seriesCount: 0, rowCount: 0, leftOutCount: 0 };
+  for (const groupRows of groups.values()) {
+    if (!groupRows.some((r) => ACTIVE_RECURRENCES.includes(r.recurrence))) continue;
+    const byDate = new Map();
+    for (const row of groupRows) {
+      const kept = byDate.get(row.date);
+      if (!kept || rank(row) < rank(kept)) byDate.set(row.date, row);
+    }
+    const ids = [...byDate.values()].map((r) => r.id);
+    await Transaction.update(
+      { recurringGroupId: crypto.randomUUID() },
+      { where: { id: { [Op.in]: ids } }, paranoid: false, transaction: dbTx }
+    );
+    result.seriesCount++;
+    result.rowCount += ids.length;
+    result.leftOutCount += groupRows.length - ids.length;
+  }
+  return result;
+};
+
+// Runs the one-off in one DB transaction together with its Setting flag, like runSeriesEndMigration.
+// Returns assignLegacySeriesIds' result, or null when it had already run.
+const runLegacySeriesIdMigration = async (migrate = assignLegacySeriesIds) => {
+  const done = await Setting.findByPk(LEGACY_SERIES_IDS_KEY);
+  if (done && done.value === "true") return null;
+  return Transaction.sequelize.transaction(async (dbTx) => {
+    const result = await migrate(dbTx);
+    await Setting.upsert({ key: LEGACY_SERIES_IDS_KEY, value: "true" }, { transaction: dbTx });
+    return result;
+  });
+};
+
 router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
   const result = await createRecurringExpenses();
   if (result?.skipped) {
     // Not a success: the cron log should show that nothing was generated
-    return res.status(503).json({
-      skipped: true,
-      error: `Recurring job skipped: the series-end migration (${SERIES_END_MIGRATION_KEY}) has not completed.`,
-    });
+    return res.status(503).json({ skipped: true, error: skippedMessage(result.pending) });
   }
   res.status(200).json({ message: "Advanced recurring job triggered successfully." });
 });
@@ -517,10 +590,13 @@ module.exports = {
   groupSeries,
   endSeriesStoppedByNewestRow,
   runSeriesEndMigration,
+  assignLegacySeriesIds,
+  runLegacySeriesIdMigration,
   markSeriesRestart,
   markSeriesRowMoved,
   getSeriesVacatedDates,
   SERIES_END_MIGRATION_KEY,
+  LEGACY_SERIES_IDS_KEY,
   ACTIVE_RECURRENCES,
   QUICK_ADD_CATCHUP_KEY,
 };

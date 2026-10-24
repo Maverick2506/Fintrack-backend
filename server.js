@@ -47,6 +47,7 @@ const {
   router: recurringRoutes,
   createRecurringExpenses,
   runSeriesEndMigration,
+  runLegacySeriesIdMigration,
 } = require("./routes/recurring");
 const { notFoundHandler, errorHandler } = require("./middleware/errorHandler");
 const {
@@ -664,24 +665,50 @@ async function initialize() {
       console.warn("Transactions schema/backfill notice:", migErr.message);
     }
 
+    // One-off: older series had no recurringGroupId and were grouped by type and title. Each one gets
+    // a series id (all of its rows, Trash included), in one transaction with its Setting flag. It runs
+    // first, with its own try: the series-end migration groups by id only, so it waits for this one,
+    // and until both flags are set the generator does not run (it logs a warning).
+    let legacySeriesIdsDone = false;
+    try {
+      const assigned = await runLegacySeriesIdMigration();
+      if (assigned !== null) {
+        console.log(
+          `✅ Assigned series IDs to ${assigned.seriesCount} old series (${assigned.rowCount} rows${
+            assigned.leftOutCount > 0
+              ? `; ${assigned.leftOutCount} same-date duplicates left as single rows`
+              : ""
+          }).`
+        );
+      }
+      legacySeriesIdsDone = true;
+    } catch (legacyErr) {
+      console.error(
+        "❌ Series-ID migration failed; recurring generation stays off until it succeeds:",
+        legacyErr
+      );
+    }
+
     // One-off: a series used to stop when its newest row was set to One-time. The generator now
     // skips One-time rows, so series stopped that way are ended explicitly, in one transaction with
     // its Setting flag. It has its own try so an earlier backfill failure cannot skip it; until the
     // flag is set the generator does not run (it logs a warning).
-    try {
-      const endedTitles = await runSeriesEndMigration();
-      if (endedTitles !== null) {
-        console.log(
-          `✅ Series-end migration: ended ${endedTitles.length} recurring series whose newest row was One-time${
-            endedTitles.length > 0 ? `: ${endedTitles.join(", ")}` : ""
-          }.`
+    if (legacySeriesIdsDone) {
+      try {
+        const endedTitles = await runSeriesEndMigration();
+        if (endedTitles !== null) {
+          console.log(
+            `✅ Series-end migration: ended ${endedTitles.length} recurring series whose newest row was One-time${
+              endedTitles.length > 0 ? `: ${endedTitles.join(", ")}` : ""
+            }.`
+          );
+        }
+      } catch (seriesErr) {
+        console.error(
+          "❌ Series-end migration failed; recurring generation stays off until it succeeds:",
+          seriesErr
         );
       }
-    } catch (seriesErr) {
-      console.error(
-        "❌ Series-end migration failed; recurring generation stays off until it succeeds:",
-        seriesErr
-      );
     }
 
     await getPrimaryCheckingAccount();

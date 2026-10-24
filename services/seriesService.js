@@ -11,12 +11,10 @@ const recurs = (row) => ACTIVE_RECURRENCES.includes(row.recurrence);
 const SERIES_RESTART_PREFIX = "recurring_restart_from:";
 const SERIES_VACATED_PREFIX = "recurring_vacated:";
 
-// A series is its recurringGroupId. An older series without one is the rows with the same type and
-// title and no group id, the way the generator groups them.
+// A series is its recurringGroupId. A row without one is a single row, not a series (getSeriesKey in
+// routes/recurring.js): every recurring row has an id, older ones from legacy_series_ids_v1.
 const seriesOf = (row) =>
-  row.recurringGroupId
-    ? { recurringGroupId: row.recurringGroupId }
-    : { type: row.type, title: row.title };
+  row.recurringGroupId ? { recurringGroupId: row.recurringGroupId } : { rowId: row.id };
 
 // Every row of a series, Trash included
 const findSeriesRows = async (series, dbTx = null) => {
@@ -27,18 +25,13 @@ const findSeriesRows = async (series, dbTx = null) => {
       transaction: dbTx,
     });
   }
-  const titleKey = String(series.title || "").toLowerCase().trim();
-  const rows = await Transaction.findAll({
-    where: { type: series.type, recurringGroupId: null },
-    paranoid: false,
-    transaction: dbTx,
-  });
-  return rows.filter((t) => t.title.toLowerCase().trim() === titleKey);
+  const row = await Transaction.findByPk(series.rowId, { paranoid: false, transaction: dbTx });
+  return row ? [row] : [];
 };
 
-// An id from the client: a recurringGroupId, or the id of one of the series' rows (older series
-// have no group id). Null when neither matches, and for a row with no group id whose title group
-// never recurred: a plain one-off row is not a series, so same-titled bills are never touched.
+// An id from the client: a recurringGroupId, or the id of one of the series' rows. Null when neither
+// matches, and for a row with no group id that does not recur: a plain one-off row is not a series,
+// so same-titled bills are never touched.
 const resolveSeries = async (id, dbTx = null) => {
   const inGroup = await Transaction.count({
     where: { recurringGroupId: id },
@@ -48,9 +41,8 @@ const resolveSeries = async (id, dbTx = null) => {
   if (inGroup > 0) return { recurringGroupId: id };
   const row = await Transaction.findByPk(id, { paranoid: false, transaction: dbTx });
   if (!row) return null;
-  const series = seriesOf(row);
-  if (series.recurringGroupId) return series;
-  return (await findSeriesRows(series, dbTx)).some(recurs) ? series : null;
+  if (row.recurringGroupId) return seriesOf(row);
+  return recurs(row) ? seriesOf(row) : null;
 };
 
 // The series' current occurrence (B3): its newest live row dated today or earlier, or its first row
@@ -73,8 +65,7 @@ const findCurrentOccurrence = (rows, todayStr) => {
 // current occurrence, and archiving an account. Every row of the series stops recurring, Trash
 // included, so neither the generator nor a restore brings it back. Its unpaid rows dated after
 // today are removed for good (not sent to the Trash: restoring one would restart the series).
-// Paid and past rows are kept. For an older series grouped by title, only rows that recur are
-// removed, so a one-off bill with the same title stays.
+// Paid and past rows are kept.
 // options: dryRun only reports; keepIds are never removed (the row being edited); requireRecurring
 // (default true) reports { alreadyEnded: true } and changes nothing when no row still recurs. The
 // B3 edit and account archive pass false: the edit has just set the last recurring row to One-time.
@@ -100,14 +91,8 @@ const endSeries = async (
     };
   }
   const keep = new Set(keepIds);
-  const byTitle = !series.recurringGroupId;
   const upcoming = rows.filter(
-    (r) =>
-      !r.deletedAt &&
-      !r.isCleared &&
-      r.date > todayStr &&
-      !keep.has(r.id) &&
-      (!byTitle || recurs(r))
+    (r) => !r.deletedAt && !r.isCleared && r.date > todayStr && !keep.has(r.id)
   );
   const upcomingIds = new Set(upcoming.map((r) => r.id));
   const result = {

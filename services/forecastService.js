@@ -285,16 +285,11 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
       if (nextDate > newestDate && !vacated?.has(nextDate) && nextDate >= todayStr && daysMap[nextDate]) {
         // Skip if this occurrence already exists in database
-        const existsInDb = dbTransactions.some((dbt) => {
-          if (latest.recurringGroupId && dbt.recurringGroupId === latest.recurringGroupId) {
-            return dbt.date === nextDate;
-          }
-          return (
-            dbt.date === nextDate &&
-            dbt.type === latest.type &&
-            dbt.title.toLowerCase().trim() === latest.title.toLowerCase().trim()
-          );
-        });
+        // Matched by series id, as the generator does (a row without one becomes a series under its own id)
+        const seriesId = latest.recurringGroupId || latest.id;
+        const existsInDb = dbTransactions.some(
+          (dbt) => dbt.recurringGroupId === seriesId && dbt.date === nextDate
+        );
         if (existsInDb) continue;
 
         const amt = parseFloat(latest.amount) || 0;
