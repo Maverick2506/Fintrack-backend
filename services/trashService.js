@@ -85,6 +85,8 @@ const listTrash = async () => {
     recurringGroupId: t.recurringGroupId || null,
     fromAccount: t.fromAccount ? t.fromAccount.name : null,
     toAccount: t.toAccount ? t.toAccount.name : null,
+    fromAccountType: t.fromAccount ? t.fromAccount.type : null,
+    toAccountType: t.toAccount ? t.toAccount.type : null,
     fromAccountArchived: t.fromAccount?.isActive === false,
     toAccountArchived: t.toAccount?.isActive === false,
     deletedAt: t.deletedAt,
