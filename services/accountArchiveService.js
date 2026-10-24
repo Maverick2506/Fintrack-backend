@@ -5,6 +5,7 @@ const {
   getTodayString,
 } = require("./accountBalanceService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
+const { endSeries, seriesOf } = require("./seriesService");
 const { HttpError } = require("../middleware/errorHandler");
 const {
   groupSeries,
@@ -191,16 +192,9 @@ const retireAccount = async (account, options, dbTx) => {
         { transaction: dbTx }
       );
     } else {
-      // Ended explicitly: every row of the series stops recurring, Trash included, so neither an
-      // older recurring row nor a restore can bring it back
-      const remainingIds = rows.filter((r) => !removedIds.has(r.id)).map((r) => r.id);
-      const where = latest.recurringGroupId
-        ? { recurringGroupId: latest.recurringGroupId }
-        : { id: { [Op.in]: remainingIds } };
-      await Transaction.update(
-        { recurrence: "none" },
-        { where, paranoid: false, transaction: dbTx }
-      );
+      // Ended through the shared path: every row stops recurring, Trash included, and any unpaid
+      // rows after today left on other accounts go too
+      await endSeries(seriesOf(latest), { todayStr, dbTx });
     }
   }
 

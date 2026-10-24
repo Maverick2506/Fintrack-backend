@@ -660,20 +660,28 @@ async function initialize() {
 
       // One-off backfill (R3): store each debt's due day from its current due date
       await backfillDebtDueDays(Account, Setting);
-
-      // One-off: a series used to stop when its newest row was set to One-time. The generator now
-      // skips One-time rows, so series stopped that way are ended explicitly, in one transaction with
-      // its Setting flag. Until that flag is set the generator does not run (it logs a warning).
-      try {
-        const endedCount = await runSeriesEndMigration();
-        if (endedCount !== null) {
-          console.log(`✅ Series-end migration: ended ${endedCount} recurring series whose newest row was One-time.`);
-        }
-      } catch (seriesErr) {
-        console.warn("Series-end migration failed; recurring generation stays off until it succeeds:", seriesErr.message);
-      }
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
+    }
+
+    // One-off: a series used to stop when its newest row was set to One-time. The generator now
+    // skips One-time rows, so series stopped that way are ended explicitly, in one transaction with
+    // its Setting flag. It has its own try so an earlier backfill failure cannot skip it; until the
+    // flag is set the generator does not run (it logs a warning).
+    try {
+      const endedTitles = await runSeriesEndMigration();
+      if (endedTitles !== null) {
+        console.log(
+          `✅ Series-end migration: ended ${endedTitles.length} recurring series whose newest row was One-time${
+            endedTitles.length > 0 ? `: ${endedTitles.join(", ")}` : ""
+          }.`
+        );
+      }
+    } catch (seriesErr) {
+      console.error(
+        "❌ Series-end migration failed; recurring generation stays off until it succeeds:",
+        seriesErr
+      );
     }
 
     await getPrimaryCheckingAccount();

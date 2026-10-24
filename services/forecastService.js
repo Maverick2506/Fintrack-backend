@@ -3,7 +3,12 @@ const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
-const { getNextOccurrenceDate, groupSeries, ACTIVE_RECURRENCES } = require("../routes/recurring");
+const {
+  getNextOccurrenceDate,
+  groupSeries,
+  getSeriesCoveredThrough,
+  ACTIVE_RECURRENCES,
+} = require("../routes/recurring");
 const { usesArchivedAccount } = require("./accountArchiveService");
 const {
   DEBT_INTEREST_START_KEY,
@@ -266,9 +271,12 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
   // Each series projects from its newest recurring row, after its newest row of any kind (getSeriesTemplate)
   const { seriesTemplates } = groupSeries(recurringTrxs);
+  const seriesCovered = await getSeriesCoveredThrough(dbTx);
 
   for (const { template: latest, newestDate, anchorDay } of Object.values(seriesTemplates)) {
     if (usesArchivedAccount(latest)) continue;
+    const coveredThrough = seriesCovered.get(latest.recurringGroupId);
+    const takenThrough = coveredThrough && coveredThrough > newestDate ? coveredThrough : newestDate;
 
     let curDate = latest.date;
     while (true) {
@@ -276,7 +284,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
       if (!nextDate || nextDate > endDateStr) break;
       curDate = nextDate;
 
-      if (nextDate > newestDate && nextDate >= todayStr && daysMap[nextDate]) {
+      if (nextDate > takenThrough && nextDate >= todayStr && daysMap[nextDate]) {
         // Skip if this occurrence already exists in database
         const existsInDb = dbTransactions.some((dbt) => {
           if (latest.recurringGroupId && dbt.recurringGroupId === latest.recurringGroupId) {
