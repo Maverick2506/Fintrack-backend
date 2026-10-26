@@ -6825,6 +6825,14 @@ async function runTestSuite() {
     { title: "Suite 43 Split Water", amount: 45, date: getTorontoOffsetDate(-24), type: "EXPENSE", category: "Utilities", isCleared: true, recurrence: "bi-weekly" },
     { title: "Suite 43 Split Water", amount: 45, date: getTorontoOffsetDate(-10), type: "EXPENSE", category: "Utilities", isCleared: true, recurrence: "bi-weekly" },
   ]);
+  // An old row still monthly whose title's series (with an id) has already ended: every row One-time
+  const s43EndedGroup = require("crypto").randomUUID();
+  await Transaction.bulkCreate([
+    { title: "Suite 43 Ended Box", amount: 15, date: getTorontoOffsetDate(-20), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "none", recurringGroupId: s43EndedGroup },
+  ]);
+  const [s43EndedOld] = await Transaction.bulkCreate([
+    { title: "Suite 43 Ended Box", amount: 15, date: getTorontoOffsetDate(-80), type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
+  ]);
   // Rows that never recurred: same title among themselves, and an income with the rent's title
   const s43Dentist = await Transaction.bulkCreate([
     { title: "Suite 43 Dentist", amount: 120, date: getTorontoOffsetDate(-90), type: "EXPENSE", category: "Health", isCleared: true, recurrence: "none" },
@@ -6936,6 +6944,12 @@ async function runTestSuite() {
     `Old rows join the existing series id of the same title (got ${s43SplitOldAfter.recurringGroupId === s43SplitTemplate.id ? "joined" : s43SplitOldAfter.recurringGroupId}, same-date ${s43SplitSameAfter.recurringGroupId}:${s43SplitSameAfter.recurrence})`
   );
 
+  const s43EndedOldAfter = await Transaction.findByPk(s43EndedOld.id);
+  assert(
+    s43EndedOldAfter.recurringGroupId === s43EndedGroup && s43EndedOldAfter.recurrence === "none" && s43Result.joinedEndedCount >= 1,
+    `An old row joining an ended series is set to One-time (got ${s43EndedOldAfter.recurringGroupId === s43EndedGroup ? "joined" : "not joined"}:${s43EndedOldAfter.recurrence})`
+  );
+
   // 43.4 The migration runs only once
   assert((await s43RunMigration()) === null, "The series-id migration runs only once");
   await s43Generate(null, { todayStr: s43Today });
@@ -6943,6 +6957,10 @@ async function runTestSuite() {
     (await Transaction.count({ where: { recurringGroupId: s43ProbeGroup } })) > 1 &&
       (await Transaction.count({ where: { title: "Suite 43 Dentist" } })) === 2,
     "Once it has run, generation resumes, and the one-off rows generate nothing"
+  );
+  assert(
+    (await Transaction.count({ where: { title: "Suite 43 Ended Box" } })) === 2,
+    "The ended series is not restarted, so no overdue rows are backfilled"
   );
   const s43SplitAll = await Transaction.findAll({ where: { title: "Suite 43 Split Water" } });
   const s43SplitDates = s43SplitAll.filter((r) => r.id !== s43SplitSameDate.id).map((r) => r.date);
