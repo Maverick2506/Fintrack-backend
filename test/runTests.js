@@ -7037,6 +7037,178 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite 43 %" } }, { title: "suite 43 old rent " }] }, force: true });
   await Setting.destroy({ where: { key: { [Op.like]: "recurring_%:%" } } });
 
+  // 44. Ask FinTrack tools (AI1-AI4) and the daily AI cap (AI8)
+  console.log("\n--- Suite 44: Ask FinTrack tools and the daily AI cap ---");
+  const s44Gemini = require("../routes/gemini");
+  const { AiUsage } = require("../models");
+  const s44Today = getTorontoToday();
+  const s44Card = await Account.create({ name: "Suite44 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 1000 });
+  const s44Checking = await Account.findOne({ where: { type: "CHECKING" } });
+
+  // AI2 searchTransactions: 22 hydro bills, one in the Trash, one on the card
+  const s44Hydro = [];
+  for (let i = 0; i < 22; i++) {
+    const d = new Date(Date.UTC(2019, 0, 1 + i * 3, 12));
+    s44Hydro.push({
+      title: i % 2 ? "Suite44 HYDRO bill" : "suite44 hydro bill",
+      amount: 50 + i,
+      date: d.toISOString().slice(0, 10),
+      type: "EXPENSE",
+      category: "Essentials",
+      isCleared: true,
+      fromAccountId: i === 21 ? s44Card.id : s44Checking.id,
+    });
+  }
+  const s44Rows = [];
+  for (const row of s44Hydro) s44Rows.push(await Transaction.create(row));
+  const s44Deleted = await Transaction.create({ title: "Suite44 Hydro bill", amount: 999, date: "2019-02-20", type: "EXPENSE", category: "Essentials", isCleared: true });
+  await s44Deleted.destroy();
+  const s44Wild = await Transaction.create({ title: "Suite44 100% juice", amount: 4, date: "2019-02-21", type: "EXPENSE", category: "Food & Drink", isCleared: true });
+
+  const s44Search = await s44Gemini.executeTool("searchTransactions", { text: "suite44 hydro" }, s44Today);
+  const s44HydroTotal = s44Hydro.reduce((s, r) => s + r.amount, 0);
+  assert(
+    s44Search.count === 22 && s44Search.rows.length === 20 && s44Search.total === s44HydroTotal,
+    `searchTransactions returns 20 rows plus the count and total of all 22 matches, any case, Trash left out (got ${s44Search.count}, ${s44Search.rows.length} rows, $${s44Search.total})`
+  );
+  assert(
+    s44Search.rows[0].date === s44Hydro[21].date && s44Search.rows[0].from === "Suite44 Visa" && s44Search.rows[0].paid === true,
+    "searchTransactions lists the newest first with its account and paid state"
+  );
+  const s44ByCard = await s44Gemini.executeTool("searchTransactions", { text: "hydro", account: "suite44 visa" }, s44Today);
+  assert(s44ByCard.count === 1 && s44ByCard.rows[0].amount === 71, `searchTransactions filters by account name (got ${s44ByCard.count})`);
+  const s44Range = await s44Gemini.executeTool(
+    "searchTransactions",
+    { text: "Suite44", from: "2019-01-04", to: "2019-01-31", minAmount: 52, maxAmount: 58, category: "essentials" },
+    s44Today
+  );
+  assert(
+    s44Range.count === 7 && s44Range.rows.every((r) => r.amount >= 52 && r.amount <= 58 && r.date >= "2019-01-04"),
+    `searchTransactions applies the date, amount and category filters together (got ${s44Range.count})`
+  );
+  const s44Pct = await s44Gemini.executeTool("searchTransactions", { text: "suite44 100%" }, s44Today);
+  assert(s44Pct.count === 1 && s44Pct.rows[0].title === "Suite44 100% juice", "A % typed by the model is not a wildcard");
+  const s44NoAcct = await s44Gemini.executeTool("searchTransactions", { account: "no such card zz" }, s44Today);
+  assert(s44NoAcct.count === 0 && /No account matches/.test(s44NoAcct.note), "An unknown account returns no rows and says so");
+
+  // AI3 compareMonths: Jan vs Feb 2019, from the same query as /api/trends
+  const s44Compare = await s44Gemini.executeTool("compareMonths", { monthA: "2019-01", monthB: "2019-02" }, s44Today);
+  const s44JanEss = s44Hydro.filter((r) => r.date.startsWith("2019-01")).reduce((s, r) => s + r.amount, 0);
+  const s44FebEss = s44Hydro.filter((r) => r.date.startsWith("2019-02")).reduce((s, r) => s + r.amount, 0);
+  const s44EssRow = s44Compare.categories.find((c) => c.category === "Essentials");
+  const s44FoodRow = s44Compare.categories.find((c) => c.category === "Food & Drink");
+  assert(
+    s44EssRow && s44EssRow["2019-01"] === s44JanEss && s44EssRow["2019-02"] === s44FebEss && s44EssRow.difference === s44FebEss - s44JanEss,
+    `compareMonths gives each category's totals and difference, Trash left out (got ${JSON.stringify(s44EssRow)})`
+  );
+  assert(
+    s44FoodRow && s44FoodRow["2019-01"] === 0 && s44FoodRow.difference === 4 && s44Compare.spending.difference === s44FebEss + 4 - s44JanEss,
+    "compareMonths includes categories found in only one month and the overall spending change"
+  );
+  const s44BadMonth = await s44Gemini.executeTool("compareMonths", { monthA: "2019-13", monthB: "Feb" }, s44Today);
+  assert(Boolean(s44BadMonth.error), "compareMonths refuses months not in YYYY-MM");
+
+  // AI4 getSubscriptions matches the Subscriptions page
+  const s44SubGroup = require("crypto").randomUUID();
+  await Transaction.create({ title: "Suite44 Streamio", amount: 12, date: getTorontoOffsetDate(-20), type: "EXPENSE", category: "Subscription", isCleared: true, recurrence: "monthly", recurringGroupId: s44SubGroup });
+  await Transaction.create({ title: "Suite44 Streamio", amount: 12, date: getTorontoOffsetDate(10), type: "EXPENSE", category: "Subscription", isCleared: false, recurrence: "monthly", recurringGroupId: s44SubGroup });
+  const s44Subs = await s44Gemini.executeTool("getSubscriptions", {}, s44Today);
+  const s44SubsPage = await request({ hostname: "localhost", port: 8000, path: "/api/subscriptions", method: "GET", headers: authHeaders });
+  const s44Sub = s44Subs.subscriptions.find((x) => x.name === "Suite44 Streamio");
+  assert(
+    s44Sub && s44Sub.monthlyCost === 12 && s44Sub.yearlyCost === 144 && s44Sub.nextChargeDate === getTorontoOffsetDate(10) && s44Sub.cadence === "monthly",
+    `getSubscriptions gives monthly and yearly cost and the next charge date (got ${JSON.stringify(s44Sub)})`
+  );
+  assert(
+    s44Subs.totalMonthly === s44SubsPage.body.totalMonthly && s44Subs.totalYearly === s44SubsPage.body.totalAnnual && s44Subs.count === s44SubsPage.body.count,
+    "getSubscriptions totals match the Subscriptions page"
+  );
+
+  // AI1 proposeTransaction writes nothing
+  const s44CountBefore = await Transaction.count({ paranoid: false });
+  const s44Draft = await s44Gemini.executeTool("proposeTransaction", { amount: 12.5, title: "lunch", account: "suite44 visa" }, s44Today);
+  assert(
+    /^12\.50 lunch (visa|suite44)$/.test(s44Draft.quickAddText) && s44Draft.saved === false && (await Transaction.count({ paranoid: false })) === s44CountBefore,
+    `proposeTransaction returns Quick Add text and saves nothing (got ${s44Draft.quickAddText})`
+  );
+
+  // AI8 daily cap across the three AI endpoints, with a mocked model client
+  const s44Usage = { promptTokenCount: 100, candidatesTokenCount: 15, thoughtsTokenCount: 5, totalTokenCount: 120 };
+  let s44ProposeNext = false;
+  s44Gemini.setAiClientForTests({
+    models: {
+      generateContent: async (params) => {
+        const last = params.contents[params.contents.length - 1];
+        if (s44ProposeNext && Array.isArray(last.parts) && !last.parts.some((p) => p.functionResponse)) {
+          s44ProposeNext = false;
+          const call = { name: "proposeTransaction", args: { amount: 8, title: "coffee" } };
+          return { functionCalls: [call], candidates: [{ content: { role: "model", parts: [{ functionCall: call }] } }], usageMetadata: s44Usage };
+        }
+        return { text: '{"headline":"h","summary":"s","tacticalActions":[]}', usageMetadata: s44Usage };
+      },
+    },
+  });
+  const s44Handler = (routePath) => {
+    const layer = s44Gemini.stack.find((l) => l.route && l.route.path === routePath);
+    return layer.route.stack[layer.route.stack.length - 1].handle;
+  };
+  const s44Call = (routePath, body) =>
+    new Promise((resolve, reject) => {
+      const res = {
+        statusCode: 200,
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        json(payload) {
+          resolve({ status: this.statusCode, body: payload });
+          return this;
+        },
+      };
+      Promise.resolve(s44Handler(routePath)({ body }, res)).catch(reject);
+    });
+
+  await Setting.upsert({ key: "ai_daily_cap", value: "3" });
+  await AiUsage.destroy({ where: { date: s44Today } });
+  const s44Chat1 = await s44Call("/chat-advisor", { message: "hi", history: [] });
+  s44ProposeNext = true;
+  const s44CountBeforeChat = await Transaction.count({ paranoid: false });
+  const s44Chat2 = await s44Call("/chat-advisor", { message: "add 8 coffee", history: [] });
+  assert(
+    s44Chat1.status === 200 && s44Chat2.status === 200 && s44Chat2.body.proposals?.[0]?.quickAddText === "8 coffee" &&
+      (await Transaction.count({ paranoid: false })) === s44CountBeforeChat,
+    `Chat returns the draft as a proposal card and saves nothing (got ${JSON.stringify(s44Chat2.body.proposals)})`
+  );
+  const s44Cat1 = await s44Call("/categorize-expense", { name: "Suite44 Qzxv Merchant" });
+  const s44Chat3 = await s44Call("/chat-advisor", { message: "hi again", history: [] });
+  assert(
+    s44Cat1.status === 200 && s44Chat3.status === 429 && s44Chat3.body.code === "AI_DAILY_CAP" && /limit of 3 AI requests/.test(s44Chat3.body.error),
+    `The 4th AI request of the day gets a friendly 429 (got ${s44Chat3.status}: ${s44Chat3.body.error})`
+  );
+  const s44Cat2 = await s44Call("/categorize-expense", { name: "Suite44 Wxyq Other" });
+  const s44CatHistory = await s44Call("/categorize-expense", { name: "suite44 hydro bill" });
+  const s44Advice = await s44Call("/financial-advice", { force: true });
+  assert(
+    s44Cat2.status === 429 && s44Advice.status === 429 && s44CatHistory.status === 200 && s44CatHistory.body.source === "history",
+    "Category suggestions and the advice card share the cap; a suggestion from history needs no AI call"
+  );
+  const s44UsageRes = await request({ hostname: "localhost", port: 8000, path: "/api/settings/ai-usage", method: "GET", headers: authHeaders });
+  // Calls: chat, chat, categorize. Model calls: 1 + 2 (tool round) + 1 = 4, 120 tokens each
+  assert(
+    s44UsageRes.status === 200 && s44UsageRes.body.calls === 3 && s44UsageRes.body.cap === 3 && s44UsageRes.body.remaining === 0 &&
+      s44UsageRes.body.totalTokens === 480 && s44UsageRes.body.promptTokens === 400 && s44UsageRes.body.outputTokens === 80,
+    `GET /api/settings/ai-usage shows today's calls and tokens (got ${JSON.stringify(s44UsageRes.body)})`
+  );
+  await Setting.destroy({ where: { key: "ai_daily_cap" } });
+  const s44Default = await request({ hostname: "localhost", port: 8000, path: "/api/settings/ai-usage", method: "GET", headers: authHeaders });
+  assert(s44Default.body.cap === 100, "The daily cap defaults to 100");
+
+  // Cleanup
+  s44Gemini.setAiClientForTests(null);
+  await AiUsage.destroy({ where: { date: s44Today } });
+  await Transaction.destroy({ where: { title: { [Op.like]: "Suite44 %" } }, force: true });
+  await s44Card.destroy();
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

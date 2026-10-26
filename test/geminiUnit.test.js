@@ -9,6 +9,8 @@
  * - Function calling tools: parallel calls in 1 user turn, multi-round chain (G13, C2)
  * - Registered account room calculation: TFSA/RRSP room = limit - contributionsThisYear (G14, C3)
  * - Exact simulatePurchase math (S1)
+ * - Ask FinTrack tool choice with a mocked model client: 10 fixed questions (AI9)
+ * - Quick Add drafts from proposeTransaction (AI1)
  */
 
 process.env.NODE_ENV = "test";
@@ -17,7 +19,10 @@ const { normalizeMerchantName } = require("../utils/merchantNormalizer");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { simulate, comparePlans } = require("../services/debtPayoffService");
 const { schemas } = require("../middleware/validate");
-const { ThinkingLevel } = require("@google/genai");
+const { ThinkingLevel, Type } = require("@google/genai");
+const fs = require("fs");
+const path = require("path");
+const { runChatLoop, buildQuickAddText, CHAT_TOOLS } = require("../routes/gemini");
 
 async function runGeminiUnitTests() {
   console.log("==================================================");
@@ -307,6 +312,194 @@ async function runGeminiUnitTests() {
       : { thinkingBudget: 0 };
 
     assert.deepStrictEqual(thinkingConfig, { thinkingBudget: 0 });
+  });
+
+
+  // --- Suite F: Ask FinTrack tool choice with a mocked model client (AI9) ---
+  console.log("\n--- Suite F: Ask FinTrack tool choice, mocked model (AI9) ---");
+
+  const TODAY = "2026-10-26";
+  const CARDS = [
+    { id: "c1", name: "TD Visa Infinite" },
+    { id: "c2", name: "Amex Cobalt" },
+  ];
+
+  // What a well-behaved model calls for each question. The mock plays the model; the test checks that
+  // the server runs exactly these tools with these arguments and that they fit the tool declarations.
+  const TOOL_CASES = [
+    { q: "can I afford $400", name: "simulatePurchase", args: { amount: 400 } },
+    { q: "when did I last pay hydro", name: "searchTransactions", args: { text: "hydro" } },
+    {
+      q: "add 12.50 lunch visa",
+      name: "proposeTransaction",
+      args: { amount: 12.5, title: "lunch", account: "visa" },
+      quickAddText: "12.50 lunch visa",
+    },
+    { q: "how much did I spend on food in the last 6 months", name: "getCategorySpending", args: { category: "Food & Drink", months: 6 } },
+    { q: "if I pay $200 extra a month with snowball, when am I debt free", name: "getDebtPayoff", args: { extraPerMonth: 200, strategy: "snowball" } },
+    { q: "did I spend more in October than September", name: "compareMonths", args: { monthA: "2026-09", monthB: "2026-10" } },
+    { q: "what subscriptions do I have and what do they cost a year", name: "getSubscriptions", args: {} },
+    {
+      q: "show my visa purchases over $100 in September",
+      name: "searchTransactions",
+      args: { account: "visa", minAmount: 100, from: "2026-09-01", to: "2026-09-30" },
+    },
+    {
+      q: "log my 2100 paycheque",
+      name: "proposeTransaction",
+      args: { amount: 2100, title: "paycheque", type: "income" },
+      quickAddText: "+2100 paycheque",
+    },
+    {
+      q: "add the 120 hydro bill due Nov 5",
+      name: "proposeTransaction",
+      args: { amount: 120, title: "hydro bill", date: "2026-11-05" },
+      quickAddText: "120 hydro bill due 2026-11-05",
+    },
+  ];
+
+  const declarationsByName = Object.fromEntries(CHAT_TOOLS.map((d) => [d.name, d]));
+
+  // A mocked @google/genai client: answers a question with its scripted function call, and the
+  // function results with text. It records every request it gets.
+  const makeMockClient = (script) => {
+    const requests = [];
+    return {
+      requests,
+      models: {
+        generateContent: async (params) => {
+          requests.push(params);
+          const last = params.contents[params.contents.length - 1];
+          if (last.parts.some((p) => p.functionResponse)) {
+            return { text: "Here is what I found." };
+          }
+          const planned = script[last.parts[0].text];
+          if (!planned) return { text: "No tool needed." };
+          return {
+            functionCalls: [{ name: planned.name, args: planned.args }],
+            candidates: [{ content: { role: "model", parts: [{ functionCall: { name: planned.name, args: planned.args } }] } }],
+          };
+        },
+      },
+    };
+  };
+
+  const fitsDeclaration = (name, args) => {
+    const decl = declarationsByName[name];
+    if (!decl) return `no declaration for ${name}`;
+    const props = decl.parameters?.properties || {};
+    for (const key of decl.parameters?.required || []) {
+      if (args[key] === undefined) return `missing required ${key}`;
+    }
+    for (const [key, value] of Object.entries(args)) {
+      const prop = props[key];
+      if (!prop) return `undeclared argument ${key}`;
+      const want = prop.type === Type.NUMBER || prop.type === Type.INTEGER ? "number" : "string";
+      if (typeof value !== want) return `${key} should be a ${want}`;
+    }
+    return null;
+  };
+
+  const script = Object.fromEntries(TOOL_CASES.map((c) => [c.q, c]));
+
+  for (const c of TOOL_CASES) {
+    await testAsync(`"${c.q}" -> ${c.name}(${JSON.stringify(c.args)})`, async () => {
+      const client = makeMockClient(script);
+      const ran = [];
+      // Read tools are spied on (no database here); drafts use the real Quick Add builder
+      const runTool = async (name, args, todayStr) => {
+        ran.push({ name, args, todayStr });
+        if (name === "proposeTransaction") return buildQuickAddText(args, { todayStr, cards: CARDS });
+        return { ok: true };
+      };
+      const result = await runChatLoop({
+        ai: client,
+        model: "gemini-test",
+        contents: [{ role: "user", parts: [{ text: c.q }] }],
+        systemPrompt: "test",
+        todayStr: TODAY,
+        runTool,
+      });
+
+      assert.strictEqual(ran.length, 1, `expected one tool call, got ${ran.length}`);
+      assert.strictEqual(ran[0].name, c.name);
+      assert.deepStrictEqual(ran[0].args, c.args);
+      assert.strictEqual(ran[0].todayStr, TODAY);
+      assert.strictEqual(fitsDeclaration(c.name, c.args), null);
+
+      // Every request offers all seven tools; the second one carries the tool result back
+      assert.strictEqual(client.requests.length, 2);
+      const offered = client.requests[0].config.tools[0].functionDeclarations.map((d) => d.name);
+      assert.deepStrictEqual(offered.sort(), Object.keys(declarationsByName).sort());
+      const resultTurn = client.requests[1].contents.at(-1);
+      assert.strictEqual(resultTurn.role, "user");
+      assert.strictEqual(resultTurn.parts[0].functionResponse.name, c.name);
+
+      if (c.quickAddText) {
+        assert.strictEqual(result.proposals.length, 1);
+        assert.strictEqual(result.proposals[0].quickAddText, c.quickAddText);
+        assert(/Not saved yet/.test(result.proposals[0].summary), "summary says it is not saved");
+      } else {
+        assert.deepStrictEqual(result.proposals, []);
+      }
+    });
+  }
+
+  await testAsync("A question that needs no tool runs none and returns the model's text", async () => {
+    const client = makeMockClient(script);
+    const ran = [];
+    const result = await runChatLoop({
+      ai: client,
+      model: "gemini-test",
+      contents: [{ role: "user", parts: [{ text: "hi there" }] }],
+      systemPrompt: "test",
+      todayStr: TODAY,
+      runTool: async (name) => ran.push(name),
+    });
+    assert.strictEqual(ran.length, 0);
+    assert.strictEqual(result.reply, "No tool needed.");
+  });
+
+  test("The chat system prompt forbids claiming anything was saved (AI1)", () => {
+    const src = fs.readFileSync(path.join(__dirname, "..", "routes", "gemini.js"), "utf8");
+    assert(/Never say or imply that something was saved/.test(src));
+  });
+
+  // --- Suite G: Quick Add drafts (AI1) ---
+  console.log("\n--- Suite G: proposeTransaction builds Quick Add text only (AI1) ---");
+  const draft = (args) => buildQuickAddText(args, { todayStr: TODAY, cards: CARDS });
+
+  test("Card keyword picks a word only that card has", () => {
+    assert.strictEqual(draft({ amount: 15.99, title: "netflix", account: "amex" }).quickAddText, "15.99 netflix amex");
+    assert.strictEqual(draft({ amount: 9, title: "snack", account: "TD Visa Infinite" }).quickAddText, "9 snack visa");
+  });
+
+  test("Past date uses 'on', future date uses 'due', today adds nothing", () => {
+    assert.strictEqual(draft({ amount: 40, title: "gas", date: "2026-10-20" }).quickAddText, "40 gas on 2026-10-20");
+    assert.strictEqual(draft({ amount: 40, title: "gas", date: "2026-11-02" }).quickAddText, "40 gas due 2026-11-02");
+    assert.strictEqual(draft({ amount: 40, title: "gas", date: TODAY }).quickAddText, "40 gas");
+    assert(/due Nov 2 \(unpaid\)/.test(draft({ amount: 40, title: "gas", date: "2026-11-02" }).summary));
+  });
+
+  test("Title words Quick Add would misread are dropped", () => {
+    const d = draft({ amount: 30, title: "visa due 11/05 dinner checking $5", account: "amex" });
+    assert.strictEqual(d.quickAddText, "30 dinner amex");
+  });
+
+  test("Income gets '+', ignores the card, and never claims to be saved", () => {
+    const d = draft({ amount: 500, title: "bonus", type: "income", account: "visa" });
+    assert.strictEqual(d.quickAddText, "+500 bonus");
+    assert.strictEqual(d.saved, false);
+    assert(/^Income: Bonus, \$500\.00, today \(paid\)\. Not saved yet\.$/.test(d.summary), d.summary);
+  });
+
+  test("Unknown card falls back to checking with a note; bad amount or empty title is refused", () => {
+    const d = draft({ amount: 5, title: "coffee", account: "discover" });
+    assert.strictEqual(d.quickAddText, "5 coffee");
+    assert(/No card matches/.test(d.note));
+    assert(draft({ amount: 0, title: "x" }).error);
+    assert(draft({ amount: "abc", title: "x" }).error);
+    assert(draft({ amount: 5, title: "  $ " }).error);
   });
 
   console.log("\n==================================================");

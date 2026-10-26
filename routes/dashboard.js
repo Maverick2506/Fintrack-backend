@@ -26,6 +26,7 @@ const {
   getCheckingActivity,
 } = require("../services/checkingService");
 const { usesArchivedAccount } = require("../services/accountArchiveService");
+const { getClearedMonthTotals } = require("../services/trendsService");
 
 router.get(
   "/dashboard",
@@ -308,23 +309,12 @@ router.get(
     const windowStart = formatYMD(baseYear, baseMonth - 5, 1);
     const windowEnd = formatYMD(baseYear, baseMonth + 1, 0);
 
-    const rows = await Transaction.findAll({
-      attributes: ["type", "date", "amount"],
-      where: {
-        type: { [Op.in]: ["INCOME", "EXPENSE"] },
-        isCleared: true,
-        date: { [Op.between]: [windowStart, windowEnd] },
-      },
-      raw: true,
-    });
-
-    for (const r of rows) {
-      const ym = String(r.date).slice(0, 7);
+    const months = await getClearedMonthTotals(windowStart, windowEnd);
+    for (const [ym, totals] of Object.entries(months)) {
       const bucket = bucketMap[ym];
       if (!bucket) continue;
-      const amt = parseFloat(r.amount) || 0;
-      if (r.type === "INCOME") bucket.income += amt;
-      else if (r.type === "EXPENSE") bucket.spending += amt;
+      bucket.income += totals.income;
+      bucket.spending += totals.spending;
     }
 
     res.json(

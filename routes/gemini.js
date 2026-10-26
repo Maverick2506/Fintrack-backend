@@ -16,6 +16,9 @@ const {
   simulate: simulateDebtPayoff,
   comparePlans: compareDebtPlans,
 } = require("../services/debtPayoffService");
+const { compareMonths, isMonthStr } = require("../services/trendsService");
+const { getSubscriptionsSummary } = require("../services/subscriptionService");
+const { reserveCall, sendCapReached, recordTokens } = require("../services/aiUsageService");
 
 const router = express.Router();
 
@@ -35,7 +38,14 @@ const getModels = () => ({
 let _aiInstance = null;
 let _cachedApiKey = null;
 
+// Tests swap in a mocked model client (test/geminiUnit.test.js, Suite 44)
+let _testClient = null;
+const setAiClientForTests = (client) => {
+  _testClient = client;
+};
+
 const getAiClient = () => {
+  if (_testClient) return _testClient;
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return null;
   if (!_aiInstance || _cachedApiKey !== apiKey) {
@@ -80,6 +90,16 @@ async function generateWithRetry(ai, params, maxRetries = 1, delayMs = 1000) {
     }
   }
 }
+
+// Every model call goes through here so its token counts are logged and added to today's usage (AI8)
+async function generate(ai, params, usage, maxRetries, delayMs) {
+  const response = await generateWithRetry(ai, params, maxRetries, delayMs);
+  await recordTokens(usage.todayStr, usage.endpoint, params.model, response?.usageMetadata);
+  return response;
+}
+
+const getTorontoTodayStr = () =>
+  format(toZonedTime(new Date(), TIMEZONE), "yyyy-MM-dd", { timeZone: TIMEZONE });
 
 // Persistent merchant categorization cache in Setting table (G8, m2)
 const SETTING_CAT_CACHE = "ai_category_cache";
@@ -390,9 +410,12 @@ INSTRUCTIONS:
 4. Provide a 1-sentence spending alert if an area is over-budget or tight, or null if all is well.
 `;
 
+      const reservation = await reserveCall(todayStr);
+      if (!reservation.allowed) return sendCapReached(res, reservation);
+
       const models = getModels();
 
-      const response = await generateWithRetry(ai, {
+      const response = await generate(ai, {
         model: models.advice,
         contents: prompt,
         config: {
@@ -412,7 +435,7 @@ INSTRUCTIONS:
           },
           abortSignal: AbortSignal.timeout(20000),
         },
-      });
+      }, { todayStr, endpoint: "financial-advice" });
 
       let structured = {};
       try {
@@ -514,6 +537,10 @@ router.post(
         return res.json({ category: "Other", source: "default" });
       }
 
+      const todayStr = getTorontoTodayStr();
+      const reservation = await reserveCall(todayStr);
+      if (!reservation.allowed) return sendCapReached(res, reservation);
+
       const models = getModels();
 
       const prompt = `Categorize the following expense merchant or item name into exactly one category: ${EXPENSE_CATEGORIES.join(
@@ -526,7 +553,7 @@ Expense: "${rawName}"`;
         ? { thinkingLevel: ThinkingLevel.MINIMAL }
         : { thinkingBudget: 0 };
 
-      const response = await generateWithRetry(
+      const response = await generate(
         ai,
         {
           model: modelName,
@@ -547,6 +574,7 @@ Expense: "${rawName}"`;
             abortSignal: AbortSignal.timeout(8000),
           },
         },
+        { todayStr, endpoint: "categorize-expense" },
         1,
         500
       );
@@ -643,6 +671,62 @@ const getDebtPayoffDeclaration = {
   },
 };
 
+const searchTransactionsDeclaration = {
+  name: "searchTransactions",
+  description:
+    "Find Maverick's transactions (paid and upcoming) by words in the title, date range, amount range, category or account. Use it for questions like 'when did I last pay hydro' or 'what did I spend at Costco in September'. Returns the newest 20 matches plus the full match count and total.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      text: { type: Type.STRING, description: "Words to find in the title, e.g. 'hydro'" },
+      from: { type: Type.STRING, description: "Earliest date, YYYY-MM-DD" },
+      to: { type: Type.STRING, description: "Latest date, YYYY-MM-DD" },
+      minAmount: { type: Type.NUMBER, description: "Smallest amount in dollars" },
+      maxAmount: { type: Type.NUMBER, description: "Largest amount in dollars" },
+      category: { type: Type.STRING, description: "Category, e.g. 'Essentials' or 'Food & Drink'" },
+      account: { type: Type.STRING, description: "Account or card name, e.g. 'visa' or 'checking'" },
+    },
+  },
+};
+
+const compareMonthsDeclaration = {
+  name: "compareMonths",
+  description:
+    "Compare paid spending and income of two months, by category, with the difference for each category. Use it for 'did I spend more this month than last month' or 'compare September and October'.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      monthA: { type: Type.STRING, description: "Earlier month, YYYY-MM" },
+      monthB: { type: Type.STRING, description: "Later month, YYYY-MM" },
+    },
+    required: ["monthA", "monthB"],
+  },
+};
+
+const getSubscriptionsDeclaration = {
+  name: "getSubscriptions",
+  description:
+    "List Maverick's active recurring expenses (subscriptions and bills) with each one's monthly and yearly cost and next charge date, plus the totals.",
+  parameters: { type: Type.OBJECT, properties: {} },
+};
+
+const proposeTransactionDeclaration = {
+  name: "proposeTransaction",
+  description:
+    "Draft a new expense or income for Maverick to review in Quick Add. It does NOT save anything: Maverick taps 'Review & save' to check and save it. Use it when Maverick asks to add, log or record a transaction.",
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      amount: { type: Type.NUMBER, description: "Dollar amount, e.g. 12.5" },
+      title: { type: Type.STRING, description: "Short name, e.g. 'lunch' or 'hydro'" },
+      type: { type: Type.STRING, description: "'expense' (default) or 'income'" },
+      account: { type: Type.STRING, description: "Card or account name if Maverick said one, e.g. 'visa'" },
+      date: { type: Type.STRING, description: "Date in YYYY-MM-DD if not today; a future date makes it an unpaid bill" },
+    },
+    required: ["amount", "title"],
+  },
+};
+
 // Accounts the AI may see. Archived cards, debts and goals are left out (R7).
 const getContextAccounts = (accounts) => {
   const active = accounts.filter((a) => a.isActive !== false);
@@ -652,6 +736,216 @@ const getContextAccounts = (accounts) => {
     goals: active.filter((a) => a.type === "SAVINGS_GOAL"),
   };
 };
+
+const SEARCH_LIMIT = 20;
+const isDateStr = (s) =>
+  /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) &&
+  !Number.isNaN(Date.parse(`${s}T12:00:00Z`)) &&
+  new Date(`${s}T12:00:00Z`).toISOString().slice(0, 10) === s;
+const toAmount = (v) => {
+  const n = Math.abs(parseFloat(v));
+  return Number.isFinite(n) ? n : null;
+};
+// Words typed by the model go into LIKE patterns; % and _ would match anything
+const likeText = (v, max = 100) =>
+  String(v || "")
+    .replace(/[%_\\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .slice(0, max);
+const round2 = (n) => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+const CHECKING_WORDS = /\b(checking|chequing|debit|bank)\b/i;
+
+// Accounts whose name contains the words (or Primary Checking for "checking"/"debit")
+const findAccountsByName = (accounts, words) => {
+  const wanted = likeText(words, 60);
+  if (!wanted) return [];
+  if (CHECKING_WORDS.test(wanted)) return accounts.filter((a) => a.type === "CHECKING");
+  return accounts.filter((a) => {
+    const name = (a.name || "").toLowerCase();
+    return name.includes(wanted) || wanted.includes(name);
+  });
+};
+
+/**
+ * AI2: read-only transaction search. Deleted (Trash) rows are left out (Transaction is paranoid).
+ * Returns the newest SEARCH_LIMIT matches plus the count and total of every match.
+ */
+async function searchTransactions(args = {}) {
+  const where = {};
+  const and = [];
+  const applied = {};
+
+  const text = likeText(args.text);
+  if (text) {
+    and.push(sequelize.where(sequelize.fn("LOWER", sequelize.col("title")), { [Op.like]: `%${text}%` }));
+    applied.text = text;
+  }
+  if (isDateStr(args.from)) {
+    and.push({ date: { [Op.gte]: args.from } });
+    applied.from = args.from;
+  }
+  if (isDateStr(args.to)) {
+    and.push({ date: { [Op.lte]: args.to } });
+    applied.to = args.to;
+  }
+  const minAmount = toAmount(args.minAmount);
+  if (minAmount !== null) {
+    and.push({ amount: { [Op.gte]: minAmount } });
+    applied.minAmount = minAmount;
+  }
+  const maxAmount = toAmount(args.maxAmount);
+  if (maxAmount !== null) {
+    and.push({ amount: { [Op.lte]: maxAmount } });
+    applied.maxAmount = maxAmount;
+  }
+  const category = likeText(args.category, 40);
+  if (category) {
+    and.push(sequelize.where(sequelize.fn("LOWER", sequelize.col("category")), { [Op.like]: `%${category}%` }));
+    applied.category = category;
+  }
+  if (args.account) {
+    const matches = findAccountsByName(await Account.findAll(), args.account);
+    if (matches.length === 0) {
+      return { count: 0, total: 0, rows: [], filters: applied, note: `No account matches "${args.account}".` };
+    }
+    const ids = matches.map((a) => a.id);
+    const or = [{ fromAccountId: { [Op.in]: ids } }, { toAccountId: { [Op.in]: ids } }];
+    // Income with no account goes to Primary Checking (services/checkingService.js)
+    if (matches.some((a) => a.type === "CHECKING")) or.push({ type: "INCOME", toAccountId: null });
+    and.push({ [Op.or]: or });
+    applied.account = matches.map((a) => a.name).join(", ");
+  }
+  if (and.length) where[Op.and] = and;
+
+  const [count, total, rows] = await Promise.all([
+    Transaction.count({ where }),
+    Transaction.sum("amount", { where }),
+    Transaction.findAll({
+      where,
+      include: [
+        { model: Account, as: "fromAccount", attributes: ["name"] },
+        { model: Account, as: "toAccount", attributes: ["name"] },
+      ],
+      order: [
+        ["date", "DESC"],
+        ["createdAt", "DESC"],
+      ],
+      limit: SEARCH_LIMIT,
+    }),
+  ]);
+
+  return {
+    count,
+    total: round2(total),
+    shown: rows.length,
+    filters: applied,
+    rows: rows.map((t) => ({
+      date: t.date,
+      title: t.title,
+      amount: round2(t.amount),
+      type: t.type,
+      category: t.category,
+      paid: Boolean(t.isCleared),
+      from: t.fromAccount?.name || (t.type === "EXPENSE" ? "Primary Checking" : null),
+      to: t.toAccount?.name || (t.type === "INCOME" ? "Primary Checking" : null),
+    })),
+  };
+}
+
+// Parser keywords for a card, the same way Quick Add matches cards (frontend quickAddParser.js)
+const cardKeywords = (card) => {
+  const lower = (card.name || "").toLowerCase();
+  const keywords = [];
+  if (lower.includes("visa")) keywords.push("visa");
+  if (lower.includes("mastercard") || lower.includes("mc")) keywords.push("mastercard", "mc");
+  if (lower.includes("amex") || lower.includes("american express")) keywords.push("amex", "cobalt");
+  lower.split(/\s+/).forEach((w) => {
+    if (w.length > 2 && !keywords.includes(w)) keywords.push(w);
+  });
+  return keywords;
+};
+
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const cadFormatter = new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD" });
+
+const describeDate = (date, todayStr) => {
+  if (date === todayStr) return "today";
+  const [y, m, d] = date.split("-").map(Number);
+  const label = new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString("en-CA", {
+    month: "short",
+    day: "numeric",
+    year: y === Number(todayStr.slice(0, 4)) ? undefined : "numeric",
+    timeZone: "UTC",
+  });
+  return date > todayStr ? `due ${label}` : `on ${label}`;
+};
+
+/**
+ * AI1: the Quick Add text for a drafted transaction. Pure: nothing is read or written.
+ * cards are the active credit cards; todayStr is Toronto today.
+ * Returns { quickAddText, summary, ... } or { error }.
+ */
+function buildQuickAddText(args = {}, { todayStr, cards = [] }) {
+  const amount = toAmount(args.amount);
+  if (!amount || amount > 1000000) {
+    return { error: "I need an amount between $0.01 and $1,000,000 to draft this." };
+  }
+  const type = String(args.type || "").toLowerCase() === "income" ? "income" : "expense";
+
+  // Pick the card first, so its keywords can be kept out of the title
+  let card = null;
+  let accountNote = null;
+  const accountWords = likeText(args.account, 60);
+  if (accountWords && type === "expense" && !CHECKING_WORDS.test(accountWords)) {
+    card =
+      cards.find((c) => (c.name || "").toLowerCase().includes(accountWords)) ||
+      cards.find((c) => cardKeywords(c).some((kw) => new RegExp(`\\b${escapeRegex(kw)}\\b`).test(accountWords))) ||
+      null;
+    if (!card) accountNote = `No card matches "${args.account}", so Quick Add will use Primary Checking.`;
+  }
+
+  // The title must not contain words Quick Add reads as an amount, date, account or income marker
+  const reserved = new Set(cards.flatMap(cardKeywords));
+  let title = String(args.title || "")
+    .replace(/[\r\n+$]/g, " ")
+    .replace(/\b(?:due|on)\s+(?:\d\S*|today|tomorrow|sun|mon|tue|wed|thu|fri|sat)\w*/gi, " ")
+    .replace(/\bdue\b/gi, " ")
+    .replace(new RegExp(CHECKING_WORDS.source, "gi"), " ")
+    .split(/\s+/)
+    .filter((w) => w && !reserved.has(w.toLowerCase()) && !/^\d+(?:\.\d{1,2})?$/.test(w))
+    .join(" ")
+    .slice(0, 60)
+    .trim();
+  if (!title) return { error: "I need a short name for this transaction to draft it." };
+
+  const date = isDateStr(args.date) ? args.date : todayStr;
+  const amountText = amount.toFixed(2).replace(/\.00$/, "");
+  const parts = [`${type === "income" ? "+" : ""}${amountText}`, title];
+  if (card) {
+    const others = new Set(cards.filter((c) => c !== card).flatMap(cardKeywords));
+    const keywords = cardKeywords(card);
+    parts.push(keywords.find((kw) => !others.has(kw)) || keywords[0]);
+  }
+  if (date !== todayStr) parts.push(`${date > todayStr ? "due" : "on"} ${date}`);
+
+  const displayTitle = title.charAt(0).toUpperCase() + title.slice(1);
+  const where = type === "income" ? "" : ` from ${card ? card.name : "Primary Checking"}`;
+  const status = date > todayStr ? "unpaid" : "paid";
+  const summary =
+    `${type === "income" ? "Income" : "Expense"}: ${displayTitle}, ${cadFormatter.format(amount)}${where}, ` +
+    `${describeDate(date, todayStr)} (${status}). Not saved yet.`;
+
+  return {
+    quickAddText: parts.join(" "),
+    summary,
+    saved: false,
+    ...(accountNote ? { note: accountNote } : {}),
+  };
+}
 
 // Tool Execution Handlers (S1 exact math)
 async function executeTool(name, args, todayStr) {
@@ -788,7 +1082,116 @@ async function executeTool(name, args, todayStr) {
     };
   }
 
+  if (name === "searchTransactions") {
+    return searchTransactions(args);
+  }
+
+  if (name === "compareMonths") {
+    if (!isMonthStr(args.monthA) || !isMonthStr(args.monthB)) {
+      return { error: "Both months must be in YYYY-MM format, e.g. 2026-09." };
+    }
+    return compareMonths(args.monthA, args.monthB);
+  }
+
+  if (name === "getSubscriptions") {
+    const summary = await getSubscriptionsSummary(todayStr);
+    return {
+      count: summary.count,
+      totalMonthly: summary.totalMonthly,
+      totalYearly: summary.totalAnnual,
+      subscriptions: summary.subscriptions.map((sub) => ({
+        name: sub.name,
+        cadence: sub.cadence,
+        amount: sub.latestAmount,
+        monthlyCost: sub.monthlyCost,
+        yearlyCost: sub.annualCost,
+        nextChargeDate: sub.nextDate,
+        account: sub.payingAccount,
+        priceChange: sub.priceChange,
+      })),
+    };
+  }
+
+  if (name === "proposeTransaction") {
+    const { cards } = getContextAccounts(await Account.findAll({ where: { type: "CREDIT_CARD" } }));
+    return buildQuickAddText(args, { todayStr, cards });
+  }
+
   return { error: `Tool ${name} not recognized` };
+}
+
+const CHAT_TOOLS = [
+  simulatePurchaseDeclaration,
+  getCategorySpendingDeclaration,
+  getDebtPayoffDeclaration,
+  searchTransactionsDeclaration,
+  compareMonthsDeclaration,
+  getSubscriptionsDeclaration,
+  proposeTransactionDeclaration,
+];
+
+/**
+ * Multi-round tool calling (C2): parallel calls answered in ONE user turn, up to 3 rounds.
+ * runTool defaults to executeTool; tests pass a spy. Returns the model's reply and the drafts
+ * proposeTransaction built (shown as "Review & save" cards; nothing is saved here).
+ */
+async function runChatLoop({ ai, model, contents, systemPrompt, todayStr, runTool = executeTool }) {
+  const toolsConfig = [{ functionDeclarations: CHAT_TOOLS }];
+  const usage = { todayStr, endpoint: "chat-advisor" };
+  const proposals = [];
+
+  const ask = () =>
+    generate(
+      ai,
+      {
+        model,
+        contents,
+        config: {
+          systemInstruction: systemPrompt,
+          tools: toolsConfig,
+          abortSignal: AbortSignal.timeout(20000),
+        },
+      },
+      usage
+    );
+
+  let response = await ask();
+
+  for (let round = 0; round < 3; round++) {
+    const calls = response.functionCalls;
+    if (!Array.isArray(calls) || calls.length === 0) break;
+
+    // Keep model turn with function calls & thought signatures
+    if (response.candidates?.[0]?.content) {
+      contents.push(response.candidates[0].content);
+    }
+
+    // Collect all function responses into ONE user turn (C2)
+    const parts = [];
+    for (const call of calls) {
+      const output = await runTool(call.name, call.args || {}, todayStr);
+      if (call.name === "proposeTransaction" && output?.quickAddText && proposals.length < 5) {
+        proposals.push({ quickAddText: output.quickAddText, summary: output.summary });
+      }
+      parts.push({
+        functionResponse: {
+          name: call.name,
+          response: { output },
+        },
+      });
+    }
+    contents.push({ role: "user", parts });
+
+    response = await ask();
+  }
+
+  const reply =
+    response.text ||
+    (proposals.length
+      ? "I drafted this for you. Tap **Review & save** to check it in Quick Add; nothing is saved until you do."
+      : "I ran the numbers but couldn't summarize them — please ask again.");
+
+  return { reply, proposals };
 }
 
 router.post(
@@ -809,6 +1212,9 @@ router.post(
       const startOfMonth = `${year}-${String(month).padStart(2, "0")}-01`;
       const lastDay = new Date(year, month, 0).getDate();
       const endOfMonth = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+
+      const reservation = await reserveCall(todayStr);
+      if (!reservation.allowed) return sendCapReached(res, reservation);
 
       const [
         forecast,
@@ -905,11 +1311,18 @@ ${
 BEHAVIOR GUIDELINES:
 1. Address Maverick personally, warmly, and directly.
 2. Be mathematically precise and concise. Do NOT guess or hallucinate arithmetic.
-3. You have powerful tools:
+3. You have powerful tools. Every number you state must come from <financial_data> or a tool result:
    - Use 'simulatePurchase' whenever Maverick asks "Can I afford X?" or asks about making a purchase.
    - Use 'getCategorySpending' whenever Maverick asks how much they spent on a category (e.g. food, shopping).
    - Use 'getDebtPayoff' whenever Maverick asks about paying extra on debts or Avalanche vs Snowball.
-4. Format responses using clean GitHub markdown (bold key numbers, concise bullets).
+   - Use 'searchTransactions' to find specific transactions (e.g. "when did I last pay hydro", "what did I spend at Costco").
+   - Use 'compareMonths' to compare two months (e.g. "did I spend more this month than last month"). Months are YYYY-MM.
+   - Use 'getSubscriptions' for subscriptions, recurring bills, what they cost per month or year, and when they charge next.
+   - Use 'proposeTransaction' when Maverick asks to add, log or record a transaction (e.g. "add 12.50 lunch visa").
+4. You can NEVER save, add, change or delete anything. 'proposeTransaction' only drafts: the app shows the draft
+   as a card with a "Review & save" button, and nothing is saved unless Maverick taps it and saves in Quick Add.
+   Never say or imply that something was saved, added, logged or recorded. Say it is drafted and ready to review.
+5. Format responses using clean GitHub markdown (bold key numbers, concise bullets).
 `;
 
       // Build conversation contents (C1 & C2)
@@ -929,67 +1342,15 @@ BEHAVIOR GUIDELINES:
         parts: [{ text: userMessage }],
       });
 
-      const models = getModels();
-
-      const toolsConfig = [
-        {
-          functionDeclarations: [
-            simulatePurchaseDeclaration,
-            getCategorySpendingDeclaration,
-            getDebtPayoffDeclaration,
-          ],
-        },
-      ];
-
-      // Multi-round tool calling loop handling parallel calls and multi-turn chains (C2)
-      let response = await generateWithRetry(ai, {
-        model: models.chat,
+      const { reply, proposals } = await runChatLoop({
+        ai,
+        model: getModels().chat,
         contents,
-        config: {
-          systemInstruction: systemPrompt,
-          tools: toolsConfig,
-          abortSignal: AbortSignal.timeout(20000),
-        },
+        systemPrompt,
+        todayStr,
       });
 
-      for (let round = 0; round < 3; round++) {
-        const calls = response.functionCalls;
-        if (!Array.isArray(calls) || calls.length === 0) break;
-
-        // Keep model turn with function calls & thought signatures
-        if (response.candidates?.[0]?.content) {
-          contents.push(response.candidates[0].content);
-        }
-
-        // Collect all function responses into ONE user turn (C2)
-        const parts = [];
-        for (const call of calls) {
-          const output = await executeTool(call.name, call.args || {}, todayStr);
-          parts.push({
-            functionResponse: {
-              name: call.name,
-              response: { output },
-            },
-          });
-        }
-        contents.push({ role: "user", parts });
-
-        response = await generateWithRetry(ai, {
-          model: models.chat,
-          contents,
-          config: {
-            systemInstruction: systemPrompt,
-            tools: toolsConfig,
-            abortSignal: AbortSignal.timeout(20000),
-          },
-        });
-      }
-
-      const reply =
-        response.text ||
-        "I ran the numbers but couldn't summarize them — please ask again.";
-
-      res.json({ reply });
+      res.json({ reply, proposals });
     } catch (error) {
       if (error.status === 504) {
         return res.status(504).json({ error: error.message });
@@ -1003,3 +1364,7 @@ BEHAVIOR GUIDELINES:
 module.exports = router;
 module.exports.getContextAccounts = getContextAccounts;
 module.exports.executeTool = executeTool;
+module.exports.runChatLoop = runChatLoop;
+module.exports.buildQuickAddText = buildQuickAddText;
+module.exports.CHAT_TOOLS = CHAT_TOOLS;
+module.exports.setAiClientForTests = setAiClientForTests;

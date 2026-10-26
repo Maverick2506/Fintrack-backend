@@ -7,6 +7,8 @@ const {
   DEBT_INTEREST_SETTING_KEY,
   isDebtInterestEnabled,
 } = require("../services/debtInterestService");
+const { getUsage } = require("../services/aiUsageService");
+const { toZonedTime, format } = require("date-fns-tz");
 
 const router = express.Router();
 router.use(authMiddleware);
@@ -70,6 +72,17 @@ router.put(
     const enabled = Boolean(req.body.enabled);
     await Setting.upsert({ key: DEBT_INTEREST_SETTING_KEY, value: String(enabled) });
     res.json({ enabled });
+  })
+);
+
+// AI usage today (AI8): calls counted against the ai_daily_cap Setting and the tokens Gemini reported
+router.get(
+  "/ai-usage",
+  asyncHandler(async (req, res) => {
+    const todayStr = format(toZonedTime(new Date(), "America/Toronto"), "yyyy-MM-dd", {
+      timeZone: "America/Toronto",
+    });
+    res.json(await getUsage(todayStr));
   })
 );
 
