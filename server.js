@@ -674,7 +674,7 @@ async function initialize() {
       const assigned = await runLegacySeriesIdMigration();
       if (assigned !== null) {
         console.log(
-          `✅ Assigned series IDs to ${assigned.seriesCount} old series (${assigned.rowCount} rows).`
+          `✅ Assigned series IDs to ${assigned.seriesCount} old series (${assigned.rowCount} rows; ${assigned.joinedExistingCount} joined an existing series).`
         );
         // A row on the same date as one that joined its series (unique index) stays a single row; a
         // recurring one is set to One-time so it is not charged as a second series

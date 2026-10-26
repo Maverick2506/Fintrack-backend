@@ -6814,6 +6814,17 @@ async function runTestSuite() {
     { title: "Suite 43 Twin Gym", amount: 40, date: s43Base, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
     { title: "Suite 43 Twin Gym", amount: 40, date: s43Base, type: "EXPENSE", category: "Other", isCleared: true, recurrence: "monthly" },
   ]);
+  // An old series that the previous code already split: its template row got its own id as the
+  // series id (as the old generator did), its older rows kept none. One older row shares the
+  // template's date.
+  const [s43SplitTemplate] = await Transaction.bulkCreate([
+    { title: "Suite 43 Split Water", amount: 45, date: getTorontoOffsetDate(-10), type: "EXPENSE", category: "Utilities", isCleared: true, recurrence: "bi-weekly" },
+  ]);
+  await Transaction.update({ recurringGroupId: s43SplitTemplate.id }, { where: { id: s43SplitTemplate.id } });
+  const [s43SplitOld, s43SplitSameDate] = await Transaction.bulkCreate([
+    { title: "Suite 43 Split Water", amount: 45, date: getTorontoOffsetDate(-24), type: "EXPENSE", category: "Utilities", isCleared: true, recurrence: "bi-weekly" },
+    { title: "Suite 43 Split Water", amount: 45, date: getTorontoOffsetDate(-10), type: "EXPENSE", category: "Utilities", isCleared: true, recurrence: "bi-weekly" },
+  ]);
   // Rows that never recurred: same title among themselves, and an income with the rent's title
   const s43Dentist = await Transaction.bulkCreate([
     { title: "Suite 43 Dentist", amount: 120, date: getTorontoOffsetDate(-90), type: "EXPENSE", category: "Health", isCleared: true, recurrence: "none" },
@@ -6916,6 +6927,15 @@ async function runTestSuite() {
     `A left-out same-date recurring row is set to One-time and reported (got ${s43Twins.map((r) => `${r.recurringGroupId ? "joined" : "single"}:${r.recurrence}`).join(",")})`
   );
 
+  // An old row of a series that already has an id joins that id; one on a date the series has is left out
+  const s43SplitOldAfter = await Transaction.findByPk(s43SplitOld.id);
+  const s43SplitSameAfter = await Transaction.findByPk(s43SplitSameDate.id);
+  assert(
+    s43SplitOldAfter.recurringGroupId === s43SplitTemplate.id && s43SplitSameAfter.recurringGroupId === null &&
+      s43SplitSameAfter.recurrence === "none" && s43Result.joinedExistingCount >= 1,
+    `Old rows join the existing series id of the same title (got ${s43SplitOldAfter.recurringGroupId === s43SplitTemplate.id ? "joined" : s43SplitOldAfter.recurringGroupId}, same-date ${s43SplitSameAfter.recurringGroupId}:${s43SplitSameAfter.recurrence})`
+  );
+
   // 43.4 The migration runs only once
   assert((await s43RunMigration()) === null, "The series-id migration runs only once");
   await s43Generate(null, { todayStr: s43Today });
@@ -6923,6 +6943,13 @@ async function runTestSuite() {
     (await Transaction.count({ where: { recurringGroupId: s43ProbeGroup } })) > 1 &&
       (await Transaction.count({ where: { title: "Suite 43 Dentist" } })) === 2,
     "Once it has run, generation resumes, and the one-off rows generate nothing"
+  );
+  const s43SplitAll = await Transaction.findAll({ where: { title: "Suite 43 Split Water" } });
+  const s43SplitDates = s43SplitAll.filter((r) => r.id !== s43SplitSameDate.id).map((r) => r.date);
+  assert(
+    s43SplitDates.length === new Set(s43SplitDates).size && s43SplitDates.includes(getTorontoOffsetDate(4)) &&
+      s43SplitAll.every((r) => r.id === s43SplitSameDate.id || r.recurringGroupId === s43SplitTemplate.id),
+    `A split old series is generated once per date, all in one series (got ${[...s43SplitDates].sort().join(",")})`
   );
   assert(
     (await Transaction.count({ where: { title: "Suite 43 Twin Gym", date: s43Slot1 } })) === 1,

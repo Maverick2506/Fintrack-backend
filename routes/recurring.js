@@ -486,14 +486,19 @@ const legacySeriesKey = (trx) => `${trx.type}:${String(trx.title || "").toLowerC
 
 // One-off (guarded in server.js): older series had no recurringGroupId and were grouped by type and
 // title, so no vacated slot was kept for them and a newest row moved earlier could be charged twice.
-// Every such title group with at least one recurring row (Trash included) gets one new id on all of its
-// rows, Trash included; groups that never recurred are left alone. Two rows of a group on the same date
-// can't share an id (unique index on recurringGroupId + date): the one that joins is, in order, the
-// recurring one, then the paid one, then the oldest (createdAt); the others stay single rows. A left-out
-// row that still recurs is set to One-time, or it would generate as a series of its own and the bill
-// would be charged twice. Grouping ignores the account, as the old title grouping did.
-// Loads the rows without an id into memory, which is fine for a one-off at this app's size.
-// Returns { seriesCount, rowCount, leftOut: [{ title, date, amount, setToOneTime }] }.
+// Every such title group with at least one recurring row (Trash included) gets a series id on all of its
+// rows, Trash included; groups that never recurred are left alone. Grouping ignores the account, as the
+// old title grouping did.
+// Before this, the generator and edits gave some rows of an old series an id (the template row's own
+// id, or a fresh one) while its older rows kept none. Such a group joins the existing id of the same
+// type and title (the series with the newest row, if several), as legacy_recurring_groups_backfilled
+// did; a new id would make a second series that the generator fills in on every date.
+// Only one row per date can hold an id (unique index on recurringGroupId + date). Rows on a date the
+// joined series already has are left out; among rows without an id on one date, the one that joins is,
+// in order, the recurring one, then the paid one, then the oldest (createdAt). A left-out row that still
+// recurs is set to One-time, or it would generate as a series of its own and be charged twice.
+// Loads the rows into memory, which is fine for a one-off at this app's size.
+// Returns { seriesCount, joinedExistingCount, rowCount, leftOut: [{ title, date, amount, setToOneTime }] }.
 const assignLegacySeriesIds = async (dbTx = null) => {
   const rows = await Transaction.findAll({
     where: { recurringGroupId: null },
@@ -507,14 +512,37 @@ const assignLegacySeriesIds = async (dbTx = null) => {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(row);
   }
+
+  // Per type and title: the existing series with the newest row, and the dates it holds
+  const withId = await Transaction.findAll({
+    where: { recurringGroupId: { [Op.ne]: null } },
+    attributes: ["id", "title", "type", "date", "recurringGroupId"],
+    order: [
+      ["date", "DESC"],
+      ["createdAt", "DESC"],
+    ],
+    paranoid: false,
+    transaction: dbTx,
+  });
+  const existingIdByKey = new Map();
+  const datesById = new Map();
+  for (const row of withId) {
+    const key = legacySeriesKey(row);
+    if (!existingIdByKey.has(key)) existingIdByKey.set(key, row.recurringGroupId);
+    if (!datesById.has(row.recurringGroupId)) datesById.set(row.recurringGroupId, new Set());
+    datesById.get(row.recurringGroupId).add(row.date);
+  }
+
   const joinsFirst = (a, b) =>
     Number(ACTIVE_RECURRENCES.includes(b.recurrence)) - Number(ACTIVE_RECURRENCES.includes(a.recurrence)) ||
     Number(Boolean(b.isCleared)) - Number(Boolean(a.isCleared)) ||
     new Date(a.createdAt) - new Date(b.createdAt) ||
     String(a.id).localeCompare(String(b.id));
-  const result = { seriesCount: 0, rowCount: 0, leftOut: [] };
-  for (const groupRows of groups.values()) {
+  const result = { seriesCount: 0, joinedExistingCount: 0, rowCount: 0, leftOut: [] };
+  for (const [key, groupRows] of groups) {
     if (!groupRows.some((r) => ACTIVE_RECURRENCES.includes(r.recurrence))) continue;
+    const existingId = existingIdByKey.get(key) || null;
+    const takenDates = (existingId && datesById.get(existingId)) || new Set();
     const byDate = new Map();
     for (const row of groupRows) {
       if (!byDate.has(row.date)) byDate.set(row.date, []);
@@ -522,19 +550,22 @@ const assignLegacySeriesIds = async (dbTx = null) => {
     }
     const ids = [];
     const stopIds = [];
-    for (const sameDate of byDate.values()) {
-      const [joining, ...excluded] = [...sameDate].sort(joinsFirst);
-      ids.push(joining.id);
+    for (const [date, sameDate] of byDate) {
+      const sorted = [...sameDate].sort(joinsFirst);
+      const excluded = takenDates.has(date) ? sorted : sorted.slice(1);
+      if (!takenDates.has(date)) ids.push(sorted[0].id);
       for (const r of excluded) {
         const setToOneTime = ACTIVE_RECURRENCES.includes(r.recurrence);
         if (setToOneTime) stopIds.push(r.id);
         result.leftOut.push({ title: r.title, date: r.date, amount: parseFloat(r.amount) || 0, setToOneTime });
       }
     }
-    await Transaction.update(
-      { recurringGroupId: crypto.randomUUID() },
-      { where: { id: { [Op.in]: ids } }, paranoid: false, transaction: dbTx }
-    );
+    if (ids.length > 0) {
+      await Transaction.update(
+        { recurringGroupId: existingId || crypto.randomUUID() },
+        { where: { id: { [Op.in]: ids } }, paranoid: false, transaction: dbTx }
+      );
+    }
     if (stopIds.length > 0) {
       await Transaction.update(
         { recurrence: "none" },
@@ -542,6 +573,7 @@ const assignLegacySeriesIds = async (dbTx = null) => {
       );
     }
     result.seriesCount++;
+    if (existingId) result.joinedExistingCount++;
     result.rowCount += ids.length;
   }
   return result;
