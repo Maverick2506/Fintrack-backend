@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const { DataTypes } = require("sequelize");
 const sequelize = require("../database");
 
@@ -83,5 +84,15 @@ const Transaction = sequelize.define(
     ],
   }
 );
+
+// A recurring row always belongs to a series: a row saved as recurring without a recurringGroupId gets
+// a new one, whichever route created or edited it (the generator groups by id only; see getSeriesKey).
+// Static bulk writes skip this hook; none of them set a recurrence on a row without an id.
+const SAVED_RECURRENCES = ["weekly", "bi-weekly", "monthly", "yearly"];
+Transaction.addHook("beforeSave", (trx) => {
+  if (SAVED_RECURRENCES.includes(trx.recurrence) && !trx.recurringGroupId) {
+    trx.recurringGroupId = crypto.randomUUID();
+  }
+});
 
 module.exports = Transaction;
