@@ -208,21 +208,26 @@ const applyImportedRow = async (
     }
   }
   if (checkingHistory) {
-    const change = checkingEffect(trx, checkingId) - previousCheckingEffect;
-    if (change !== 0) {
-      await Account.increment("initialBalance", {
-        by: -change,
-        where: { id: checkingId },
-        transaction: dbTx,
-      });
-    }
+    await offsetCheckingHistory(checkingId, checkingEffect(trx, checkingId) - previousCheckingEffect, dbTx);
   }
+};
+
+// Checking's balance is computed from its rows: when a row its balance already includes (history)
+// moves Checking by `change`, the opening balance takes the opposite so the balance stays put
+const offsetCheckingHistory = async (checkingId, change, dbTx = null) => {
+  if (!change) return;
+  await Account.increment("initialBalance", {
+    by: -change,
+    where: { id: checkingId },
+    transaction: dbTx,
+  });
 };
 
 module.exports = {
   adjustAccountForTransaction,
   checkingEffect,
   applyImportedRow,
+  offsetCheckingHistory,
   getTodayString,
   TIMEZONE,
 };

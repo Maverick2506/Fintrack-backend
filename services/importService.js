@@ -1,7 +1,12 @@
 const { Op } = require("sequelize");
 const { sequelize, Account, Transaction, Setting, ImportRef } = require("../models");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
-const { adjustAccountForTransaction, checkingEffect, applyImportedRow } = require("./accountBalanceService");
+const {
+  adjustAccountForTransaction,
+  checkingEffect,
+  applyImportedRow,
+  offsetCheckingHistory,
+} = require("./accountBalanceService");
 const { getBalanceAnchor } = require("./balanceAnchorService");
 const { getAppBalance } = require("./reconcileService");
 const {
@@ -384,8 +389,9 @@ const buildPreview = async (account, rows, dbTx = null) => {
     account.type === "CHECKING" && row.direction === "out" ? cardPaidBy(row.description, cards) : null;
   const paidFits = (row, t) => {
     if (paidRowDirection(t, account) !== row.direction) return false;
+    // A line that names a card or debt ("EMBER VISA PAYMENT") is only ever a payment into it
     const payee = payeeOf(row);
-    if (payee && t.type === "TRANSFER" && t.toAccountId && t.toAccountId !== payee.id) return false;
+    if (payee) return t.type === "TRANSFER" && t.toAccountId === payee.id;
     return true;
   };
   // One-to-one pairs, closest date first; a similar title only breaks ties
@@ -640,10 +646,17 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         const same = await Transaction.findByPk(row.possible.id, { transaction: dbTx });
         const sign = parseFloat(same.amount) < 0 ? -1 : 1;
         if (!same.isTaxExclusive && cents(same.amount) !== sign * cents(row.amount)) {
-          const wasApplied = Boolean(same.balanceApplied);
-          if (wasApplied) await adjustAccountForTransaction(same, -1, dbTx);
+          // Each side by its own anchor: a side whose balance already includes the bank amount
+          // (history) only takes the new amount, without moving that balance
+          const sides = await sidesFor(same, row.date);
+          const checkingBefore = checkingEffect(same, checking.id);
+          const restate = Boolean(same.balanceApplied) && !sides.storedHistory;
+          if (restate) await adjustAccountForTransaction(same, -1, dbTx);
           await same.update({ amount: sign * row.amount }, { transaction: dbTx });
-          if (wasApplied) await adjustAccountForTransaction(same, 1, dbTx, true);
+          if (restate) await adjustAccountForTransaction(same, 1, dbTx, true);
+          if (sides.checkingHistory) {
+            await offsetCheckingHistory(checking.id, checkingEffect(same, checking.id) - checkingBefore, dbTx);
+          }
         }
         await ImportRef.create({ ref: row.clientRef, transactionId: same.id, accountId: account.id }, { transaction: dbTx });
         result.matched++;

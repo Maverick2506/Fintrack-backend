@@ -8000,6 +8000,42 @@ async function runTestSuite() {
     s53P5.rows[0].possible?.id === s53Lunch.id && s53C5.created === 1 && Math.abs(parseFloat(s53Lunch.amount) - 10) < 0.005,
     "Different: the bank row is added and the app row stays as it was"
   );
+  // "Same" on a row Checking's balance already includes: the amount changes, the balance doesn't
+  const s53Lunch2 = await s53Add({ name: "Team lunch", amount: 20, due_date: "2025-11-26" });
+  await Setting.upsert({ key: `balance_anchor:${s53Checking.id}`, value: s53Today });
+  const s53BeforeHist = await s45CheckingBalance(await s45GetChecking(), s53Today);
+  const s53P6 = await s53Preview("2025-11-27,PHO HOUSE 12,-24.00\n");
+  const s53C6 = await s53Commit(s53P6, { 0: { linkId: s53Lunch2.id } });
+  await s53Lunch2.reload();
+  assert(
+    s53P6.rows[0].possible?.id === s53Lunch2.id && s53P6.rows[0].history && s53C6.created === 0 &&
+      Math.abs(parseFloat(s53Lunch2.amount) - 24) < 0.005 &&
+      Math.abs((await s45CheckingBalance(await s45GetChecking(), s53Today)) - s53BeforeHist) < 0.005,
+    `Same on a tip older than Checking's typed balance: the lunch becomes 24.00, Checking stays put ` +
+      `(got ${s53Lunch2.amount}, ${s53BeforeHist} -> ${await s45CheckingBalance(await s45GetChecking(), s53Today)})`
+  );
+  await Setting.destroy({ where: { key: `balance_anchor:${s53Checking.id}` } });
+
+  // A line that names a card never pairs with a same-amount payment that isn't to that card
+  const s53Ember = await s45Opened(await Account.create({ name: "Ember Visa", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 }));
+  const s53Etransfer = await s53Add({ name: "Rent share", amount: 157.31, due_date: "2025-11-28", category: "Essentials" });
+  await api("POST", "/api/import/commit", {
+    accountId: s53Ember.id,
+    rows: commitRows((await uploadCsv({ accountId: s53Ember.id, csv: "2025-11-29,PAYMENT - THANK YOU,157.31\n", mapping: s53Map })).body),
+  });
+  const s53P7 = await s53Preview("2025-11-28,EMBER VISA PAYMENT,-157.31\n2025-11-28,E-TRANSFER JOHN,-157.31\n");
+  const s53C7 = await s53Commit(s53P7);
+  const s53EmberPay = await Transaction.findOne({ where: { type: "TRANSFER", toAccountId: s53Ember.id } });
+  await s53Ember.reload();
+  assert(
+    s53P7.rows[0].match?.id === s53EmberPay.id && s53P7.rows[1].match?.id === s53Etransfer.id && s53C7.created === 0 &&
+      s53EmberPay.fromAccountId === s53Checking.id && Math.abs(parseFloat(s53Ember.initialBalance) - 342.69) < 0.005 &&
+      (await Transaction.count({ where: { type: "EXPENSE", date: { [Op.between]: ["2025-11-28", "2025-11-29"] } } })) === 1,
+    `"EMBER VISA PAYMENT" links to the card's payment and the e-transfer to the hand-entered row; nothing counted twice ` +
+      `(got ${s53P7.rows.map((r) => r.match?.title)}, from ${s53EmberPay.fromAccountId === s53Checking.id ? "Checking" : s53EmberPay.fromAccountId}, created ${s53C7.created})`
+  );
+  await Transaction.destroy({ where: { [Op.or]: [{ toAccountId: s53Ember.id }, { fromAccountId: s53Ember.id }] }, force: true });
+  await Account.destroy({ where: { id: s53Ember.id } });
   await Transaction.destroy({ where: { date: { [Op.between]: ["2025-11-01", "2025-11-30"] } }, force: true });
 
   // Cleanup Suites 45, 47-53
