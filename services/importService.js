@@ -95,6 +95,48 @@ const isEligible = (candidate, row, account) => {
   return candidate.type === "TRANSFER" && candidate.toAccountId === account.id;
 };
 
+// A chequing debit that pays a card: says payment and names the card ("TD VISA PAYMENT")
+const PAYMENT_WORDS = /payment|pymt|pmt|paiement/i;
+const CARD_WORDS = /visa|master ?card|amex|american express|credit card/i;
+const looksLikePaymentTo = (description, card) =>
+  PAYMENT_WORDS.test(description) && (titlesSimilar(card.name, description) || CARD_WORDS.test(description));
+
+// The one active card a chequing debit pays, or null when it names none or more than one
+const cardPaidBy = (description, cards) => {
+  if (!PAYMENT_WORDS.test(description)) return null;
+  const named = cards.filter((c) => titlesSimilar(c.name, description));
+  return named.length === 1 ? named[0] : null;
+};
+
+// A card payment shows on both statements: leaving chequing and reaching the card. Once one side is
+// in the app (imported, entered by hand, or a scheduled payment marked paid), the other side links to
+// that same TRANSFER instead of recording the payment again:
+// - card money in: a paid TRANSFER from chequing to this card -> nothing to change ("link")
+// - chequing money out: a paid TRANSFER from this chequing account to a card -> nothing to change,
+//   or one the card import recorded with no from-account -> it gets this account as its from-account
+// A TRANSFER links to each account's statement once (ImportRefs record which account linked it).
+const linkCandidateFor = (row, account, transfers, linkedBy, used) => {
+  const amountCents = cents(row.amount);
+  let best = null;
+  for (const t of transfers) {
+    if (used.has(t.id) || cents(t.amount) !== amountCents) continue;
+    if (linkedBy.get(t.id)?.has(account.id)) continue;
+    const gap = daysBetween(t.date, row.date);
+    if (gap > MATCH_WINDOW_DAYS) continue;
+    let setFrom = false;
+    if (account.type === "CREDIT_CARD") {
+      if (row.direction !== "in" || t.toAccountId !== account.id || !t.fromAccountId) continue;
+    } else {
+      if (row.direction !== "out" || !t.toAccount || !looksLikePaymentTo(row.description, t.toAccount)) continue;
+      if (t.fromAccountId === account.id) setFrom = false;
+      else if (!t.fromAccountId && t.category === "Credit Card Payment") setFrom = true;
+      else continue;
+    }
+    if (!best || gap < best.gap) best = { t, gap, setFrom };
+  }
+  return best;
+};
+
 const needsSimilarTitle = (candidate, row, account) =>
   !(row.direction === "in" && account.type === "CREDIT_CARD");
 
@@ -136,7 +178,8 @@ const loadCategoryHistory = async (dbTx) => {
 
 // Marks each parsed row (from applyMapping + withOccurrences) as
 // - duplicate: its clientRef was already imported (a row or its Trash copy, or a matched bill) -> skipped
-// - match: an unpaid row with the same amount, a date within 3 days and a similar title -> marked paid
+// - match: an unpaid row with the same amount, a date within 3 days and a similar title -> marked paid,
+//   or the other statement's side of a card payment already in the app -> linked (linkCandidateFor)
 // - new: created, with the category from the rules
 // Each unpaid row matches at most one bank row, the closest by date.
 const buildPreview = async (account, rows, dbTx = null) => {
@@ -172,6 +215,33 @@ const buildPreview = async (account, rows, dbTx = null) => {
     order: [["date", "ASC"]],
     transaction: dbTx,
   });
+  // Paid card payments in the same window, for linking the other statement's side of a payment
+  const transfers = await Transaction.findAll({
+    where: {
+      type: "TRANSFER",
+      isCleared: true,
+      toAccountId: { [Op.ne]: null },
+      date: { [Op.between]: [shift(dates[0], -MATCH_WINDOW_DAYS), shift(dates[dates.length - 1], MATCH_WINDOW_DAYS)] },
+    },
+    include: [{ model: Account, as: "toAccount", where: { type: "CREDIT_CARD" } }],
+    order: [["date", "ASC"]],
+    transaction: dbTx,
+  });
+  const linkRefs = transfers.length
+    ? await ImportRef.findAll({
+        where: { transactionId: { [Op.in]: transfers.map((t) => t.id) } },
+        transaction: dbTx,
+      })
+    : [];
+  const linkedBy = new Map();
+  for (const r of linkRefs) {
+    if (!linkedBy.has(r.transactionId)) linkedBy.set(r.transactionId, new Set());
+    linkedBy.get(r.transactionId).add(r.accountId);
+  }
+  const cards =
+    account.type === "CHECKING"
+      ? await Account.findAll({ where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } }, transaction: dbTx })
+      : [];
   const rules = await loadRules(dbTx);
   const history = await loadCategoryHistory(dbTx);
   const used = new Set();
@@ -187,6 +257,9 @@ const buildPreview = async (account, rows, dbTx = null) => {
       occurrence: row.occurrence,
       clientRef: ref,
     };
+    // A chequing debit that pays one of your cards is a TRANSFER to it, not spending
+    const payee = account.type === "CHECKING" && row.direction === "out" ? cardPaidBy(row.description, cards) : null;
+    if (payee) base.toCard = { id: payee.id, name: payee.name };
     const prior = imported.get(ref);
     if (prior) {
       return { ...base, status: "duplicate", existingId: prior.id, inTrash: prior.inTrash, category: null };
@@ -215,6 +288,25 @@ const buildPreview = async (account, rows, dbTx = null) => {
         },
       };
     }
+    const link = linkCandidateFor(row, account, transfers, linkedBy, used);
+    if (link) {
+      used.add(link.t.id);
+      return {
+        ...base,
+        status: "match",
+        category: link.t.category,
+        match: {
+          id: link.t.id,
+          title: link.t.title,
+          date: link.t.date,
+          amount: parseFloat(link.t.amount),
+          category: link.t.category,
+          alreadyRecorded: true,
+          setFrom: link.setFrom,
+        },
+      };
+    }
+    if (payee) return { ...base, status: "new", category: "Credit Card Payment", ruleId: null };
     const { category, ruleId } = categoryFor(row, account, rules, history);
     return { ...base, status: "new", category, ruleId };
   });
@@ -246,6 +338,23 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         result.skipped++;
         continue;
       }
+      if (row.status === "match" && sent.matchId !== null && row.match.alreadyRecorded) {
+        // The other statement already recorded this payment: link to it, change no balance unless
+        // the card side had no from-account yet (then it now comes out of this chequing account)
+        if (row.match.setFrom) {
+          const transfer = await Transaction.findByPk(row.match.id, { transaction: dbTx });
+          await adjustAccountForTransaction(transfer, -1, dbTx);
+          await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
+          await adjustAccountForTransaction(transfer, 1, dbTx, true);
+        }
+        await ImportRef.create(
+          { ref: row.clientRef, transactionId: row.match.id, accountId: account.id },
+          { transaction: dbTx }
+        );
+        result.matched++;
+        result.matchedIds.push(row.match.id);
+        continue;
+      }
       if (row.status === "match" && sent.matchId !== null) {
         const bill = await Transaction.findByPk(row.match.id, { transaction: dbTx });
         // Reverse, change, re-apply: the same path as marking a bill paid in the edit form
@@ -265,7 +374,9 @@ const commitImport = async ({ accountId, rows, mapping }) => {
       }
 
       let fields;
-      if (row.direction === "out") {
+      if (row.toCard) {
+        fields = { type: "TRANSFER", category: "Credit Card Payment", fromAccountId: account.id, toAccountId: row.toCard.id };
+      } else if (row.direction === "out") {
         const wanted = sent.category && EXPENSE_CATEGORIES.includes(sent.category) ? sent.category : null;
         const category = wanted || (row.status === "new" ? row.category : null) || "Other";
         fields = { type: "EXPENSE", category, fromAccountId: account.id, toAccountId: null };
@@ -297,6 +408,11 @@ const commitImport = async ({ accountId, rows, mapping }) => {
       );
       // The bank says it happened, so it changes the balance whatever its date
       await adjustAccountForTransaction(created, 1, dbTx, true);
+      // Records which account's statement holds this row, so the other side of a card payment can link
+      await ImportRef.create(
+        { ref: row.clientRef, transactionId: created.id, accountId: account.id },
+        { transaction: dbTx }
+      );
       result.created++;
       result.ids.push(created.id);
     }

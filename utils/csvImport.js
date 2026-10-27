@@ -313,6 +313,7 @@ const withOccurrences = (rows) => {
 const GENERIC_WORDS = new Set([
   "payment", "purchase", "pos", "transfer", "bill", "debit", "credit", "online", "the", "and", "for",
   "inc", "ltd", "com", "www", "thank", "you", "auto", "pay", "pre", "authorized", "interac", "etransfer",
+  "card",
 ]);
 
 const titleWords = (s) =>

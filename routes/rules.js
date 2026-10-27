@@ -10,13 +10,14 @@ const router = express.Router();
 router.param("id", validateIdParam);
 router.use(authMiddleware);
 
-// A rule's account must be checking or an active card: it's the account a purchase is charged to
+// A rule's account must be an active card: it's the card a purchase is charged to (Checking is
+// already where anything without a card goes, so a Checking rule would change nothing)
 const assertRuleAccount = async (accountId) => {
   if (!accountId) return;
   const account = await Account.findOne({
-    where: { id: accountId, type: { [Op.in]: ["CHECKING", "CREDIT_CARD"] }, isActive: { [Op.ne]: false } },
+    where: { id: accountId, type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
   });
-  if (!account) throw new HttpError(400, "A rule's account must be checking or an active credit card.");
+  if (!account) throw new HttpError(400, "A rule's account must be an active credit card.");
 };
 
 const toJson = (rule, accounts) => ({

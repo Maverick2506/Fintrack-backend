@@ -450,7 +450,10 @@ router.put(
       const fromDebt =
         trx.fromAccountId &&
         (await Account.findByPk(trx.fromAccountId, { transaction: dbTx }))?.type === "DEBT";
-      if (req.body.creditCardId !== undefined && !(fromDebt && !req.body.creditCardId)) {
+      // A row with no from-account (a card payment or refund from a card statement import, a statement-sync
+      // Adjustment) keeps none too: an empty card in the form means "not a card", not "from Checking".
+      const keepFrom = fromDebt || !trx.fromAccountId;
+      if (req.body.creditCardId !== undefined && !(keepFrom && !req.body.creditCardId)) {
         if (req.body.creditCardId) {
           fromAccountId = req.body.creditCardId;
         } else {

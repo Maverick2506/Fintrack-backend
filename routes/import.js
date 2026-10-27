@@ -87,10 +87,20 @@ router.post(
 
     const savedMapping = await getSavedMapping(account.id);
     const suggestedMapping = suggestMapping(rows);
-    const mapping = req.body.mapping || savedMapping || suggestedMapping;
+    let mapping = req.body.mapping || savedMapping || suggestedMapping;
+    let mappingSource = req.body.mapping ? "request" : savedMapping ? "saved" : "suggested";
     let mapped;
     try {
-      mapped = applyMapping(rows, mapping);
+      try {
+        mapped = applyMapping(rows, mapping);
+      } catch (err) {
+        // The bank changed its export (or this is another kind of file): when the saved columns read
+        // nothing but the guess does, use the guess and say the saved ones didn't fit
+        if (!(err instanceof CsvError) || mappingSource !== "saved") throw err;
+        mapped = applyMapping(rows, suggestedMapping);
+        mapping = suggestedMapping;
+        mappingSource = "savedDidNotFit";
+      }
     } catch (err) {
       if (err instanceof CsvError) {
         throw new HttpError(400, err.message, {
@@ -107,7 +117,7 @@ router.post(
       columns: columnNames(rows, mapping.hasHeader),
       sampleRows: rows.slice(0, 6),
       mapping,
-      mappingSource: req.body.mapping ? "request" : savedMapping ? "saved" : "suggested",
+      mappingSource,
       suggestedMapping,
       rows: preview.rows,
       invalid: mapped.invalid,
