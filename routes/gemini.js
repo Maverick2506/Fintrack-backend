@@ -18,7 +18,12 @@ const {
 } = require("../services/debtPayoffService");
 const { compareMonths, isMonthStr } = require("../services/trendsService");
 const { getSubscriptionsSummary } = require("../services/subscriptionService");
-const { reserveCall, sendCapReached, recordTokens } = require("../services/aiUsageService");
+const {
+  reserveCall,
+  releaseUnanswered,
+  sendCapReached,
+  recordTokens,
+} = require("../services/aiUsageService");
 
 const router = express.Router();
 
@@ -94,6 +99,7 @@ async function generateWithRetry(ai, params, maxRetries = 1, delayMs = 1000) {
 // Every model call goes through here so its token counts are logged and added to today's usage (AI8)
 async function generate(ai, params, usage, maxRetries, delayMs) {
   const response = await generateWithRetry(ai, params, maxRetries, delayMs);
+  usage.responded = true;
   await recordTokens(usage.todayStr, usage.endpoint, params.model, response?.usageMetadata);
   return response;
 }
@@ -202,6 +208,8 @@ router.post(
       return res.status(503).json({ error: "AI service is not configured." });
     }
 
+    // Set once a call is reserved, so a request Gemini never answered gives it back
+    let usage = null;
     try {
       const { force = false } = req.body || {};
 
@@ -412,6 +420,7 @@ INSTRUCTIONS:
 
       const reservation = await reserveCall(todayStr);
       if (!reservation.allowed) return sendCapReached(res, reservation);
+      usage = { todayStr, endpoint: "financial-advice", reserved: true };
 
       const models = getModels();
 
@@ -435,7 +444,7 @@ INSTRUCTIONS:
           },
           abortSignal: AbortSignal.timeout(20000),
         },
-      }, { todayStr, endpoint: "financial-advice" });
+      }, usage);
 
       let structured = {};
       try {
@@ -469,6 +478,7 @@ INSTRUCTIONS:
         updatedAt: new Date().toISOString(),
       });
     } catch (error) {
+      await releaseUnanswered(usage);
       if (error.status === 504) {
         return res.status(504).json({ error: error.message });
       }
@@ -490,6 +500,8 @@ router.post(
 
     const normalized = normalizeMerchantName(rawName);
 
+    // Set once a call is reserved, so a request Gemini never answered gives it back
+    let usage = null;
     try {
       // Step 1: User's past transaction history (C4 fix)
       // Only use starts-with match when normalized name is >= 4 chars and contains a space
@@ -540,6 +552,7 @@ router.post(
       const todayStr = getTorontoTodayStr();
       const reservation = await reserveCall(todayStr);
       if (!reservation.allowed) return sendCapReached(res, reservation);
+      usage = { todayStr, endpoint: "categorize-expense", reserved: true };
 
       const models = getModels();
 
@@ -574,7 +587,7 @@ Expense: "${rawName}"`;
             abortSignal: AbortSignal.timeout(8000),
           },
         },
-        { todayStr, endpoint: "categorize-expense" },
+        usage,
         1,
         500
       );
@@ -596,6 +609,7 @@ Expense: "${rawName}"`;
 
       res.json({ category: chosenCategory, source: "ai" });
     } catch (error) {
+      await releaseUnanswered(usage);
       if (error.status === 504) {
         return res.json({ category: "Other", source: "timeout_fallback" });
       }
@@ -927,15 +941,28 @@ function buildQuickAddText(args = {}, { todayStr, cards = [] }) {
     if (!card) accountNote = `No card matches "${args.account}", so Quick Add will use Primary Checking.`;
   }
 
-  // The title must not contain words Quick Add reads as an amount, date, account or income marker
+  // The title must not contain words Quick Add reads as a date, account or card; those are left out
+  // and the summary names them. Numbers can stay: Quick Add takes the first number, the amount.
   const reserved = new Set(cards.flatMap(cardKeywords));
-  let title = String(args.title || "")
+  const dropped = [];
+  const drop = (match) => {
+    dropped.push(match.trim());
+    return " ";
+  };
+  const title = String(args.title || "")
     .replace(/[\r\n+$]/g, " ")
-    .replace(/\b(?:due|on)\s+(?:\d\S*|today|tomorrow|sun|mon|tue|wed|thu|fri|sat)\w*/gi, " ")
-    .replace(/\bdue\b/gi, " ")
-    .replace(new RegExp(CHECKING_WORDS.source, "gi"), " ")
+    .replace(/\b(?:due|on)\s+(?:\d\S*|today|tomorrow|sun|mon|tue|wed|thu|fri|sat)\w*/gi, drop)
+    .replace(/\bdue\b/gi, drop)
+    .replace(new RegExp(CHECKING_WORDS.source, "gi"), drop)
     .split(/\s+/)
-    .filter((w) => w && !reserved.has(w.toLowerCase()) && !/^\d+(?:\.\d{1,2})?$/.test(w))
+    .filter((w) => {
+      if (!w) return false;
+      if (reserved.has(w.toLowerCase())) {
+        dropped.push(w);
+        return false;
+      }
+      return true;
+    })
     .join(" ")
     .slice(0, 60)
     .trim();
@@ -960,7 +987,10 @@ function buildQuickAddText(args = {}, { todayStr, cards = [] }) {
   const summary =
     `${type === "income" ? "Income" : "Expense"}: ${displayTitle}, ${cadFormatter.format(amount)}${where}, ` +
     `${describeDate(date, todayStr)} (${status}). Not saved yet.` +
-    (card && accountNote ? ` ${accountNote}` : "");
+    (card && accountNote ? ` ${accountNote}` : "") +
+    (dropped.length
+      ? ` Left out of the name because Quick Add reads them as a date or account: ${dropped.map((w) => `"${w}"`).join(", ")}.`
+      : "");
 
   return {
     quickAddText: parts.join(" "),
@@ -1158,9 +1188,16 @@ const CHAT_TOOLS = [
  * runTool defaults to executeTool; tests pass a spy. Returns the model's reply and the drafts
  * proposeTransaction built (shown as "Review & save" cards; nothing is saved here).
  */
-async function runChatLoop({ ai, model, contents, systemPrompt, todayStr, runTool = executeTool }) {
+async function runChatLoop({
+  ai,
+  model,
+  contents,
+  systemPrompt,
+  todayStr,
+  runTool = executeTool,
+  usage = { todayStr, endpoint: "chat-advisor" },
+}) {
   const toolsConfig = [{ functionDeclarations: CHAT_TOOLS }];
-  const usage = { todayStr, endpoint: "chat-advisor" };
   const proposals = [];
 
   const ask = () =>
@@ -1228,6 +1265,8 @@ router.post(
 
     const { message: userMessage, history: conversationHistory = [] } = req.body;
 
+    // Set once a call is reserved, so a request Gemini never answered gives it back
+    let usage = null;
     try {
       const nowZoned = toZonedTime(new Date(), TIMEZONE);
       const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
@@ -1238,6 +1277,7 @@ router.post(
 
       const reservation = await reserveCall(todayStr);
       if (!reservation.allowed) return sendCapReached(res, reservation);
+      usage = { todayStr, endpoint: "chat-advisor", reserved: true };
 
       const [
         forecast,
@@ -1371,10 +1411,12 @@ BEHAVIOR GUIDELINES:
         contents,
         systemPrompt,
         todayStr,
+        usage,
       });
 
       res.json({ reply, proposals });
     } catch (error) {
+      await releaseUnanswered(usage);
       if (error.status === 504) {
         return res.status(504).json({ error: error.message });
       }

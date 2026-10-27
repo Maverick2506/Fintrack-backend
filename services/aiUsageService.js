@@ -66,6 +66,23 @@ const reserveCall = async (todayStr) => {
   return { allowed: true };
 };
 
+/**
+ * Gives back a reserved call when the request failed before Gemini answered (timeout, outage), so a
+ * failed request doesn't use up the day's limit. A request Gemini answered at least once still counts.
+ */
+const releaseUnanswered = async (usage) => {
+  if (!usage?.reserved || usage.responded) return;
+  usage.reserved = false;
+  try {
+    await AiUsage.update(
+      { calls: sequelize.literal("calls - 1") },
+      { where: { date: usage.todayStr, calls: { [Op.gt]: 0 } } }
+    );
+  } catch (err) {
+    console.error("Failed to give back an AI call:", err.message);
+  }
+};
+
 /** Sends the friendly 429 for a refused reservation */
 const sendCapReached = (res, reservation) =>
   res.status(429).json({ error: reservation.message, code: "AI_DAILY_CAP", cap: reservation.cap });
@@ -102,6 +119,7 @@ module.exports = {
   getDailyCap,
   getUsage,
   reserveCall,
+  releaseUnanswered,
   sendCapReached,
   recordTokens,
 };

@@ -7,7 +7,7 @@ const {
   DEBT_INTEREST_SETTING_KEY,
   isDebtInterestEnabled,
 } = require("../services/debtInterestService");
-const { getUsage } = require("../services/aiUsageService");
+const { getUsage, AI_DAILY_CAP_KEY } = require("../services/aiUsageService");
 const { toZonedTime, format } = require("date-fns-tz");
 
 const router = express.Router();
@@ -83,6 +83,16 @@ router.get(
       timeZone: "America/Toronto",
     });
     res.json(await getUsage(todayStr));
+  })
+);
+
+// Daily AI request limit (AI8), 0 to 10,000
+router.put(
+  "/ai-daily-cap",
+  validateBody(schemas.setAiDailyCap),
+  asyncHandler(async (req, res) => {
+    await Setting.upsert({ key: AI_DAILY_CAP_KEY, value: String(req.body.cap) });
+    res.json({ cap: req.body.cap });
   })
 );
 

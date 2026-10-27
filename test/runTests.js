@@ -7217,6 +7217,35 @@ async function runTestSuite() {
     s44Burst.filter((r) => r.allowed).length === 2 && s44BurstRow.calls === 2,
     `Six requests at once with a cap of 2: exactly 2 go through (got ${s44Burst.filter((r) => r.allowed).length}, count ${s44BurstRow.calls})`
   );
+  // A call Gemini never answered (timeout, outage) gives its count back
+  await AiUsage.destroy({ where: { date: s44Today } });
+  await Setting.upsert({ key: "ai_daily_cap", value: "5" });
+  s44Gemini.setAiClientForTests({
+    models: {
+      generateContent: async () => {
+        throw new Error("UNAVAILABLE: model overloaded");
+      },
+    },
+  });
+  const s44Failed = await s44Call("/chat-advisor", { message: "hi", history: [] });
+  const s44FailedCat = await s44Call("/categorize-expense", { name: "Suite44 Failzq Shop" });
+  const s44AfterFail = await AiUsage.findByPk(s44Today);
+  assert(
+    s44Failed.status === 500 && s44FailedCat.body.source === "fallback" && s44AfterFail.calls === 0,
+    `A request Gemini never answered doesn't use up the limit (got ${s44Failed.status}, count ${s44AfterFail.calls})`
+  );
+  s44Gemini.setAiClientForTests(null);
+
+  // The limit can be changed from the app
+  const s44Put = (body) =>
+    request({ hostname: "localhost", port: 8000, path: "/api/settings/ai-daily-cap", method: "PUT", headers: authHeaders }, body);
+  const s44SetCap = await s44Put({ cap: 250 });
+  const s44AfterSet = await request({ hostname: "localhost", port: 8000, path: "/api/settings/ai-usage", method: "GET", headers: authHeaders });
+  const s44BadCaps = await Promise.all([s44Put({ cap: -1 }), s44Put({ cap: 2.5 }), s44Put({ cap: 10001 }), s44Put({})]);
+  assert(
+    s44SetCap.status === 200 && s44AfterSet.body.cap === 250 && s44BadCaps.every((r) => r.status === 400),
+    `PUT /api/settings/ai-daily-cap sets the limit and refuses bad values (got ${s44SetCap.status}, cap ${s44AfterSet.body.cap}, ${s44BadCaps.map((r) => r.status)})`
+  );
   await Setting.destroy({ where: { key: "ai_daily_cap" } });
   const s44Default = await request({ hostname: "localhost", port: 8000, path: "/api/settings/ai-usage", method: "GET", headers: authHeaders });
   assert(s44Default.body.cap === 100, "The daily cap defaults to 100");

@@ -483,7 +483,12 @@ async function runGeminiUnitTests() {
 
   test("Title words Quick Add would misread are dropped", () => {
     const d = draft({ amount: 30, title: "visa due 11/05 dinner checking $5", account: "amex" });
-    assert.strictEqual(d.quickAddText, "30 dinner amex");
+    assert.strictEqual(d.quickAddText, "30 dinner 5 amex");
+    assert(/Left out of the name .*"due 11\/05", "checking", "visa"/.test(d.summary), d.summary);
+    // Quick Add takes the first number as the amount, so later numbers stay in the name
+    const forTwo = draft({ amount: 40, title: "dinner for 2" });
+    assert.strictEqual(forTwo.quickAddText, "40 dinner for 2");
+    assert(!/Left out/.test(forTwo.summary));
   });
 
   test("Income gets '+', ignores the card, and never claims to be saved", () => {
