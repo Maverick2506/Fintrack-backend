@@ -7259,7 +7259,7 @@ async function runTestSuite() {
   await s44Card.destroy();
 
 
-  // --- Suites 45-49: Bank CSV import, rules and the Review inbox (batch 7) ---
+  // --- Suites 45, 47-50 (46 is taken by the variable-pay forecast branch): Bank CSV import, rules and the Review inbox (batch 7) ---
   const { Rule, ImportRef } = require("../models");
   const { getPrimaryCheckingAccount: s45GetChecking, getCalculatedCheckingBalance: s45CheckingBalance } = require("../services/checkingService");
   await Rule.destroy({ where: {} });
@@ -7391,232 +7391,232 @@ async function runTestSuite() {
   await Rule.destroy({ where: {} });
   await Transaction.destroy({ where: { title: { [Op.like]: "suite45 %" } }, force: true });
 
-  console.log("\n--- Suite 46: Checking import (RBC format): match, new, re-import ---");
-  const s46Checking = await s45GetChecking();
-  const s46Accounts = await api("GET", "/api/import/accounts");
+  console.log("\n--- Suite 47: Checking import (RBC format): match, new, re-import ---");
+  const s47Checking = await s45GetChecking();
+  const s47Accounts = await api("GET", "/api/import/accounts");
   assert(
-    s46Accounts.status === 200 && s46Accounts.body[0].id === s46Checking.id &&
-      s46Accounts.body.some((a) => a.id === s45Card.id) && !s46Accounts.body.some((a) => a.id === s45Goal.id),
+    s47Accounts.status === 200 && s47Accounts.body[0].id === s47Checking.id &&
+      s47Accounts.body.some((a) => a.id === s45Card.id) && !s47Accounts.body.some((a) => a.id === s45Goal.id),
     "GET /api/import/accounts lists Primary Checking and active cards only"
   );
   await Rule.create({ match: "grocery mart", category: "Essentials", priority: 5 });
-  const s46Bill = await Transaction.create({
+  const s47Bill = await Transaction.create({
     title: "Sample Hydro", amount: 85.4, date: "2026-09-05", type: "EXPENSE", category: "Essentials",
-    isCleared: false, fromAccountId: s46Checking.id,
+    isCleared: false, fromAccountId: s47Checking.id,
   });
   // Same amount but nothing like the title, and a similar title 5 days off: neither matches
-  const s46Decoy1 = await Transaction.create({
-    title: "Gym", amount: 16.49, date: "2026-09-12", type: "EXPENSE", category: "Other", isCleared: false, fromAccountId: s46Checking.id,
+  const s47Decoy1 = await Transaction.create({
+    title: "Gym", amount: 16.49, date: "2026-09-12", type: "EXPENSE", category: "Other", isCleared: false, fromAccountId: s47Checking.id,
   });
-  const s46Decoy2 = await Transaction.create({
-    title: "Pharmacy Plus", amount: 23.1, date: "2026-09-20", type: "EXPENSE", category: "Other", isCleared: false, fromAccountId: s46Checking.id,
+  const s47Decoy2 = await Transaction.create({
+    title: "Pharmacy Plus", amount: 23.1, date: "2026-09-20", type: "EXPENSE", category: "Other", isCleared: false, fromAccountId: s47Checking.id,
   });
-  const s46Today = getTorontoToday();
-  const s46Before = await s45CheckingBalance(s46Checking, s46Today);
-  const s46Count0 = await Transaction.count({ paranoid: false });
-  const s46Preview = await uploadCsv({ accountId: s46Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
-  const s46ByLine = (line) => s46Preview.body.rows?.find((r) => r.line === line);
+  const s47Today = getTorontoToday();
+  const s47Before = await s45CheckingBalance(s47Checking, s47Today);
+  const s47Count0 = await Transaction.count({ paranoid: false });
+  const s47Preview = await uploadCsv({ accountId: s47Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
+  const s47ByLine = (line) => s47Preview.body.rows?.find((r) => r.line === line);
   assert(
-    s46Preview.status === 200 && s46Preview.body.mappingSource === "suggested" &&
-      s46Preview.body.counts.matched === 1 && s46Preview.body.counts.new === 7 && s46Preview.body.counts.skipped === 0,
-    `Preview of the RBC file: 1 matched, 7 new, 0 skipped (got ${s46Preview.status} ${JSON.stringify(s46Preview.body.counts || s46Preview.body)})`
+    s47Preview.status === 200 && s47Preview.body.mappingSource === "suggested" &&
+      s47Preview.body.counts.matched === 1 && s47Preview.body.counts.new === 7 && s47Preview.body.counts.skipped === 0,
+    `Preview of the RBC file: 1 matched, 7 new, 0 skipped (got ${s47Preview.status} ${JSON.stringify(s47Preview.body.counts || s47Preview.body)})`
   );
   assert(
-    s46ByLine(6).status === "match" && s46ByLine(6).match.id === s46Bill.id &&
-      s46ByLine(8).status === "new" && s46ByLine(9).status === "new" &&
-      s46ByLine(5).category === "Essentials" && s46ByLine(5).ruleId &&
-      s46ByLine(2).category === "Income" && s46ByLine(3).status === "new" && s46ByLine(4).status === "new" &&
-      s46ByLine(3).occurrence === 1 && s46ByLine(4).occurrence === 2,
+    s47ByLine(6).status === "match" && s47ByLine(6).match.id === s47Bill.id &&
+      s47ByLine(8).status === "new" && s47ByLine(9).status === "new" &&
+      s47ByLine(5).category === "Essentials" && s47ByLine(5).ruleId &&
+      s47ByLine(2).category === "Income" && s47ByLine(3).status === "new" && s47ByLine(4).status === "new" &&
+      s47ByLine(3).occurrence === 1 && s47ByLine(4).occurrence === 2,
     "The hydro bill 2 days off matches; same amount with another title, or 5+ days off, doesn't; rules set categories; repeated rows both import"
   );
-  assert((await Transaction.count({ paranoid: false })) === s46Count0, "Preview saves nothing");
-  const s46Commit = await api("POST", "/api/import/commit", {
-    accountId: s46Checking.id,
-    mapping: s46Preview.body.mapping,
-    rows: commitRows(s46Preview.body, { 6: { category: "Entertainment" } }),
+  assert((await Transaction.count({ paranoid: false })) === s47Count0, "Preview saves nothing");
+  const s47Commit = await api("POST", "/api/import/commit", {
+    accountId: s47Checking.id,
+    mapping: s47Preview.body.mapping,
+    rows: commitRows(s47Preview.body, { 6: { category: "Entertainment" } }),
   });
-  const s46BillAfter = await Transaction.findByPk(s46Bill.id);
-  const s46Hydro = await Transaction.count({ where: { amount: 85.4 } });
-  const s46After = await s45CheckingBalance(s46Checking, s46Today);
-  const s46Expected = Math.round((s46Before + 2100 - 4.5 - 4.5 - 86.23 - 85.4 - 50 - 16.49 - 23.1) * 100) / 100;
+  const s47BillAfter = await Transaction.findByPk(s47Bill.id);
+  const s47Hydro = await Transaction.count({ where: { amount: 85.4 } });
+  const s47After = await s45CheckingBalance(s47Checking, s47Today);
+  const s47Expected = Math.round((s47Before + 2100 - 4.5 - 4.5 - 86.23 - 85.4 - 50 - 16.49 - 23.1) * 100) / 100;
   assert(
-    s46Commit.status === 200 && s46Commit.body.created === 7 && s46Commit.body.matched === 1 && s46Commit.body.skipped === 0,
-    `Commit creates 7 rows and marks 1 bill paid (got ${s46Commit.status} ${JSON.stringify(s46Commit.body)})`
+    s47Commit.status === 200 && s47Commit.body.created === 7 && s47Commit.body.matched === 1 && s47Commit.body.skipped === 0,
+    `Commit creates 7 rows and marks 1 bill paid (got ${s47Commit.status} ${JSON.stringify(s47Commit.body)})`
   );
   assert(
-    s46BillAfter.isCleared === true && s46Hydro === 1 && !s46BillAfter.needsReview,
+    s47BillAfter.isCleared === true && s47Hydro === 1 && !s47BillAfter.needsReview,
     "The matched bill is marked paid, with no duplicate row for it"
   );
   assert(
-    Math.abs(s46After - s46Expected) < 0.005,
-    `Checking balance after the import: ${s46Before} + 2,100 in - 270.22 out = ${s46Expected} (got ${s46After})`
+    Math.abs(s47After - s47Expected) < 0.005,
+    `Checking balance after the import: ${s47Before} + 2,100 in - 270.22 out = ${s47Expected} (got ${s47After})`
   );
-  const s46New = await Transaction.findAll({ where: { id: { [Op.in]: s46Commit.body.ids } } });
-  const s46Streaming = s46New.find((t) => t.title === "STREAMFLIX.COM");
-  const s46Pay = s46New.find((t) => t.type === "INCOME");
+  const s47New = await Transaction.findAll({ where: { id: { [Op.in]: s47Commit.body.ids } } });
+  const s47Streaming = s47New.find((t) => t.title === "STREAMFLIX.COM");
+  const s47Pay = s47New.find((t) => t.type === "INCOME");
   assert(
-    s46New.length === 7 && s46New.every((t) => t.needsReview && t.isCleared && t.clientRef) &&
-      s46Streaming.category === "Entertainment" && s46Pay.toAccountId === s46Checking.id && s46Pay.category === "Income" &&
-      (await Transaction.findByPk(s46Decoy1.id)).isCleared === false && (await Transaction.findByPk(s46Decoy2.id)).isCleared === false,
+    s47New.length === 7 && s47New.every((t) => t.needsReview && t.isCleared && t.clientRef) &&
+      s47Streaming.category === "Entertainment" && s47Pay.toAccountId === s47Checking.id && s47Pay.category === "Income" &&
+      (await Transaction.findByPk(s47Decoy1.id)).isCleared === false && (await Transaction.findByPk(s47Decoy2.id)).isCleared === false,
     "New rows are paid, need review, carry a clientRef and keep the category edited in the preview; the decoy bills stay unpaid"
   );
-  const s46Mapping = await api("GET", `/api/import/mapping/${s46Checking.id}`);
+  const s47Mapping = await api("GET", `/api/import/mapping/${s47Checking.id}`);
   assert(
-    s46Mapping.status === 200 && s46Mapping.body.mapping?.amount === 6 && s46Mapping.body.mapping?.description.join() === "4,5",
+    s47Mapping.status === 200 && s47Mapping.body.mapping?.amount === 6 && s47Mapping.body.mapping?.description.join() === "4,5",
     "The mapping is saved for the account"
   );
   // Re-import the same file: everything is skipped and nothing changes
-  const s46Count1 = await Transaction.count({ paranoid: false });
-  const s46Again = await uploadCsv({ accountId: s46Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
-  const s46AgainCommit = await api("POST", "/api/import/commit", { accountId: s46Checking.id, rows: commitRows(s46Again.body) });
+  const s47Count1 = await Transaction.count({ paranoid: false });
+  const s47Again = await uploadCsv({ accountId: s47Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
+  const s47AgainCommit = await api("POST", "/api/import/commit", { accountId: s47Checking.id, rows: commitRows(s47Again.body) });
   assert(
-    s46Again.body.mappingSource === "saved" && s46Again.body.counts.skipped === 8 && s46Again.body.counts.new === 0 &&
-      s46Again.body.counts.matched === 0 && s46AgainCommit.body.created === 0 && s46AgainCommit.body.matched === 0 &&
-      (await Transaction.count({ paranoid: false })) === s46Count1 &&
-      Math.abs((await s45CheckingBalance(s46Checking, s46Today)) - s46After) < 0.005,
-    `Re-importing the same file creates nothing (got ${JSON.stringify(s46Again.body.counts)}, created ${s46AgainCommit.body.created})`
+    s47Again.body.mappingSource === "saved" && s47Again.body.counts.skipped === 8 && s47Again.body.counts.new === 0 &&
+      s47Again.body.counts.matched === 0 && s47AgainCommit.body.created === 0 && s47AgainCommit.body.matched === 0 &&
+      (await Transaction.count({ paranoid: false })) === s47Count1 &&
+      Math.abs((await s45CheckingBalance(s47Checking, s47Today)) - s47After) < 0.005,
+    `Re-importing the same file creates nothing (got ${JSON.stringify(s47Again.body.counts)}, created ${s47AgainCommit.body.created})`
   );
   // A deleted imported row stays a duplicate while it's in the Trash
-  await api("DELETE", `/api/expenses/${s46Streaming.id}`);
-  const s46Trash = await uploadCsv({ accountId: s46Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
-  const s46TrashRow = s46Trash.body.rows.find((r) => r.description === "STREAMFLIX.COM");
+  await api("DELETE", `/api/expenses/${s47Streaming.id}`);
+  const s47Trash = await uploadCsv({ accountId: s47Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
+  const s47TrashRow = s47Trash.body.rows.find((r) => r.description === "STREAMFLIX.COM");
   assert(
-    s46TrashRow.status === "duplicate" && s46TrashRow.inTrash === true,
+    s47TrashRow.status === "duplicate" && s47TrashRow.inTrash === true,
     "A row deleted to the Trash is still skipped on re-import"
   );
 
-  console.log("\n--- Suite 47: Card import (TD format): charges, payment match, refund ---");
-  const s47Card = await Account.create({ name: "Suite47 TD Visa", type: "CREDIT_CARD", initialBalance: 1000, creditLimit: 5000 });
-  const s47Checking = await s45GetChecking();
-  const s47Payment = await Transaction.create({
-    title: "Payment for Suite47 TD Visa", amount: 200, date: "2026-09-09", type: "TRANSFER", category: "Credit Card Payment",
-    isCleared: false, fromAccountId: s47Checking.id, toAccountId: s47Card.id,
+  console.log("\n--- Suite 48: Card import (TD format): charges, payment match, refund ---");
+  const s48Card = await Account.create({ name: "Suite48 TD Visa", type: "CREDIT_CARD", initialBalance: 1000, creditLimit: 5000 });
+  const s48Checking = await s45GetChecking();
+  const s48Payment = await Transaction.create({
+    title: "Payment for Suite48 TD Visa", amount: 200, date: "2026-09-09", type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, fromAccountId: s48Checking.id, toAccountId: s48Card.id,
   });
   // A bill on Checking that the card statement shows was charged to the card
-  const s47Gas = await Transaction.create({
+  const s48Gas = await Transaction.create({
     title: "Gas-n-Go", amount: 61.2, date: "2026-09-13", type: "EXPENSE", category: "Transportation",
-    isCleared: false, fromAccountId: s47Checking.id,
+    isCleared: false, fromAccountId: s48Checking.id,
   });
-  const s47Today = getTorontoToday();
-  const s47CheckingBefore = await s45CheckingBalance(s47Checking, s47Today);
-  const s47Preview = await uploadCsv({ accountId: s47Card.id, csv: fixtureCsv("td-visa.csv"), contentType: "application/vnd.ms-excel" });
+  const s48Today = getTorontoToday();
+  const s48CheckingBefore = await s45CheckingBalance(s48Checking, s48Today);
+  const s48Preview = await uploadCsv({ accountId: s48Card.id, csv: fixtureCsv("td-visa.csv"), contentType: "application/vnd.ms-excel" });
   assert(
-    s47Preview.status === 200 && s47Preview.body.mapping.hasHeader === false && s47Preview.body.mapping.debit === 2 &&
-      s47Preview.body.counts.matched === 2 && s47Preview.body.counts.new === 3,
-    `TD Visa preview (Windows' CSV type): debit/credit columns found, payment and gas bill matched, 3 new (got ${s47Preview.status} ${JSON.stringify(s47Preview.body.counts || s47Preview.body)})`
+    s48Preview.status === 200 && s48Preview.body.mapping.hasHeader === false && s48Preview.body.mapping.debit === 2 &&
+      s48Preview.body.counts.matched === 2 && s48Preview.body.counts.new === 3,
+    `TD Visa preview (Windows' CSV type): debit/credit columns found, payment and gas bill matched, 3 new (got ${s48Preview.status} ${JSON.stringify(s48Preview.body.counts || s48Preview.body)})`
   );
-  const s47Commit = await api("POST", "/api/import/commit", { accountId: s47Card.id, mapping: s47Preview.body.mapping, rows: commitRows(s47Preview.body) });
-  await s47Card.reload();
-  const s47CheckingAfter = await s45CheckingBalance(s47Checking, s47Today);
-  const s47Refund = await Transaction.findOne({ where: { title: "ONLINESHOP.CA REFUND" } });
-  const s47GasAfter = await Transaction.findByPk(s47Gas.id);
+  const s48Commit = await api("POST", "/api/import/commit", { accountId: s48Card.id, mapping: s48Preview.body.mapping, rows: commitRows(s48Preview.body) });
+  await s48Card.reload();
+  const s48CheckingAfter = await s45CheckingBalance(s48Checking, s48Today);
+  const s48Refund = await Transaction.findOne({ where: { title: "ONLINESHOP.CA REFUND" } });
+  const s48GasAfter = await Transaction.findByPk(s48Gas.id);
   assert(
-    s47Commit.status === 200 && s47Commit.body.created === 3 && s47Commit.body.matched === 2,
-    `Card commit: 3 created, 2 matched (got ${JSON.stringify(s47Commit.body)})`
-  );
-  assert(
-    Math.abs(parseFloat(s47Card.initialBalance) - 933.35) < 0.005,
-    `Card balance: 1,000 + 32.15 + 59.99 + 61.20 charges - 200 payment - 19.99 refund = 933.35, the statement's balance (got ${s47Card.initialBalance})`
+    s48Commit.status === 200 && s48Commit.body.created === 3 && s48Commit.body.matched === 2,
+    `Card commit: 3 created, 2 matched (got ${JSON.stringify(s48Commit.body)})`
   );
   assert(
-    Math.abs(s47CheckingAfter - (s47CheckingBefore - 200)) < 0.005 && (await Transaction.findByPk(s47Payment.id)).isCleared === true,
-    `The matched card payment is paid from Checking: Checking goes down by 200 (got ${s47CheckingBefore} -> ${s47CheckingAfter})`
+    Math.abs(parseFloat(s48Card.initialBalance) - 933.35) < 0.005,
+    `Card balance: 1,000 + 32.15 + 59.99 + 61.20 charges - 200 payment - 19.99 refund = 933.35, the statement's balance (got ${s48Card.initialBalance})`
   );
   assert(
-    s47Refund.type === "TRANSFER" && s47Refund.toAccountId === s47Card.id && !s47Refund.fromAccountId && s47Refund.category === "Refund" &&
-      s47GasAfter.isCleared && s47GasAfter.fromAccountId === s47Card.id,
+    Math.abs(s48CheckingAfter - (s48CheckingBefore - 200)) < 0.005 && (await Transaction.findByPk(s48Payment.id)).isCleared === true,
+    `The matched card payment is paid from Checking: Checking goes down by 200 (got ${s48CheckingBefore} -> ${s48CheckingAfter})`
+  );
+  assert(
+    s48Refund.type === "TRANSFER" && s48Refund.toAccountId === s48Card.id && !s48Refund.fromAccountId && s48Refund.category === "Refund" &&
+      s48GasAfter.isCleared && s48GasAfter.fromAccountId === s48Card.id,
     "A refund lowers the card without counting as income or spending; the matched gas bill moves to the card"
   );
-  const s47Again = await uploadCsv({ accountId: s47Card.id, csv: fixtureCsv("td-visa.csv") });
-  const s47AgainCommit = await api("POST", "/api/import/commit", { accountId: s47Card.id, rows: commitRows(s47Again.body) });
-  await s47Card.reload();
+  const s48Again = await uploadCsv({ accountId: s48Card.id, csv: fixtureCsv("td-visa.csv") });
+  const s48AgainCommit = await api("POST", "/api/import/commit", { accountId: s48Card.id, rows: commitRows(s48Again.body) });
+  await s48Card.reload();
   assert(
-    s47Again.body.counts.skipped === 5 && s47AgainCommit.body.created === 0 && s47AgainCommit.body.matched === 0 &&
-      Math.abs(parseFloat(s47Card.initialBalance) - 933.35) < 0.005,
-    `Re-importing the card file (matched rows included) creates nothing and leaves the balance (got ${JSON.stringify(s47Again.body.counts)})`
+    s48Again.body.counts.skipped === 5 && s48AgainCommit.body.created === 0 && s48AgainCommit.body.matched === 0 &&
+      Math.abs(parseFloat(s48Card.initialBalance) - 933.35) < 0.005,
+    `Re-importing the card file (matched rows included) creates nothing and leaves the balance (got ${JSON.stringify(s48Again.body.counts)})`
   );
   // Skip and "import as new instead of matching" are honoured
-  const s47Bill = await Transaction.create({
-    title: "Suite47 Streaming", amount: 9.99, date: "2026-10-01", type: "EXPENSE", category: "Subscription", isCleared: false, fromAccountId: s47Card.id,
+  const s48Bill = await Transaction.create({
+    title: "Suite48 Streaming", amount: 9.99, date: "2026-10-01", type: "EXPENSE", category: "Subscription", isCleared: false, fromAccountId: s48Card.id,
   });
-  const s47Csv = "10/01/2026,SUITE47 STREAMING,9.99,,\n10/02/2026,SUITE47 SKIPPED,5.00,,\n";
-  const s47Edit = await uploadCsv({ accountId: s47Card.id, csv: s47Csv, mapping: { ...s47Preview.body.mapping } });
-  const s47EditCommit = await api("POST", "/api/import/commit", {
-    accountId: s47Card.id,
-    rows: commitRows(s47Edit.body, { 0: { matchId: null }, 1: { skip: true } }),
+  const s48Csv = "10/01/2026,SUITE48 STREAMING,9.99,,\n10/02/2026,SUITE48 SKIPPED,5.00,,\n";
+  const s48Edit = await uploadCsv({ accountId: s48Card.id, csv: s48Csv, mapping: { ...s48Preview.body.mapping } });
+  const s48EditCommit = await api("POST", "/api/import/commit", {
+    accountId: s48Card.id,
+    rows: commitRows(s48Edit.body, { 0: { matchId: null }, 1: { skip: true } }),
   });
   assert(
-    s47Edit.body.rows[0].status === "match" && s47EditCommit.body.created === 1 && s47EditCommit.body.skipped === 1 &&
-      (await Transaction.findByPk(s47Bill.id)).isCleared === false,
-    `A row unlinked from its match is imported as new and the bill stays unpaid; a skipped row isn't imported (got ${JSON.stringify(s47EditCommit.body)})`
+    s48Edit.body.rows[0].status === "match" && s48EditCommit.body.created === 1 && s48EditCommit.body.skipped === 1 &&
+      (await Transaction.findByPk(s48Bill.id)).isCleared === false,
+    `A row unlinked from its match is imported as new and the bill stays unpaid; a skipped row isn't imported (got ${JSON.stringify(s48EditCommit.body)})`
   );
 
-  console.log("\n--- Suite 48: Bad files are refused ---");
-  const s48Map = { hasHeader: false, date: 0, description: [1], amount: 2, dateFormat: "YYYY-MM-DD" };
-  const s48Bad = {
-    pdf: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", filename: "statement.pdf", contentType: "application/pdf" }),
-    xlsx: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", filename: "statement.xlsx", contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
-    binary: await uploadCsv({ accountId: s47Card.id, csv: Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x08]) }),
-    quote: await uploadCsv({ accountId: s47Card.id, csv: '2026-09-01,"unclosed,-1\n' }),
-    noRows: await uploadCsv({ accountId: s47Card.id, csv: "hello,world\nfoo,bar\n", mapping: s48Map }),
-    column: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", mapping: { ...s48Map, amount: 7 } }),
-    mapping: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", mapping: { ...s48Map, dateFormat: "YY" } }),
-    empty: await uploadCsv({ accountId: s47Card.id, csv: "\n\n" }),
-    noFile: await uploadCsv({ accountId: s47Card.id, csv: "", omitFile: true }),
+  console.log("\n--- Suite 49: Bad files are refused ---");
+  const s49Map = { hasHeader: false, date: 0, description: [1], amount: 2, dateFormat: "YYYY-MM-DD" };
+  const s49Bad = {
+    pdf: await uploadCsv({ accountId: s48Card.id, csv: "2026-09-01,A,-1\n", filename: "statement.pdf", contentType: "application/pdf" }),
+    xlsx: await uploadCsv({ accountId: s48Card.id, csv: "2026-09-01,A,-1\n", filename: "statement.xlsx", contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    binary: await uploadCsv({ accountId: s48Card.id, csv: Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x08]) }),
+    quote: await uploadCsv({ accountId: s48Card.id, csv: '2026-09-01,"unclosed,-1\n' }),
+    noRows: await uploadCsv({ accountId: s48Card.id, csv: "hello,world\nfoo,bar\n", mapping: s49Map }),
+    column: await uploadCsv({ accountId: s48Card.id, csv: "2026-09-01,A,-1\n", mapping: { ...s49Map, amount: 7 } }),
+    mapping: await uploadCsv({ accountId: s48Card.id, csv: "2026-09-01,A,-1\n", mapping: { ...s49Map, dateFormat: "YY" } }),
+    empty: await uploadCsv({ accountId: s48Card.id, csv: "\n\n" }),
+    noFile: await uploadCsv({ accountId: s48Card.id, csv: "", omitFile: true }),
     goal: await uploadCsv({ accountId: s45Goal.id, csv: "2026-09-01,A,-1\n" }),
-    tooMany: await uploadCsv({ accountId: s47Card.id, csv: Array.from({ length: 2001 }, (_, i) => `2026-09-01,ROW ${i},-1`).join("\n") }),
+    tooMany: await uploadCsv({ accountId: s48Card.id, csv: Array.from({ length: 2001 }, (_, i) => `2026-09-01,ROW ${i},-1`).join("\n") }),
   };
-  const s48Big = await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n" + "x".repeat(2 * 1024 * 1024) });
-  const s48Statuses = Object.entries(s48Bad).map(([k, r]) => `${k}:${r.status}`);
+  const s49Big = await uploadCsv({ accountId: s48Card.id, csv: "2026-09-01,A,-1\n" + "x".repeat(2 * 1024 * 1024) });
+  const s49Statuses = Object.entries(s49Bad).map(([k, r]) => `${k}:${r.status}`);
   assert(
-    Object.values(s48Bad).every((r) => r.status === 400 && typeof r.body.error === "string"),
-    `Bad CSVs get a 400 with a message: other file types, binary, unclosed quote, no readable rows, bad mapping, empty, no file, a savings goal, over 2,000 rows (got ${s48Statuses})`
+    Object.values(s49Bad).every((r) => r.status === 400 && typeof r.body.error === "string"),
+    `Bad CSVs get a 400 with a message: other file types, binary, unclosed quote, no readable rows, bad mapping, empty, no file, a savings goal, over 2,000 rows (got ${s49Statuses})`
   );
-  assert(s48Bad.noRows.body.details?.columns?.length === 2, "A mapping that reads nothing returns the columns so the user can fix it");
-  assert(s48Big.status === 413, `A file over 2 MB is refused with 413 (got ${s48Big.status})`);
-  const s48Commits = await Promise.all([
-    api("POST", "/api/import/commit", { accountId: s47Card.id, rows: [] }),
-    api("POST", "/api/import/commit", { accountId: s47Card.id, rows: [{ date: "09/01/2026", description: "A", amount: 1, direction: "out" }] }),
-    api("POST", "/api/import/commit", { accountId: s47Card.id, rows: [{ date: "2026-09-01", description: "A", amount: -1, direction: "out" }] }),
+  assert(s49Bad.noRows.body.details?.columns?.length === 2, "A mapping that reads nothing returns the columns so the user can fix it");
+  assert(s49Big.status === 413, `A file over 2 MB is refused with 413 (got ${s49Big.status})`);
+  const s49Commits = await Promise.all([
+    api("POST", "/api/import/commit", { accountId: s48Card.id, rows: [] }),
+    api("POST", "/api/import/commit", { accountId: s48Card.id, rows: [{ date: "09/01/2026", description: "A", amount: 1, direction: "out" }] }),
+    api("POST", "/api/import/commit", { accountId: s48Card.id, rows: [{ date: "2026-09-01", description: "A", amount: -1, direction: "out" }] }),
   ]);
-  assert(s48Commits.every((r) => r.status === 400), `Commit validates its rows (got ${s48Commits.map((r) => r.status)})`);
+  assert(s49Commits.every((r) => r.status === 400), `Commit validates its rows (got ${s49Commits.map((r) => r.status)})`);
   // One transaction: a commit that fails part-way saves nothing
-  const s48Count = await Transaction.count({ paranoid: false });
-  await s47Card.update({ isActive: false });
-  const s48Archived = await api("POST", "/api/import/commit", {
-    accountId: s47Card.id, rows: [{ date: "2026-09-20", description: "SUITE48 X", amount: 3, direction: "out" }],
+  const s49Count = await Transaction.count({ paranoid: false });
+  await s48Card.update({ isActive: false });
+  const s49Archived = await api("POST", "/api/import/commit", {
+    accountId: s48Card.id, rows: [{ date: "2026-09-20", description: "SUITE49 X", amount: 3, direction: "out" }],
   });
-  await s47Card.update({ isActive: true });
+  await s48Card.update({ isActive: true });
   assert(
-    s48Archived.status === 400 && (await Transaction.count({ paranoid: false })) === s48Count,
+    s49Archived.status === 400 && (await Transaction.count({ paranoid: false })) === s49Count,
     "An archived card can't be imported into, and nothing is saved"
   );
 
-  console.log("\n--- Suite 49: Review inbox ---");
-  const s49Inbox = await api("GET", "/api/import/review");
-  const s49All = await api("GET", "/api/expenses/all");
-  const s49Imported = [...s46Commit.body.ids, ...s47Commit.body.ids, ...s47EditCommit.body.ids].filter((id) => id !== s46Streaming.id);
+  console.log("\n--- Suite 50: Review inbox ---");
+  const s50Inbox = await api("GET", "/api/import/review");
+  const s50All = await api("GET", "/api/expenses/all");
+  const s50Imported = [...s47Commit.body.ids, ...s48Commit.body.ids, ...s48EditCommit.body.ids].filter((id) => id !== s47Streaming.id);
   assert(
-    s49Inbox.status === 200 && s49Imported.every((id) => s49Inbox.body.some((r) => r.id === id)) &&
-      !s49Inbox.body.some((r) => r.id === s46Bill.id) &&
-      s49All.body.find((r) => r.id === s49Imported[0])?.needsReview === true &&
-      s49All.body.find((r) => r.id === s46Bill.id)?.needsReview === false,
-    `GET /api/import/review lists imported rows only, and the Ledger rows say whether they need review (got ${s49Inbox.body.length})`
+    s50Inbox.status === 200 && s50Imported.every((id) => s50Inbox.body.some((r) => r.id === id)) &&
+      !s50Inbox.body.some((r) => r.id === s47Bill.id) &&
+      s50All.body.find((r) => r.id === s50Imported[0])?.needsReview === true &&
+      s50All.body.find((r) => r.id === s47Bill.id)?.needsReview === false,
+    `GET /api/import/review lists imported rows only, and the Ledger rows say whether they need review (got ${s50Inbox.body.length})`
   );
-  const s49Confirm = await api("POST", "/api/import/review/confirm", { ids: s49Imported.slice(0, 2) });
-  const s49After = await api("GET", "/api/import/review");
-  const s49BadConfirm = await api("POST", "/api/import/review/confirm", { ids: ["nope"] });
+  const s50Confirm = await api("POST", "/api/import/review/confirm", { ids: s50Imported.slice(0, 2) });
+  const s50After = await api("GET", "/api/import/review");
+  const s50BadConfirm = await api("POST", "/api/import/review/confirm", { ids: ["nope"] });
   assert(
-    s49Confirm.body.confirmed === 2 && s49After.body.length === s49Inbox.body.length - 2 && s49BadConfirm.status === 400,
+    s50Confirm.body.confirmed === 2 && s50After.body.length === s50Inbox.body.length - 2 && s50BadConfirm.status === 400,
     "Confirm takes rows out of the inbox; bad ids are refused"
   );
 
-  // Cleanup Suites 45-49
+  // Cleanup Suites 45, 47-50
   await Rule.destroy({ where: {} });
   await ImportRef.destroy({ where: {} });
   await Setting.destroy({ where: { key: { [Op.like]: "import_mapping:%" } } });
   await Transaction.destroy({ where: {}, force: true });
-  await Account.destroy({ where: { id: { [Op.in]: [s45Card.id, s45Goal.id, s47Card.id] } } });
+  await Account.destroy({ where: { id: { [Op.in]: [s45Card.id, s45Goal.id, s48Card.id] } } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
