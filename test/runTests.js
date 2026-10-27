@@ -1718,8 +1718,17 @@ async function runTestSuite() {
   const s15AfterChecking = parseFloat(s15AfterSchedDash.body?.checkingAccount?.currentBalance || 0);
   assert(s15AfterChecking === s15InitialChecking, "Future unpaid transfer does NOT deduct checking balance immediately");
 
-  // Verify future transfer appears in upcoming bills
-  const s15UpcomingBills = s15AfterSchedDash.body?.upcomingBills || [];
+  // Verify future transfer appears in upcoming bills. Upcoming Bills is month-bounded, so ask for the month
+  // the payment falls in: in the last 5 days of a month it lands in the next one.
+  const [s15FutureYear, s15FutureMonth] = s15FutureDateStr.split("-").map(Number);
+  const s15FutureMonthDash = await request({
+    hostname: "localhost",
+    port: 8000,
+    path: `/api/dashboard?year=${s15FutureYear}&month=${s15FutureMonth}`,
+    method: "GET",
+    headers: authHeaders,
+  });
+  const s15UpcomingBills = s15FutureMonthDash.body?.upcomingBills || [];
   const s15FoundUpcoming = s15UpcomingBills.find((b) => b.id === s15TransferId);
   assert(Boolean(s15FoundUpcoming), "Future unpaid transfer appears in Upcoming Bills");
 
