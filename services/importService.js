@@ -101,11 +101,23 @@ const CARD_WORDS = /visa|master ?card|amex|american express|credit card/i;
 const looksLikePaymentTo = (description, card) =>
   PAYMENT_WORDS.test(description) && (titlesSimilar(card.name, description) || CARD_WORDS.test(description));
 
-// The one active card a chequing debit pays, or null when it names none or more than one
+// The one active card a chequing debit pays, or null when it names none or can't tell them apart.
+// "TD VISA PAYMENT" is similar to both "TD Visa" and "CIBC Visa"; the bank's own word ("td") decides.
+const NOT_A_BANK_WORD = /^(visa|master|mastercard|amex|american|express|credit|card|payment|pymt|pmt|paiement|thank|you)$/;
+const bankWords = (s) =>
+  String(s)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 2 && !NOT_A_BANK_WORD.test(w));
 const cardPaidBy = (description, cards) => {
   if (!PAYMENT_WORDS.test(description)) return null;
   const named = cards.filter((c) => titlesSimilar(c.name, description));
-  return named.length === 1 ? named[0] : null;
+  if (named.length <= 1) return named[0] || null;
+  const words = new Set(bankWords(description));
+  const scored = named.map((c) => ({ c, score: bankWords(c.name).filter((w) => words.has(w)).length }));
+  const top = Math.max(...scored.map((x) => x.score));
+  const best = scored.filter((x) => x.score === top);
+  return top > 0 && best.length === 1 ? best[0].c : null;
 };
 
 // A card payment shows on both statements: leaving chequing and reaching the card. Once one side is
@@ -115,9 +127,12 @@ const cardPaidBy = (description, cards) => {
 // - chequing money out: a paid TRANSFER from this chequing account to a card -> nothing to change,
 //   or one the card import recorded with no from-account -> it gets this account as its from-account
 // A TRANSFER links to each account's statement once (ImportRefs record which account linked it).
-const linkCandidateFor = (row, account, transfers, linkedBy, used) => {
+// A chequing row that names one card (payee) links only to transfers into that card; one that names
+// none links only when every matching transfer goes to the same card.
+const linkCandidateFor = (row, account, transfers, linkedBy, used, payee) => {
   const amountCents = cents(row.amount);
   let best = null;
+  const cardsSeen = new Set();
   for (const t of transfers) {
     if (used.has(t.id) || cents(t.amount) !== amountCents) continue;
     if (linkedBy.get(t.id)?.has(account.id)) continue;
@@ -127,14 +142,16 @@ const linkCandidateFor = (row, account, transfers, linkedBy, used) => {
     if (account.type === "CREDIT_CARD") {
       if (row.direction !== "in" || t.toAccountId !== account.id || !t.fromAccountId) continue;
     } else {
-      if (row.direction !== "out" || !t.toAccount || !looksLikePaymentTo(row.description, t.toAccount)) continue;
+      if (row.direction !== "out" || !t.toAccount) continue;
+      if (payee ? t.toAccountId !== payee.id : !looksLikePaymentTo(row.description, t.toAccount)) continue;
       if (t.fromAccountId === account.id) setFrom = false;
       else if (!t.fromAccountId && t.category === "Credit Card Payment") setFrom = true;
       else continue;
+      cardsSeen.add(t.toAccountId);
     }
     if (!best || gap < best.gap) best = { t, gap, setFrom };
   }
-  return best;
+  return cardsSeen.size > 1 ? null : best;
 };
 
 const needsSimilarTitle = (candidate, row, account) =>
@@ -270,6 +287,8 @@ const buildPreview = async (account, rows, dbTx = null) => {
       if (used.has(c.id) || payableCents(c) !== amountCents) continue;
       const gap = daysBetween(c.date, row.date);
       if (gap > MATCH_WINDOW_DAYS || !isEligible(c, row, account)) continue;
+      // A row that names one card never pays a scheduled payment to another card
+      if (payee && c.type === "TRANSFER" && c.toAccountId && c.toAccountId !== payee.id) continue;
       if (needsSimilarTitle(c, row, account) && !titlesSimilar(c.title, row.description)) continue;
       if (!best || gap < best.gap) best = { c, gap };
     }
@@ -288,7 +307,7 @@ const buildPreview = async (account, rows, dbTx = null) => {
         },
       };
     }
-    const link = linkCandidateFor(row, account, transfers, linkedBy, used);
+    const link = linkCandidateFor(row, account, transfers, linkedBy, used, payee);
     if (link) {
       used.add(link.t.id);
       return {

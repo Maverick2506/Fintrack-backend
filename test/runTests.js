@@ -7703,6 +7703,34 @@ async function runTestSuite() {
     s51Fallback.status === 200 && s51Fallback.body.mappingSource === "savedDidNotFit" && s51Fallback.body.counts.new === 1,
     `Saved columns that read nothing fall back to the file's own guess (got ${s51Fallback.status} ${s51Fallback.body.mappingSource})`
   );
+  // Two cards paid the same amount the same week; both chequing lines say a card word ("visa", "mastercard").
+  // Mastercard statement first, then chequing, then Visa: each chequing line links only to the card it names.
+  const s51Visa = await Account.create({ name: "Pemwick Visa", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 });
+  const s51Mc = await Account.create({ name: "Drossel Mastercard", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 });
+  s51Cards.push(s51Visa, s51Mc);
+  const s51TwoBefore = await s45CheckingBalance(s51Checking, s51Today);
+  const s51Import = async (accountId, csv) => {
+    const preview = await uploadCsv({ accountId, csv, mapping: s51Map });
+    await api("POST", "/api/import/commit", { accountId, rows: commitRows(preview.body) });
+    return preview.body;
+  };
+  await s51Import(s51Mc.id, "2026-09-09,PAYMENT - THANK YOU,317.45\n");
+  const s51TwoChequing = await s51Import(
+    s51Checking.id,
+    "2026-09-07,PEMWICK VISA PAYMENT,-317.45\n2026-09-08,DROSSEL MASTERCARD PAYMENT,-317.45\n"
+  );
+  await s51Import(s51Visa.id, "2026-09-08,PAYMENT - THANK YOU,317.45\n");
+  await s51Visa.reload();
+  await s51Mc.reload();
+  const s51TwoAfter = await s45CheckingBalance(s51Checking, s51Today);
+  const s51VisaRow = s51TwoChequing.rows.find((r) => r.description.includes("VISA"));
+  assert(
+    Math.abs(parseFloat(s51Visa.initialBalance) - 182.55) < 0.005 && Math.abs(parseFloat(s51Mc.initialBalance) - 182.55) < 0.005 &&
+      Math.abs(s51TwoAfter - (s51TwoBefore - 634.9)) < 0.005 && s51VisaRow.status === "new" && s51VisaRow.toCard?.id === s51Visa.id,
+    `Two cards paid the same amount: each chequing line pays the card it names ` +
+      `(Visa ${s51Visa.initialBalance}, Mastercard ${s51Mc.initialBalance}, chequing ${s51TwoBefore} -> ${s51TwoAfter}, Visa line ${s51VisaRow.status})`
+  );
+
   await Transaction.destroy({ where: { toAccountId: { [Op.in]: s51Cards.map((c) => c.id) } }, force: true });
   await Account.destroy({ where: { id: { [Op.in]: s51Cards.map((c) => c.id) } } });
 
