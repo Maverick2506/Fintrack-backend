@@ -531,6 +531,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         }
       : null,
     expectedPayActive: incomeSource === "expected-pay",
+    // A pay_title that doesn't form a valid series is ignored for now (automatic detection runs instead)
+    payOverrideIgnored: payContext.overrideIgnored,
     debts: debtProjections,
   };
 };

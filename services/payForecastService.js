@@ -68,11 +68,17 @@ const payAmounts = (amounts) => {
   };
 };
 
+// "acme payroll" -> "Acme Payroll": the payee key, readable, without the dates a raw title can carry
+const payLabel = (key) => key.replace(/(^|\s)(\p{L})/gu, (m, sp, ch) => sp + ch.toUpperCase());
+
 /**
  * Groups income rows by normalized title and picks the pay series. Pure, so tests can feed rows.
+ * A pay_title override is used only while it forms a valid series (2+ rows in the window with a
+ * weekly / bi-weekly / monthly gap); otherwise it's ignored for now and automatic detection runs,
+ * and overrideIgnored says why. The saved override applies again once it's valid.
  * @param {Array<{ title: string, amount: number|string, date: string }>} rows paid income, any order
  * @param {{ payTitle?: string|null }} [options]
- * @returns {{ groups: Array, pay: object|null }}
+ * @returns {{ groups: Array, pay: object|null, overrideIgnored: { title: string, label: string, reason: string }|null }}
  */
 const detectPaySeries = (rows, { payTitle = null } = {}) => {
   const byKey = new Map();
@@ -92,23 +98,33 @@ const detectPaySeries = (rows, { payTitle = null } = {}) => {
     const cadence = gaps.length ? cadenceForGap(median(gaps)) : null;
     groups.push({
       key,
-      label: recent[0].title,
+      label: payLabel(key),
       count: list.length,
       lastDate: recent[0].date,
       cadence,
+      valid: recent.length >= 2 && Boolean(cadence),
       rows: recent,
     });
   }
   // Most rows first, then the most recent
   groups.sort((a, b) => b.count - a.count || (a.lastDate < b.lastDate ? 1 : -1));
 
-  const qualifies = (g) => g.rows.length >= 2 && g.cadence;
-  let chosen;
+  let chosen = null;
+  let overrideIgnored = null;
   if (payTitle) {
-    chosen = groups.find((g) => g.key === payTitle && qualifies(g));
-  } else {
-    chosen = groups.find(qualifies);
+    const picked = groups.find((g) => g.key === payTitle);
+    if (picked && picked.valid) {
+      chosen = picked;
+    } else {
+      const reason = !picked
+        ? "no entries in the last 120 days"
+        : picked.count < 2
+        ? "1 entry"
+        : "irregular gaps";
+      overrideIgnored = { title: payTitle, label: picked ? picked.label : payLabel(payTitle), reason };
+    }
   }
+  if (!chosen) chosen = groups.find((g) => g.valid) || null;
 
   const pay = chosen
     ? {
@@ -118,11 +134,11 @@ const detectPaySeries = (rows, { payTitle = null } = {}) => {
         lastDate: chosen.lastDate,
         basedOn: chosen.rows.length,
         newestRow: chosen.rows[0],
-        override: Boolean(payTitle),
+        override: Boolean(payTitle) && !overrideIgnored,
         ...payAmounts(chosen.rows.map((r) => parseFloat(r.amount) || 0)),
       }
     : null;
-  return { groups, pay };
+  return { groups, pay, overrideIgnored };
 };
 
 /**
@@ -171,8 +187,8 @@ const loadPayContext = async ({ todayStr, checkingId, dbTx = null }) => {
     Setting.findByPk(EXPECTED_PAY_KEY, { transaction: dbTx }),
   ]);
   const payTitle = payTitleRec && payTitleRec.value ? payTitleRec.value : null;
-  const { groups, pay } = detectPaySeries(rows, { payTitle });
-  return { groups, pay, payTitle, expectedPay: parseExpectedPay(expectedRec) };
+  const { groups, pay, overrideIgnored } = detectPaySeries(rows, { payTitle });
+  return { groups, pay, overrideIgnored, payTitle, expectedPay: parseExpectedPay(expectedRec) };
 };
 
 module.exports = {
@@ -183,6 +199,7 @@ module.exports = {
   PAY_CADENCES,
   percentile,
   payAmounts,
+  payLabel,
   detectPaySeries,
   expectedPayDates,
   parseExpectedPay,

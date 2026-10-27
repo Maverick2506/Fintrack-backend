@@ -7346,6 +7346,65 @@ async function runTestSuite() {
   const s46Cleared = await s33("GET", "/api/settings/pay");
   assert(s46BadTitle.status === 400 && s46Cleared.body.payTitle === null, "An empty pay title is refused; null goes back to automatic");
 
+  // 46.4b A pay_title that isn't a valid series is ignored for now: automatic detection runs instead
+  await s46Clear();
+  const { buildMorningDigest: s46OvDigest } = require("../services/notificationService");
+  await Setting.destroy({ where: { key: "pay_title_ignored_notified" } });
+  await s46Income("Suite46 Paycheque", 1500, -28);
+  await s46Income("Suite46 Paycheque", 1300, -14);
+  await s46Income("Suite46 Paycheque", 1400, 0);
+  await s46Income("Suite46 Refund", 40, -5);
+  const s46NoOverride = await s46Forecast();
+  const s46BadPick = await s33("PUT", "/api/settings/pay-title", { title: "Suite46 Refund" });
+  const s46OvF = await s46Forecast();
+  assert(
+    s46BadPick.status === 200 && s46OvF.paySeries?.title === "suite46 paycheque" && s46OvF.paySeries?.override === false &&
+      s46OvF.payOverrideIgnored?.title === "suite46 refund" && s46OvF.payOverrideIgnored?.reason === "1 entry" &&
+      s46OvF.payOverrideIgnored?.label === "Suite46 Refund",
+    `An override on a single refund is ignored and the detected Paycheque is used (got ${s46OvF.paySeries?.title}, ${JSON.stringify(s46OvF.payOverrideIgnored)})`
+  );
+  assert(
+    s46OvF.incomeSource === "estimated" && s46OvF.safeToSpend === s46NoOverride.safeToSpend && s46OvF.planningAmount === s46NoOverride.planningAmount &&
+      s46NoOverride.payOverrideIgnored === null,
+    `Safe to Spend is the same as with no override (${s46OvF.safeToSpend} vs ${s46NoOverride.safeToSpend})`
+  );
+  const s46OvSettings = await s33("GET", "/api/settings/pay");
+  assert(
+    s46OvSettings.body.payTitle === "suite46 refund" && s46OvSettings.body.payOverrideIgnored?.reason === "1 entry" &&
+      s46OvSettings.body.incomeNames.map((n) => n.title).join(",") === "suite46 paycheque" &&
+      s46OvSettings.body.incomeNames[0].count === 3 && s46OvSettings.body.incomeNames[0].cadence === "bi-weekly",
+    `The override is kept, and the picker lists only names that form a valid series (got ${JSON.stringify(s46OvSettings.body.incomeNames)})`
+  );
+  const s46OvD1 = await s46OvDigest();
+  const s46OvD2 = await s46OvDigest();
+  const s46OvLine = "Your chosen pay 'Suite46 Refund' doesn't look like regular pay (1 entry) — using 'Suite46 Paycheque' instead.";
+  assert(
+    (s46OvD1?.message || "").includes(s46OvLine) && !(s46OvD2?.message || "").includes("doesn't look like regular pay"),
+    `The digest mentions the ignored override once, not daily (first: ${s46OvD1?.message})`
+  );
+  // The override becomes valid later (a bi-weekly series): it's used again automatically
+  await s46Income("Suite46 Refund", 45, -19);
+  await s46Income("Suite46 Refund", 50, -33);
+  const s46OvValid = await s46Forecast();
+  assert(
+    s46OvValid.paySeries?.title === "suite46 refund" && s46OvValid.paySeries?.override === true && s46OvValid.payOverrideIgnored === null &&
+      s46OvValid.planningAmount === 40,
+    `Once the chosen name forms a series, the saved override is used (got ${s46OvValid.paySeries?.title}, $${s46OvValid.planningAmount})`
+  );
+  // Both invalid: no pay series at all, and the note names the override's problem
+  await s46Clear();
+  await s46Income("Suite46 Paycheque", 1400, -3);
+  await s46Income("Suite46 Refund", 40, -5);
+  const s46OvNone = await s46Forecast();
+  const s46OvD3 = await s46OvDigest();
+  assert(
+    s46OvNone.incomeSource === "none" && s46OvNone.paySeries === null && s46OvNone.payOverrideIgnored?.reason === "1 entry" &&
+      (s46OvD3?.message || "").includes("No income in your forecast — 'Suite46 Refund' doesn't look like regular pay (1 entry). Log your paycheques or set Expected pay"),
+    `With no valid series either, incomeSource is "none" and the note names the reason (got ${s46OvNone.incomeSource}: ${s46OvD3?.message})`
+  );
+  await s33("PUT", "/api/settings/pay-title", { title: null });
+  await Setting.destroy({ where: { key: "pay_title_ignored_notified" } });
+
   // 46.5 Expected pay: used only with no pay history, ignored after 2 paycheques
   await s46Clear();
   const s46BadExpected = await Promise.all([
@@ -7439,7 +7498,7 @@ async function runTestSuite() {
 
   // Cleanup
   await s46Clear();
-  await Setting.destroy({ where: { key: ["pay_title", "expected_pay"] } });
+  await Setting.destroy({ where: { key: ["pay_title", "expected_pay", "pay_title_ignored_notified"] } });
   if (s46OrigBuffer) await Setting.upsert({ key: "forecast_buffer", value: s46OrigBuffer.value });
   else await Setting.destroy({ where: { key: "forecast_buffer" } });
   await Account.update({ initialBalance: s46OrigBalance }, { where: { id: s46Checking.id } });

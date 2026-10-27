@@ -6,6 +6,22 @@ const { toZonedTime } = require("date-fns-tz");
 
 const LOW_BALANCE_WINDOW_DAYS = 14;
 const NO_INCOME_NOTE = "No income in your forecast — log your paycheques or set Expected pay";
+// Last pay_title value the digest has mentioned as ignored, so each override is mentioned once
+const PAY_OVERRIDE_NOTIFIED_KEY = "pay_title_ignored_notified";
+
+// The no-income note, naming an ignored pay choice when there is one
+const noIncomeNote = (forecast) => {
+  const ignored = forecast.payOverrideIgnored;
+  if (!ignored) return NO_INCOME_NOTE;
+  return `No income in your forecast — '${ignored.label}' doesn't look like regular pay (${ignored.reason}). Log your paycheques or set Expected pay`;
+};
+
+// One line on a pay choice that's ignored while it isn't a regular series
+const payOverrideLine = (forecast) => {
+  const ignored = forecast.payOverrideIgnored;
+  const using = forecast.paySeries ? `using '${forecast.paySeries.label}' instead` : "it's ignored for now";
+  return `ℹ️ Your chosen pay '${ignored.label}' doesn't look like regular pay (${ignored.reason}) — ${using}.`;
+};
 
 /**
  * The lowest day below the buffer within the alert window (the next LOW_BALANCE_WINDOW_DAYS days,
@@ -111,8 +127,16 @@ const buildMorningDigest = async (dbTx = null, options = {}) => {
   try {
     const forecast = await getForecast(60, dbTx, [], options.todayStr ? { todayStr: options.todayStr } : {});
     if (forecast.incomeSource === "none") {
-      sections.push(NO_INCOME_NOTE);
+      sections.push(noIncomeNote(forecast));
     } else {
+      const ignored = forecast.payOverrideIgnored;
+      if (ignored) {
+        const notified = await Setting.findByPk(PAY_OVERRIDE_NOTIFIED_KEY, { transaction: dbTx });
+        if (!notified || notified.value !== ignored.title) {
+          sections.push(payOverrideLine(forecast));
+          await Setting.upsert({ key: PAY_OVERRIDE_NOTIFIED_KEY, value: ignored.title }, { transaction: dbTx });
+        }
+      }
       const lowest = lowBalanceDip(forecast);
       if (lowest) {
         isHighPriority = true;
@@ -241,6 +265,8 @@ Provide a 2-sentence encouraging weekly wrap-up highlighting their top focus for
 module.exports = {
   LOW_BALANCE_WINDOW_DAYS,
   NO_INCOME_NOTE,
+  PAY_OVERRIDE_NOTIFIED_KEY,
+  noIncomeNote,
   lowBalanceDip,
   buildMorningDigest,
 };

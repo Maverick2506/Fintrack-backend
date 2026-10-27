@@ -84,7 +84,9 @@ const payStatus = async () => {
         }
       : null,
     payTitle: ctx.payTitle,
-    incomeNames: ctx.groups.map((g) => ({
+    payOverrideIgnored: ctx.overrideIgnored,
+    // Only names that already form a valid pay series can be picked
+    incomeNames: ctx.groups.filter((g) => g.valid).map((g) => ({
       title: g.key,
       label: g.label,
       count: g.count,
