@@ -400,6 +400,8 @@ const schemas = {
           occurrence: z.coerce.number().int().min(1).max(MAX_IMPORT_ROWS).optional().default(1),
           category: z.string().trim().max(100).nullable().optional(),
           matchId: z.string().uuid().nullable().optional(),
+          // "Same" on a possible match: the app row this bank row is
+          linkId: z.string().uuid().nullable().optional(),
           skip: z.boolean().optional().default(false),
         })
       )

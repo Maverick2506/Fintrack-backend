@@ -221,6 +221,41 @@ const loadCategoryHistory = async (dbTx) => {
   return history;
 };
 
+// Rows already paid in the app (Quick Add, entered by hand) that a bank row can be: on the same
+// account, the same total, and a bank date from 1 day before to 5 days after the app row's date.
+const PAID_BEFORE_DAYS = 1;
+const PAID_AFTER_DAYS = 5;
+// Bank date minus app date, in days (negative when the bank shows it first)
+const dayDiff = (bankDate, appDate) =>
+  Math.round((Date.parse(`${bankDate}T00:00:00Z`) - Date.parse(`${appDate}T00:00:00Z`)) / 86400000);
+
+// Which way a cleared app row moved this account: "out" (spent from it, or charged to a card) or "in"
+const paidRowDirection = (t, account) => {
+  const amount = parseFloat(t.amount) || 0;
+  if (account.type === "CHECKING") {
+    if (t.type === "INCOME") return t.toAccountId === account.id || !t.toAccountId ? "in" : null;
+    if (t.type === "TRANSFER" && t.toAccountId === account.id) return "in";
+    if (t.fromAccountId === account.id || (t.type === "EXPENSE" && !t.fromAccountId && !t.toAccountId)) {
+      return t.type === "EXPENSE" && amount < 0 ? "in" : "out";
+    }
+    return null;
+  }
+  if (t.toAccountId === account.id) return "in";
+  if (t.fromAccountId === account.id) return t.type === "EXPENSE" && amount < 0 ? "in" : "out";
+  return null;
+};
+// The total a paid row moved: a tax-exclusive row counts with its tax, a refund by its size
+const paidTotalCents = (t) => Math.abs(payableCents(t));
+
+// "Possible match" (never automatic): the same or next day, and the bank amount up to 25% higher (a
+// tip) or within 3% either way (a foreign-currency charge)
+const possibleReason = (bankCents, appCents, diff) => {
+  if (diff < 0 || diff > 1 || bankCents === appCents || appCents <= 0) return null;
+  if (bankCents > appCents && bankCents <= Math.round(appCents * 1.25)) return "tip";
+  if (Math.abs(bankCents - appCents) <= Math.round(appCents * 0.03)) return "fx";
+  return null;
+};
+
 // Marks each parsed row (from applyMapping + withOccurrences) as
 // - duplicate: its clientRef was already imported (a row or its Trash copy, or a matched bill) -> skipped
 // - match: an unpaid row with the same amount, a date within 3 days and a similar title -> marked paid,
@@ -312,6 +347,71 @@ const buildPreview = async (account, rows, dbTx = null) => {
   // already includes them, so importing them changes no balance
   const anchorDate = await getBalanceAnchor(account, dbTx);
 
+  // Rows already paid in the app on this account, not yet linked to a row of this account's statements
+  const paidPool = (
+    await Transaction.findAll({
+      where: {
+        isCleared: true,
+        date: { [Op.between]: [shift(dates[0], -PAID_AFTER_DAYS), shift(dates[dates.length - 1], PAID_BEFORE_DAYS)] },
+        [Op.or]:
+          account.type === "CHECKING"
+            ? [
+                { fromAccountId: account.id },
+                { toAccountId: account.id },
+                { type: "INCOME", toAccountId: null },
+                { type: "EXPENSE", fromAccountId: null, toAccountId: null },
+              ]
+            : [{ fromAccountId: account.id }, { toAccountId: account.id }],
+      },
+      order: [["date", "ASC"]],
+      transaction: dbTx,
+    })
+  ).filter((t) => paidRowDirection(t, account) && !["Adjustment", "Interest"].includes(t.category));
+  const paidLinked = paidPool.length
+    ? new Set(
+        (
+          await ImportRef.findAll({
+            attributes: ["transactionId"],
+            where: { accountId: account.id, transactionId: { [Op.in]: paidPool.map((t) => t.id) } },
+            transaction: dbTx,
+          })
+        ).map((r) => r.transactionId)
+      )
+    : new Set();
+  const paidCandidates = paidPool.filter((t) => !paidLinked.has(t.id));
+  // A line that names one card never matches a payment to another card
+  const payeeOf = (row) =>
+    account.type === "CHECKING" && row.direction === "out" ? cardPaidBy(row.description, cards) : null;
+  const paidFits = (row, t) => {
+    if (paidRowDirection(t, account) !== row.direction) return false;
+    const payee = payeeOf(row);
+    if (payee && t.type === "TRANSFER" && t.toAccountId && t.toAccountId !== payee.id) return false;
+    return true;
+  };
+  // One-to-one pairs, closest date first; a similar title only breaks ties
+  const paidMatchOf = new Map();
+  {
+    const pairs = [];
+    rows.forEach((row, i) => {
+      if (imported.has(refs[i])) return;
+      const amountCents = cents(row.amount);
+      for (const t of paidCandidates) {
+        if (paidTotalCents(t) !== amountCents || !paidFits(row, t)) continue;
+        const diff = dayDiff(row.date, t.date);
+        if (diff < -PAID_BEFORE_DAYS || diff > PAID_AFTER_DAYS) continue;
+        pairs.push({ i, t, gap: Math.abs(diff), similar: titlesSimilar(t.title, row.description) ? 0 : 1 });
+      }
+    });
+    pairs.sort((a, b) => a.gap - b.gap || a.similar - b.similar || a.i - b.i);
+    const taken = new Set();
+    for (const p of pairs) {
+      if (paidMatchOf.has(p.i) || taken.has(p.t.id)) continue;
+      paidMatchOf.set(p.i, p.t);
+      taken.add(p.t.id);
+    }
+  }
+  const possibleTaken = new Set([...paidMatchOf.values()].map((t) => t.id));
+
   const out = rows.map((row, i) => {
     const ref = refs[i];
     const base = {
@@ -331,6 +431,25 @@ const buildPreview = async (account, rows, dbTx = null) => {
     const prior = imported.get(ref);
     if (prior) {
       return { ...base, status: "duplicate", existingId: prior.id, inTrash: prior.inTrash, category: null };
+    }
+    // Already recorded in the app (Quick Add or by hand): link it, create nothing, keep its title and category
+    const paid = paidMatchOf.get(i);
+    if (paid) {
+      return {
+        ...base,
+        status: "match",
+        category: paid.category,
+        match: {
+          id: paid.id,
+          title: paid.title,
+          date: paid.date,
+          amount: Math.abs(parseFloat(paid.amount)),
+          category: paid.category,
+          alreadyRecorded: true,
+          setFrom: false,
+          kind: "recorded",
+        },
+      };
     }
     const amountCents = cents(row.amount);
     let best = null;
@@ -357,6 +476,7 @@ const buildPreview = async (account, rows, dbTx = null) => {
           date: best.c.date,
           amount: parseFloat(best.c.amount),
           category: best.c.category,
+          kind: "paid",
         },
       };
     }
@@ -375,7 +495,28 @@ const buildPreview = async (account, rows, dbTx = null) => {
           category: link.t.category,
           alreadyRecorded: true,
           setFrom: link.setFrom,
+          kind: "recorded",
         },
+      };
+    }
+    // A row the user may say is the same as one already paid (tip or currency): never automatic
+    let possible = null;
+    for (const t of paidCandidates) {
+      if (possibleTaken.has(t.id) || !paidFits(row, t)) continue;
+      const diff = dayDiff(row.date, t.date);
+      const reason = possibleReason(amountCents, paidTotalCents(t), diff);
+      if (!reason) continue;
+      if (!possible || diff < possible.diff) possible = { t, diff, reason };
+    }
+    if (possible) {
+      possibleTaken.add(possible.t.id);
+      base.possible = {
+        id: possible.t.id,
+        title: possible.t.title,
+        date: possible.t.date,
+        amount: Math.abs(parseFloat(possible.t.amount)),
+        category: possible.t.category,
+        reason: possible.reason,
       };
     }
     if (payee) {
@@ -390,6 +531,9 @@ const buildPreview = async (account, rows, dbTx = null) => {
 
   const counts = {
     matched: out.filter((r) => r.status === "match").length,
+    recorded: out.filter((r) => r.status === "match" && r.match.kind === "recorded").length,
+    paid: out.filter((r) => r.status === "match" && r.match.kind === "paid").length,
+    possible: out.filter((r) => r.possible).length,
     new: out.filter((r) => r.status === "new").length,
     skipped: out.filter((r) => r.status === "duplicate").length,
     history: out.filter((r) => r.history).length,
@@ -486,6 +630,24 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         result.matched++;
         if (row.history) result.history++;
         result.matchedIds.push(bill.id);
+        continue;
+      }
+
+      // "Same" on a possible match: link the app row instead of adding one. It keeps its title and
+      // category and takes the bank's amount (a tip, a currency difference), which moves balances by
+      // the difference only. A tax-exclusive row keeps its own amounts.
+      if (row.possible && sent.linkId && sent.linkId === row.possible.id) {
+        const same = await Transaction.findByPk(row.possible.id, { transaction: dbTx });
+        const sign = parseFloat(same.amount) < 0 ? -1 : 1;
+        if (!same.isTaxExclusive && cents(same.amount) !== sign * cents(row.amount)) {
+          const wasApplied = Boolean(same.balanceApplied);
+          if (wasApplied) await adjustAccountForTransaction(same, -1, dbTx);
+          await same.update({ amount: sign * row.amount }, { transaction: dbTx });
+          if (wasApplied) await adjustAccountForTransaction(same, 1, dbTx, true);
+        }
+        await ImportRef.create({ ref: row.clientRef, transactionId: same.id, accountId: account.id }, { transaction: dbTx });
+        result.matched++;
+        result.matchedIds.push(same.id);
         continue;
       }
 

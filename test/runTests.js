@@ -7922,7 +7922,87 @@ async function runTestSuite() {
   });
   await Account.destroy({ where: { id: { [Op.in]: s52Cards } } });
 
-  // Cleanup Suites 45, 47-52
+  console.log("\n--- Suite 53: Imports match rows already paid in the app ---");
+  const s53Map = { hasHeader: false, date: 0, description: [1], amount: 2, dateFormat: "YYYY-MM-DD" };
+  const s53Checking = await s45GetChecking();
+  const s53Today = getTorontoToday();
+  const s53Add = async (body) => {
+    const res = await api("POST", "/api/expenses", { category: "Food & Drink", is_paid: true, recurrence: "none", creditCardId: null, ...body });
+    return Transaction.findByPk(res.body.id || res.body.transaction?.id);
+  };
+  const s53Preview = async (csv) => (await uploadCsv({ accountId: s53Checking.id, csv, mapping: s53Map })).body;
+  const s53Commit = async (preview, edits) =>
+    (await api("POST", "/api/import/commit", { accountId: s53Checking.id, rows: commitRows(preview, edits) })).body;
+
+  // A Quick Add coffee, then the bank's line 2 days later: one row, no balance change, the user's title kept
+  const s53Coffee = await s53Add({ name: "Coffee", amount: 4.5, due_date: "2025-11-03" });
+  const s53Before = await s45CheckingBalance(s53Checking, s53Today);
+  const s53Csv = "2025-11-05,TIM HORTONS #0001,-4.50\n";
+  const s53P1 = await s53Preview(s53Csv);
+  const s53C1 = await s53Commit(s53P1);
+  await s53Coffee.reload();
+  assert(
+    s53Coffee && s53P1.rows[0].status === "match" && s53P1.rows[0].match.kind === "recorded" && s53P1.rows[0].match.id === s53Coffee.id &&
+      s53P1.counts.recorded === 1 && s53C1.created === 0 && s53C1.matched === 1 &&
+      Math.abs((await s45CheckingBalance(s53Checking, s53Today)) - s53Before) < 0.005 &&
+      s53Coffee.title === "Coffee" && s53Coffee.category === "Food & Drink" &&
+      (await Transaction.count({ where: { date: { [Op.between]: ["2025-11-01", "2025-11-30"] } } })) === 1,
+    `A Quick Add 4.50 and the bank's charge 2 days later are one row; balance and title unchanged (got ${s53P1.rows[0].status} ${s53P1.rows[0].match?.kind}, ${JSON.stringify(s53C1)})`
+  );
+  const s53Again = await s53Preview(s53Csv);
+  assert(
+    s53Again.rows[0].status === "duplicate" && (await s53Commit(s53Again)).created === 0,
+    "Re-importing the file after a match to a paid row adds nothing"
+  );
+
+  // Two equal coffees on different days pair by date
+  const s53A = await s53Add({ name: "Latte", amount: 5.25, due_date: "2025-11-10" });
+  const s53B = await s53Add({ name: "Latte", amount: 5.25, due_date: "2025-11-13" });
+  const s53P2 = await s53Preview("2025-11-14,BEAN COUNTER CAFE,-5.25\n2025-11-11,BEAN COUNTER CAFE,-5.25\n");
+  const s53C2 = await s53Commit(s53P2);
+  assert(
+    s53P2.rows[0].match?.id === s53B.id && s53P2.rows[1].match?.id === s53A.id && s53C2.created === 0 && s53C2.matched === 2,
+    `Two equal coffees pair by date: Nov 14 with Nov 13, Nov 11 with Nov 10 (got ${s53P2.rows.map((r) => r.match?.date)})`
+  );
+
+  // A tax-exclusive Quick Add matches on its total with tax
+  const s53Taxed = await s53Add({ name: "Hardware", amount: 40, due_date: "2025-11-17", category: "Shopping", isTaxExclusive: true, taxRate: 13 });
+  const s53P3 = await s53Preview("2025-11-18,HOME DEPOT 7012,-45.20\n");
+  assert(
+    s53Taxed && Math.abs(parseFloat(s53Taxed.amount) - 45.2) < 0.005 && s53P3.rows[0].match?.id === s53Taxed.id && s53P3.rows[0].match.kind === "recorded",
+    `A tax-exclusive 40 + 13% (45.20) matches the bank's 45.20 (got ${s53Taxed?.amount}, ${s53P3.rows[0].status})`
+  );
+  await s53Commit(s53P3);
+
+  // A 20% tip: Possible match only, never automatic; "Same" links it and takes the bank amount
+  const s53Dinner = await s53Add({ name: "Dinner", amount: 25, due_date: "2025-11-20" });
+  const s53P4 = await s53Preview("2025-11-21,THE KEG 0218,-30.00\n");
+  assert(
+    s53P4.rows[0].status === "new" && s53P4.rows[0].possible?.id === s53Dinner.id && s53P4.rows[0].possible.reason === "tip" &&
+      s53P4.counts.possible === 1 && s53P4.counts.recorded === 0,
+    `A 20% tip is a Possible match, not automatic (got ${s53P4.rows[0].status}, ${JSON.stringify(s53P4.rows[0].possible)})`
+  );
+  const s53BeforeSame = await s45CheckingBalance(s53Checking, s53Today);
+  const s53C4 = await s53Commit(s53P4, { 0: { linkId: s53Dinner.id } });
+  await s53Dinner.reload();
+  assert(
+    s53C4.created === 0 && s53C4.matched === 1 && Math.abs(parseFloat(s53Dinner.amount) - 30) < 0.005 && s53Dinner.title === "Dinner" &&
+      Math.abs((await s45CheckingBalance(s53Checking, s53Today)) - (s53BeforeSame - 5)) < 0.005 &&
+      (await s53Preview("2025-11-21,THE KEG 0218,-30.00\n")).rows[0].status === "duplicate",
+    `"Same" links the dinner, which takes the bank's 30.00 (chequing down the 5 tip only); re-import skips it (got ${JSON.stringify(s53C4)}, ${s53Dinner.amount})`
+  );
+  // Different (no linkId): a new row, the app row untouched
+  const s53Lunch = await s53Add({ name: "Lunch", amount: 10, due_date: "2025-11-24" });
+  const s53P5 = await s53Preview("2025-11-24,FOOD COURT,-12.00\n");
+  const s53C5 = await s53Commit(s53P5);
+  await s53Lunch.reload();
+  assert(
+    s53P5.rows[0].possible?.id === s53Lunch.id && s53C5.created === 1 && Math.abs(parseFloat(s53Lunch.amount) - 10) < 0.005,
+    "Different: the bank row is added and the app row stays as it was"
+  );
+  await Transaction.destroy({ where: { date: { [Op.between]: ["2025-11-01", "2025-11-30"] } }, force: true });
+
+  // Cleanup Suites 45, 47-53
   await Rule.destroy({ where: {} });
   await ImportRef.destroy({ where: {} });
   await Setting.destroy({ where: { key: { [Op.like]: "import_mapping:%" } } });
