@@ -148,6 +148,8 @@ async function runTestSuite() {
     { prefix: "/api/settings", r: require("../routes/settings") },
     { prefix: "/api/net-worth-history", r: require("../routes/netWorthHistory") },
     { prefix: "/api/subscriptions", r: require("../routes/subscriptions") },
+    { prefix: "/api/rules", r: require("../routes/rules") },
+    { prefix: "/api/import", r: require("../routes/import") },
   ];
   const publicAllowlist = [
     /^\/api\/health/,
@@ -7255,6 +7257,366 @@ async function runTestSuite() {
   await AiUsage.destroy({ where: { date: s44Today } });
   await Transaction.destroy({ where: { title: { [Op.like]: "Suite44 %" } }, force: true });
   await s44Card.destroy();
+
+
+  // --- Suites 45-49: Bank CSV import, rules and the Review inbox (batch 7) ---
+  const { Rule, ImportRef } = require("../models");
+  const { getPrimaryCheckingAccount: s45GetChecking, getCalculatedCheckingBalance: s45CheckingBalance } = require("../services/checkingService");
+  await Rule.destroy({ where: {} });
+  await ImportRef.destroy({ where: {} });
+  await Setting.destroy({ where: { key: { [Op.like]: "import_mapping:%" } } });
+  const api = (method, apiPath, body) =>
+    request({ hostname: "localhost", port: 8000, path: apiPath, method, headers: authHeaders }, body);
+  // multipart/form-data upload, like the browser's FormData
+  const uploadCsv = ({ accountId, mapping, csv, filename = "statement.csv", contentType = "text/csv", omitFile = false }) => {
+    const boundary = `----fintrack${Date.now()}`;
+    const parts = [];
+    const field = (name, value) =>
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
+    if (accountId) field("accountId", accountId);
+    if (mapping) field("mapping", JSON.stringify(mapping));
+    if (!omitFile) {
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`));
+      parts.push(Buffer.isBuffer(csv) ? csv : Buffer.from(csv));
+      parts.push(Buffer.from("\r\n"));
+    }
+    parts.push(Buffer.from(`--${boundary}--\r\n`));
+    const payload = Buffer.concat(parts);
+    return new Promise((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: "localhost",
+          port: 8000,
+          path: "/api/import/preview",
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": `multipart/form-data; boundary=${boundary}`,
+            "Content-Length": payload.length,
+          },
+        },
+        (res) => {
+          let data = "";
+          res.on("data", (c) => (data += c));
+          res.on("end", () => {
+            let parsed = {};
+            try {
+              parsed = data ? JSON.parse(data) : {};
+            } catch {
+              parsed = { raw: data };
+            }
+            resolve({ status: res.statusCode, body: parsed });
+          });
+        }
+      );
+      // The server may answer (413) before reading the whole body
+      req.on("error", (err) => (err.code === "EPIPE" || err.code === "ECONNRESET" ? null : reject(err)));
+      req.write(payload);
+      req.end();
+    });
+  };
+  const fixtureCsv = (name) => fs.readFileSync(path.join(__dirname, "fixtures", name), "utf8");
+  // What the Import page sends to commit: the preview's rows, as previewed
+  const commitRows = (preview, edits = {}) =>
+    preview.rows.map((r, i) => ({
+      date: r.date,
+      description: r.description,
+      amount: r.amount,
+      direction: r.direction,
+      occurrence: r.occurrence,
+      category: r.category,
+      ...(edits[i] || {}),
+    }));
+
+  console.log("\n--- Suite 45: Rules (CRUD, priority order, POST /expenses, categorize) ---");
+  const s45Card = await Account.create({ name: "Suite45 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 5000 });
+  const s45Goal = await Account.create({ name: "Suite45 Goal", type: "SAVINGS_GOAL", initialBalance: 0 });
+  const s45Bad = await Promise.all([
+    api("POST", "/api/rules", { match: "uber" }),
+    api("POST", "/api/rules", { match: "", category: "Shopping" }),
+    api("POST", "/api/rules", { match: "uber", category: "Groceries" }),
+    api("POST", "/api/rules", { match: "uber", accountId: s45Goal.id }),
+    api("POST", "/api/rules", { match: "uber", accountId: "not-a-uuid" }),
+  ]);
+  assert(
+    s45Bad.every((r) => r.status === 400),
+    `Rules need a match and a category or account; bad categories and non-card accounts are refused (got ${s45Bad.map((r) => r.status)})`
+  );
+  const s45R1 = await api("POST", "/api/rules", { match: "Suite45 Uber", category: "Transportation", priority: 20 });
+  const s45R2 = await api("POST", "/api/rules", { match: "suite45 uber eats", category: "Food & Drink", accountId: s45Card.id, priority: 10 });
+  const s45List = await api("GET", "/api/rules");
+  assert(
+    s45R1.status === 201 && s45R2.status === 201 && s45List.body.map((r) => r.id).join() === [s45R2.body.id, s45R1.body.id].join() &&
+      s45List.body[0].accountName === "Suite45 Visa",
+    "Rules are created and listed in priority order (lowest number first) with the account's name"
+  );
+  const s45Eats = await api("POST", "/api/expenses", { name: "SUITE45 UBER EATS order", amount: 20, due_date: "2026-09-01", is_paid: true });
+  const s45Ride = await api("POST", "/api/expenses", { name: "Suite45 Uber trip", amount: 15, due_date: "2026-09-01", is_paid: true });
+  const s45EatsRow = await Transaction.findByPk(s45Eats.body.id);
+  const s45RideRow = await Transaction.findByPk(s45Ride.body.id);
+  const s45Checking = await s45GetChecking();
+  assert(
+    s45EatsRow.category === "Food & Drink" && s45EatsRow.fromAccountId === s45Card.id &&
+      s45RideRow.category === "Transportation" && s45RideRow.fromAccountId === s45Checking.id,
+    `POST /expenses without a category or account takes both from the matching rule, case-insensitive (got ${s45EatsRow.category}/${s45EatsRow.fromAccountId === s45Card.id}, ${s45RideRow.category})`
+  );
+  // Swap priorities: the "uber" rule now comes first and wins the category; the account still comes from the other rule
+  await api("PUT", `/api/rules/${s45R1.body.id}`, { priority: 1 });
+  const s45Eats2 = await api("POST", "/api/expenses", { name: "Suite45 Uber Eats lunch", amount: 12, due_date: "2026-09-01", is_paid: true });
+  const s45Eats2Row = await Transaction.findByPk(s45Eats2.body.id);
+  assert(
+    s45Eats2Row.category === "Transportation" && s45Eats2Row.fromAccountId === s45Card.id,
+    `Rules apply in priority order: after the swap the lower number wins the category (got ${s45Eats2Row.category})`
+  );
+  const s45Explicit = await api("POST", "/api/expenses", {
+    name: "Suite45 Uber Eats dinner", amount: 30, due_date: "2026-09-01", is_paid: true, category: "Shopping", creditCardId: null,
+  });
+  const s45ExplicitRow = await Transaction.findByPk(s45Explicit.body.id);
+  assert(
+    s45ExplicitRow.category === "Shopping" && s45ExplicitRow.fromAccountId === s45Checking.id,
+    "A category or account the client sends wins over the rules (creditCardId: null keeps Checking)"
+  );
+  const s45Cat = await api("POST", "/api/categorize-expense", { name: "suite45 uber eats" });
+  assert(
+    s45Cat.status === 200 && s45Cat.body.source === "rule" && s45Cat.body.category === "Transportation",
+    `Category suggestions check the rules before history and AI (got ${JSON.stringify(s45Cat.body)})`
+  );
+  const s45Del = await api("DELETE", `/api/rules/${s45R1.body.id}`);
+  const s45Del404 = await api("DELETE", `/api/rules/${s45R1.body.id}`);
+  const s45ClearBoth = await api("PUT", `/api/rules/${s45R2.body.id}`, { category: null, accountId: null });
+  assert(
+    s45Del.status === 204 && s45Del404.status === 404 && s45ClearBoth.status === 400 && (await Rule.count()) === 1,
+    "Rules can be deleted; an edit that leaves a rule with nothing to set is refused"
+  );
+  await Rule.destroy({ where: {} });
+  await Transaction.destroy({ where: { title: { [Op.like]: "suite45 %" } }, force: true });
+
+  console.log("\n--- Suite 46: Checking import (RBC format): match, new, re-import ---");
+  const s46Checking = await s45GetChecking();
+  const s46Accounts = await api("GET", "/api/import/accounts");
+  assert(
+    s46Accounts.status === 200 && s46Accounts.body[0].id === s46Checking.id &&
+      s46Accounts.body.some((a) => a.id === s45Card.id) && !s46Accounts.body.some((a) => a.id === s45Goal.id),
+    "GET /api/import/accounts lists Primary Checking and active cards only"
+  );
+  await Rule.create({ match: "grocery mart", category: "Essentials", priority: 5 });
+  const s46Bill = await Transaction.create({
+    title: "Sample Hydro", amount: 85.4, date: "2026-09-05", type: "EXPENSE", category: "Essentials",
+    isCleared: false, fromAccountId: s46Checking.id,
+  });
+  // Same amount but nothing like the title, and a similar title 5 days off: neither matches
+  const s46Decoy1 = await Transaction.create({
+    title: "Gym", amount: 16.49, date: "2026-09-12", type: "EXPENSE", category: "Other", isCleared: false, fromAccountId: s46Checking.id,
+  });
+  const s46Decoy2 = await Transaction.create({
+    title: "Pharmacy Plus", amount: 23.1, date: "2026-09-20", type: "EXPENSE", category: "Other", isCleared: false, fromAccountId: s46Checking.id,
+  });
+  const s46Today = getTorontoToday();
+  const s46Before = await s45CheckingBalance(s46Checking, s46Today);
+  const s46Count0 = await Transaction.count({ paranoid: false });
+  const s46Preview = await uploadCsv({ accountId: s46Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
+  const s46ByLine = (line) => s46Preview.body.rows?.find((r) => r.line === line);
+  assert(
+    s46Preview.status === 200 && s46Preview.body.mappingSource === "suggested" &&
+      s46Preview.body.counts.matched === 1 && s46Preview.body.counts.new === 7 && s46Preview.body.counts.skipped === 0,
+    `Preview of the RBC file: 1 matched, 7 new, 0 skipped (got ${s46Preview.status} ${JSON.stringify(s46Preview.body.counts || s46Preview.body)})`
+  );
+  assert(
+    s46ByLine(6).status === "match" && s46ByLine(6).match.id === s46Bill.id &&
+      s46ByLine(8).status === "new" && s46ByLine(9).status === "new" &&
+      s46ByLine(5).category === "Essentials" && s46ByLine(5).ruleId &&
+      s46ByLine(2).category === "Income" && s46ByLine(3).status === "new" && s46ByLine(4).status === "new" &&
+      s46ByLine(3).occurrence === 1 && s46ByLine(4).occurrence === 2,
+    "The hydro bill 2 days off matches; same amount with another title, or 5+ days off, doesn't; rules set categories; repeated rows both import"
+  );
+  assert((await Transaction.count({ paranoid: false })) === s46Count0, "Preview saves nothing");
+  const s46Commit = await api("POST", "/api/import/commit", {
+    accountId: s46Checking.id,
+    mapping: s46Preview.body.mapping,
+    rows: commitRows(s46Preview.body, { 6: { category: "Entertainment" } }),
+  });
+  const s46BillAfter = await Transaction.findByPk(s46Bill.id);
+  const s46Hydro = await Transaction.count({ where: { amount: 85.4 } });
+  const s46After = await s45CheckingBalance(s46Checking, s46Today);
+  const s46Expected = Math.round((s46Before + 2100 - 4.5 - 4.5 - 86.23 - 85.4 - 50 - 16.49 - 23.1) * 100) / 100;
+  assert(
+    s46Commit.status === 200 && s46Commit.body.created === 7 && s46Commit.body.matched === 1 && s46Commit.body.skipped === 0,
+    `Commit creates 7 rows and marks 1 bill paid (got ${s46Commit.status} ${JSON.stringify(s46Commit.body)})`
+  );
+  assert(
+    s46BillAfter.isCleared === true && s46Hydro === 1 && !s46BillAfter.needsReview,
+    "The matched bill is marked paid, with no duplicate row for it"
+  );
+  assert(
+    Math.abs(s46After - s46Expected) < 0.005,
+    `Checking balance after the import: ${s46Before} + 2,100 in - 270.22 out = ${s46Expected} (got ${s46After})`
+  );
+  const s46New = await Transaction.findAll({ where: { id: { [Op.in]: s46Commit.body.ids } } });
+  const s46Streaming = s46New.find((t) => t.title === "STREAMFLIX.COM");
+  const s46Pay = s46New.find((t) => t.type === "INCOME");
+  assert(
+    s46New.length === 7 && s46New.every((t) => t.needsReview && t.isCleared && t.clientRef) &&
+      s46Streaming.category === "Entertainment" && s46Pay.toAccountId === s46Checking.id && s46Pay.category === "Income" &&
+      (await Transaction.findByPk(s46Decoy1.id)).isCleared === false && (await Transaction.findByPk(s46Decoy2.id)).isCleared === false,
+    "New rows are paid, need review, carry a clientRef and keep the category edited in the preview; the decoy bills stay unpaid"
+  );
+  const s46Mapping = await api("GET", `/api/import/mapping/${s46Checking.id}`);
+  assert(
+    s46Mapping.status === 200 && s46Mapping.body.mapping?.amount === 6 && s46Mapping.body.mapping?.description.join() === "4,5",
+    "The mapping is saved for the account"
+  );
+  // Re-import the same file: everything is skipped and nothing changes
+  const s46Count1 = await Transaction.count({ paranoid: false });
+  const s46Again = await uploadCsv({ accountId: s46Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
+  const s46AgainCommit = await api("POST", "/api/import/commit", { accountId: s46Checking.id, rows: commitRows(s46Again.body) });
+  assert(
+    s46Again.body.mappingSource === "saved" && s46Again.body.counts.skipped === 8 && s46Again.body.counts.new === 0 &&
+      s46Again.body.counts.matched === 0 && s46AgainCommit.body.created === 0 && s46AgainCommit.body.matched === 0 &&
+      (await Transaction.count({ paranoid: false })) === s46Count1 &&
+      Math.abs((await s45CheckingBalance(s46Checking, s46Today)) - s46After) < 0.005,
+    `Re-importing the same file creates nothing (got ${JSON.stringify(s46Again.body.counts)}, created ${s46AgainCommit.body.created})`
+  );
+  // A deleted imported row stays a duplicate while it's in the Trash
+  await api("DELETE", `/api/expenses/${s46Streaming.id}`);
+  const s46Trash = await uploadCsv({ accountId: s46Checking.id, csv: fixtureCsv("rbc-chequing.csv") });
+  const s46TrashRow = s46Trash.body.rows.find((r) => r.description === "STREAMFLIX.COM");
+  assert(
+    s46TrashRow.status === "duplicate" && s46TrashRow.inTrash === true,
+    "A row deleted to the Trash is still skipped on re-import"
+  );
+
+  console.log("\n--- Suite 47: Card import (TD format): charges, payment match, refund ---");
+  const s47Card = await Account.create({ name: "Suite47 TD Visa", type: "CREDIT_CARD", initialBalance: 1000, creditLimit: 5000 });
+  const s47Checking = await s45GetChecking();
+  const s47Payment = await Transaction.create({
+    title: "Payment for Suite47 TD Visa", amount: 200, date: "2026-09-09", type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, fromAccountId: s47Checking.id, toAccountId: s47Card.id,
+  });
+  // A bill on Checking that the card statement shows was charged to the card
+  const s47Gas = await Transaction.create({
+    title: "Gas-n-Go", amount: 61.2, date: "2026-09-13", type: "EXPENSE", category: "Transportation",
+    isCleared: false, fromAccountId: s47Checking.id,
+  });
+  const s47Today = getTorontoToday();
+  const s47CheckingBefore = await s45CheckingBalance(s47Checking, s47Today);
+  const s47Preview = await uploadCsv({ accountId: s47Card.id, csv: fixtureCsv("td-visa.csv"), contentType: "application/vnd.ms-excel" });
+  assert(
+    s47Preview.status === 200 && s47Preview.body.mapping.hasHeader === false && s47Preview.body.mapping.debit === 2 &&
+      s47Preview.body.counts.matched === 2 && s47Preview.body.counts.new === 3,
+    `TD Visa preview (Windows' CSV type): debit/credit columns found, payment and gas bill matched, 3 new (got ${s47Preview.status} ${JSON.stringify(s47Preview.body.counts || s47Preview.body)})`
+  );
+  const s47Commit = await api("POST", "/api/import/commit", { accountId: s47Card.id, mapping: s47Preview.body.mapping, rows: commitRows(s47Preview.body) });
+  await s47Card.reload();
+  const s47CheckingAfter = await s45CheckingBalance(s47Checking, s47Today);
+  const s47Refund = await Transaction.findOne({ where: { title: "ONLINESHOP.CA REFUND" } });
+  const s47GasAfter = await Transaction.findByPk(s47Gas.id);
+  assert(
+    s47Commit.status === 200 && s47Commit.body.created === 3 && s47Commit.body.matched === 2,
+    `Card commit: 3 created, 2 matched (got ${JSON.stringify(s47Commit.body)})`
+  );
+  assert(
+    Math.abs(parseFloat(s47Card.initialBalance) - 933.35) < 0.005,
+    `Card balance: 1,000 + 32.15 + 59.99 + 61.20 charges - 200 payment - 19.99 refund = 933.35, the statement's balance (got ${s47Card.initialBalance})`
+  );
+  assert(
+    Math.abs(s47CheckingAfter - (s47CheckingBefore - 200)) < 0.005 && (await Transaction.findByPk(s47Payment.id)).isCleared === true,
+    `The matched card payment is paid from Checking: Checking goes down by 200 (got ${s47CheckingBefore} -> ${s47CheckingAfter})`
+  );
+  assert(
+    s47Refund.type === "TRANSFER" && s47Refund.toAccountId === s47Card.id && !s47Refund.fromAccountId && s47Refund.category === "Refund" &&
+      s47GasAfter.isCleared && s47GasAfter.fromAccountId === s47Card.id,
+    "A refund lowers the card without counting as income or spending; the matched gas bill moves to the card"
+  );
+  const s47Again = await uploadCsv({ accountId: s47Card.id, csv: fixtureCsv("td-visa.csv") });
+  const s47AgainCommit = await api("POST", "/api/import/commit", { accountId: s47Card.id, rows: commitRows(s47Again.body) });
+  await s47Card.reload();
+  assert(
+    s47Again.body.counts.skipped === 5 && s47AgainCommit.body.created === 0 && s47AgainCommit.body.matched === 0 &&
+      Math.abs(parseFloat(s47Card.initialBalance) - 933.35) < 0.005,
+    `Re-importing the card file (matched rows included) creates nothing and leaves the balance (got ${JSON.stringify(s47Again.body.counts)})`
+  );
+  // Skip and "import as new instead of matching" are honoured
+  const s47Bill = await Transaction.create({
+    title: "Suite47 Streaming", amount: 9.99, date: "2026-10-01", type: "EXPENSE", category: "Subscription", isCleared: false, fromAccountId: s47Card.id,
+  });
+  const s47Csv = "10/01/2026,SUITE47 STREAMING,9.99,,\n10/02/2026,SUITE47 SKIPPED,5.00,,\n";
+  const s47Edit = await uploadCsv({ accountId: s47Card.id, csv: s47Csv, mapping: { ...s47Preview.body.mapping } });
+  const s47EditCommit = await api("POST", "/api/import/commit", {
+    accountId: s47Card.id,
+    rows: commitRows(s47Edit.body, { 0: { matchId: null }, 1: { skip: true } }),
+  });
+  assert(
+    s47Edit.body.rows[0].status === "match" && s47EditCommit.body.created === 1 && s47EditCommit.body.skipped === 1 &&
+      (await Transaction.findByPk(s47Bill.id)).isCleared === false,
+    `A row unlinked from its match is imported as new and the bill stays unpaid; a skipped row isn't imported (got ${JSON.stringify(s47EditCommit.body)})`
+  );
+
+  console.log("\n--- Suite 48: Bad files are refused ---");
+  const s48Map = { hasHeader: false, date: 0, description: [1], amount: 2, dateFormat: "YYYY-MM-DD" };
+  const s48Bad = {
+    pdf: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", filename: "statement.pdf", contentType: "application/pdf" }),
+    xlsx: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", filename: "statement.xlsx", contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    binary: await uploadCsv({ accountId: s47Card.id, csv: Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x08]) }),
+    quote: await uploadCsv({ accountId: s47Card.id, csv: '2026-09-01,"unclosed,-1\n' }),
+    noRows: await uploadCsv({ accountId: s47Card.id, csv: "hello,world\nfoo,bar\n", mapping: s48Map }),
+    column: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", mapping: { ...s48Map, amount: 7 } }),
+    mapping: await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n", mapping: { ...s48Map, dateFormat: "YY" } }),
+    empty: await uploadCsv({ accountId: s47Card.id, csv: "\n\n" }),
+    noFile: await uploadCsv({ accountId: s47Card.id, csv: "", omitFile: true }),
+    goal: await uploadCsv({ accountId: s45Goal.id, csv: "2026-09-01,A,-1\n" }),
+    tooMany: await uploadCsv({ accountId: s47Card.id, csv: Array.from({ length: 2001 }, (_, i) => `2026-09-01,ROW ${i},-1`).join("\n") }),
+  };
+  const s48Big = await uploadCsv({ accountId: s47Card.id, csv: "2026-09-01,A,-1\n" + "x".repeat(2 * 1024 * 1024) });
+  const s48Statuses = Object.entries(s48Bad).map(([k, r]) => `${k}:${r.status}`);
+  assert(
+    Object.values(s48Bad).every((r) => r.status === 400 && typeof r.body.error === "string"),
+    `Bad CSVs get a 400 with a message: other file types, binary, unclosed quote, no readable rows, bad mapping, empty, no file, a savings goal, over 2,000 rows (got ${s48Statuses})`
+  );
+  assert(s48Bad.noRows.body.details?.columns?.length === 2, "A mapping that reads nothing returns the columns so the user can fix it");
+  assert(s48Big.status === 413, `A file over 2 MB is refused with 413 (got ${s48Big.status})`);
+  const s48Commits = await Promise.all([
+    api("POST", "/api/import/commit", { accountId: s47Card.id, rows: [] }),
+    api("POST", "/api/import/commit", { accountId: s47Card.id, rows: [{ date: "09/01/2026", description: "A", amount: 1, direction: "out" }] }),
+    api("POST", "/api/import/commit", { accountId: s47Card.id, rows: [{ date: "2026-09-01", description: "A", amount: -1, direction: "out" }] }),
+  ]);
+  assert(s48Commits.every((r) => r.status === 400), `Commit validates its rows (got ${s48Commits.map((r) => r.status)})`);
+  // One transaction: a commit that fails part-way saves nothing
+  const s48Count = await Transaction.count({ paranoid: false });
+  await s47Card.update({ isActive: false });
+  const s48Archived = await api("POST", "/api/import/commit", {
+    accountId: s47Card.id, rows: [{ date: "2026-09-20", description: "SUITE48 X", amount: 3, direction: "out" }],
+  });
+  await s47Card.update({ isActive: true });
+  assert(
+    s48Archived.status === 400 && (await Transaction.count({ paranoid: false })) === s48Count,
+    "An archived card can't be imported into, and nothing is saved"
+  );
+
+  console.log("\n--- Suite 49: Review inbox ---");
+  const s49Inbox = await api("GET", "/api/import/review");
+  const s49All = await api("GET", "/api/expenses/all");
+  const s49Imported = [...s46Commit.body.ids, ...s47Commit.body.ids, ...s47EditCommit.body.ids].filter((id) => id !== s46Streaming.id);
+  assert(
+    s49Inbox.status === 200 && s49Imported.every((id) => s49Inbox.body.some((r) => r.id === id)) &&
+      !s49Inbox.body.some((r) => r.id === s46Bill.id) &&
+      s49All.body.find((r) => r.id === s49Imported[0])?.needsReview === true &&
+      s49All.body.find((r) => r.id === s46Bill.id)?.needsReview === false,
+    `GET /api/import/review lists imported rows only, and the Ledger rows say whether they need review (got ${s49Inbox.body.length})`
+  );
+  const s49Confirm = await api("POST", "/api/import/review/confirm", { ids: s49Imported.slice(0, 2) });
+  const s49After = await api("GET", "/api/import/review");
+  const s49BadConfirm = await api("POST", "/api/import/review/confirm", { ids: ["nope"] });
+  assert(
+    s49Confirm.body.confirmed === 2 && s49After.body.length === s49Inbox.body.length - 2 && s49BadConfirm.status === 400,
+    "Confirm takes rows out of the inbox; bad ids are refused"
+  );
+
+  // Cleanup Suites 45-49
+  await Rule.destroy({ where: {} });
+  await ImportRef.destroy({ where: {} });
+  await Setting.destroy({ where: { key: { [Op.like]: "import_mapping:%" } } });
+  await Transaction.destroy({ where: {}, force: true });
+  await Account.destroy({ where: { id: { [Op.in]: [s45Card.id, s45Goal.id, s47Card.id] } } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

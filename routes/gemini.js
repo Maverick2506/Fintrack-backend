@@ -18,6 +18,7 @@ const {
 } = require("../services/debtPayoffService");
 const { compareMonths, isMonthStr } = require("../services/trendsService");
 const { getSubscriptionsSummary } = require("../services/subscriptionService");
+const { loadRules, applyRules } = require("../services/ruleService");
 const {
   reserveCall,
   releaseUnanswered,
@@ -503,6 +504,12 @@ router.post(
     // Set once a call is reserved, so a request Gemini never answered gives it back
     let usage = null;
     try {
+      // Step 0: the user's own rules come before history and AI
+      const ruled = applyRules(await loadRules(), rawName);
+      if (ruled.category) {
+        return res.json({ category: ruled.category, source: "rule", accountId: ruled.accountId });
+      }
+
       // Step 1: User's past transaction history (C4 fix)
       // Only use starts-with match when normalized name is >= 4 chars and contains a space
       const allowStartsWith = normalized.length >= 4 && normalized.includes(" ");

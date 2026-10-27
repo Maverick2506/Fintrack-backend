@@ -43,6 +43,8 @@ const settingsRoutes = require("./routes/settings");
 const netWorthHistoryRoutes = require("./routes/netWorthHistory");
 const subscriptionRoutes = require("./routes/subscriptions");
 const accountRoutes = require("./routes/accounts");
+const ruleRoutes = require("./routes/rules");
+const importRoutes = require("./routes/import");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -131,6 +133,8 @@ app.use("/api/forecast", forecastRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/net-worth-history", netWorthHistoryRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
+app.use("/api/rules", ruleRoutes);
+app.use("/api/import", importRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);
@@ -240,6 +244,14 @@ async function initialize() {
         await queryInterface.addColumn("Transactions", "deletedAt", {
           type: DataTypes.DATE,
           allowNull: true,
+        });
+      }
+      // Bank CSV import: imported rows wait in the "Review new" inbox
+      if (!tableDesc.needsReview) {
+        await queryInterface.addColumn("Transactions", "needsReview", {
+          type: DataTypes.BOOLEAN,
+          allowNull: false,
+          defaultValue: false,
         });
       }
       if (!tableDesc.balanceReversedOnDelete) {
