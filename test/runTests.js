@@ -7068,8 +7068,8 @@ async function runTestSuite() {
   const s44Search = await s44Gemini.executeTool("searchTransactions", { text: "suite44 hydro" }, s44Today);
   const s44HydroTotal = s44Hydro.reduce((s, r) => s + r.amount, 0);
   assert(
-    s44Search.count === 22 && s44Search.rows.length === 20 && s44Search.total === s44HydroTotal,
-    `searchTransactions returns 20 rows plus the count and total of all 22 matches, any case, Trash left out (got ${s44Search.count}, ${s44Search.rows.length} rows, $${s44Search.total})`
+    s44Search.count === 22 && s44Search.rows.length === 20 && s44Search.spentTotal === s44HydroTotal,
+    `searchTransactions returns 20 rows plus the count and total of all 22 matches, any case, Trash left out (got ${s44Search.count}, ${s44Search.rows.length} rows, $${s44Search.spentTotal})`
   );
   assert(
     s44Search.rows[0].date === s44Hydro[21].date && s44Search.rows[0].from === "Suite44 Visa" && s44Search.rows[0].paid === true,
@@ -7077,6 +7077,14 @@ async function runTestSuite() {
   );
   const s44ByCard = await s44Gemini.executeTool("searchTransactions", { text: "hydro", account: "suite44 visa" }, s44Today);
   assert(s44ByCard.count === 1 && s44ByCard.rows[0].amount === 71, `searchTransactions filters by account name (got ${s44ByCard.count})`);
+  // A card payment (TRANSFER) and a refund (INCOME) are not spending: separate totals, never one sum
+  await Transaction.create({ title: "Suite44 Visa payment", amount: 100, date: "2019-03-10", type: "TRANSFER", category: "Debt", isCleared: true, fromAccountId: s44Checking.id, toAccountId: s44Card.id });
+  await Transaction.create({ title: "Suite44 Visa refund", amount: 30, date: "2019-03-11", type: "INCOME", category: "Income", isCleared: true, toAccountId: s44Card.id });
+  const s44CardAll = await s44Gemini.executeTool("searchTransactions", { account: "suite44 visa" }, s44Today);
+  assert(
+    s44CardAll.count === 3 && s44CardAll.spentTotal === 71 && s44CardAll.transferTotal === 100 && s44CardAll.incomeTotal === 30 && !("total" in s44CardAll),
+    `searchTransactions keeps spending, card payments and refunds in separate totals (got ${JSON.stringify({ c: s44CardAll.count, s: s44CardAll.spentTotal, t: s44CardAll.transferTotal, i: s44CardAll.incomeTotal })})`
+  );
   const s44Range = await s44Gemini.executeTool(
     "searchTransactions",
     { text: "Suite44", from: "2019-01-04", to: "2019-01-31", minAmount: 52, maxAmount: 58, category: "essentials" },
@@ -7198,6 +7206,16 @@ async function runTestSuite() {
     s44UsageRes.status === 200 && s44UsageRes.body.calls === 3 && s44UsageRes.body.cap === 3 && s44UsageRes.body.remaining === 0 &&
       s44UsageRes.body.totalTokens === 480 && s44UsageRes.body.promptTokens === 400 && s44UsageRes.body.outputTokens === 80,
     `GET /api/settings/ai-usage shows today's calls and tokens (got ${JSON.stringify(s44UsageRes.body)})`
+  );
+  // Requests arriving together can't push the count past the cap
+  const { reserveCall: s44Reserve } = require("../services/aiUsageService");
+  await AiUsage.destroy({ where: { date: s44Today } });
+  await Setting.upsert({ key: "ai_daily_cap", value: "2" });
+  const s44Burst = await Promise.all(Array.from({ length: 6 }, () => s44Reserve(s44Today)));
+  const s44BurstRow = await AiUsage.findByPk(s44Today);
+  assert(
+    s44Burst.filter((r) => r.allowed).length === 2 && s44BurstRow.calls === 2,
+    `Six requests at once with a cap of 2: exactly 2 go through (got ${s44Burst.filter((r) => r.allowed).length}, count ${s44BurstRow.calls})`
   );
   await Setting.destroy({ where: { key: "ai_daily_cap" } });
   const s44Default = await request({ hostname: "localhost", port: 8000, path: "/api/settings/ai-usage", method: "GET", headers: authHeaders });

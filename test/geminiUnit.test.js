@@ -493,11 +493,21 @@ async function runGeminiUnitTests() {
     assert(/^Income: Bonus, \$500\.00, today \(paid\)\. Not saved yet\.$/.test(d.summary), d.summary);
   });
 
+  test("Two cards that share every keyword: the summary says to check the card", () => {
+    const twoVisas = [{ id: "a", name: "Visa" }, { id: "b", name: "Visa Infinite" }];
+    const d = buildQuickAddText({ amount: 9, title: "snack", account: "visa" }, { todayStr: TODAY, cards: twoVisas });
+    assert.strictEqual(d.quickAddText, "9 snack visa");
+    assert(/Check the card in Quick Add/.test(d.summary), d.summary);
+    assert(!/Check the card/.test(draft({ amount: 9, title: "snack", account: "visa" }).summary));
+  });
+
   test("Unknown card falls back to checking with a note; bad amount or empty title is refused", () => {
     const d = draft({ amount: 5, title: "coffee", account: "discover" });
     assert.strictEqual(d.quickAddText, "5 coffee");
     assert(/No card matches/.test(d.note));
     assert(draft({ amount: 0, title: "x" }).error);
+    assert(draft({ amount: 0.004, title: "gum" }).error, "an amount that rounds to $0.00 is refused");
+    assert.strictEqual(draft({ amount: 2.999, title: "gum" }).quickAddText, "3 gum");
     assert(draft({ amount: "abc", title: "x" }).error);
     assert(draft({ amount: 5, title: "  $ " }).error);
   });

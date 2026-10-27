@@ -674,7 +674,7 @@ const getDebtPayoffDeclaration = {
 const searchTransactionsDeclaration = {
   name: "searchTransactions",
   description:
-    "Find Maverick's transactions (paid and upcoming) by words in the title, date range, amount range, category or account. Use it for questions like 'when did I last pay hydro' or 'what did I spend at Costco in September'. Returns the newest 20 matches plus the full match count and total.",
+    "Find Maverick's transactions (paid and upcoming) by words in the title, date range, amount range, category or account. Use it for questions like 'when did I last pay hydro' or 'what did I spend at Costco in September'. Returns the newest 20 matches plus the full match count and separate totals: spentTotal (expenses, the money spent), incomeTotal (income and refunds) and transferTotal (card and debt payments, savings contributions; these are not spending). Never add these together.",
   parameters: {
     type: Type.OBJECT,
     properties: {
@@ -809,7 +809,15 @@ async function searchTransactions(args = {}) {
   if (args.account) {
     const matches = findAccountsByName(await Account.findAll(), args.account);
     if (matches.length === 0) {
-      return { count: 0, total: 0, rows: [], filters: applied, note: `No account matches "${args.account}".` };
+      return {
+        count: 0,
+        spentTotal: 0,
+        incomeTotal: 0,
+        transferTotal: 0,
+        rows: [],
+        filters: applied,
+        note: `No account matches "${args.account}".`,
+      };
     }
     const ids = matches.map((a) => a.id);
     const or = [{ fromAccountId: { [Op.in]: ids } }, { toAccountId: { [Op.in]: ids } }];
@@ -820,9 +828,15 @@ async function searchTransactions(args = {}) {
   }
   if (and.length) where[Op.and] = and;
 
-  const [count, total, rows] = await Promise.all([
+  const [count, sumsByType, rows] = await Promise.all([
     Transaction.count({ where }),
-    Transaction.sum("amount", { where }),
+    // One total per type: a card payment (TRANSFER) or a refund (INCOME) is not spending
+    Transaction.findAll({
+      where,
+      attributes: ["type", [sequelize.fn("SUM", sequelize.col("amount")), "sum"]],
+      group: ["type"],
+      raw: true,
+    }),
     Transaction.findAll({
       where,
       include: [
@@ -837,9 +851,13 @@ async function searchTransactions(args = {}) {
     }),
   ]);
 
+  const totalOf = (type) => round2(sumsByType.find((r) => r.type === type)?.sum);
+
   return {
     count,
-    total: round2(total),
+    spentTotal: totalOf("EXPENSE"),
+    incomeTotal: totalOf("INCOME"),
+    transferTotal: totalOf("TRANSFER"),
     shown: rows.length,
     filters: applied,
     rows: rows.map((t) => ({
@@ -890,7 +908,8 @@ const describeDate = (date, todayStr) => {
  * Returns { quickAddText, summary, ... } or { error }.
  */
 function buildQuickAddText(args = {}, { todayStr, cards = [] }) {
-  const amount = toAmount(args.amount);
+  const raw = toAmount(args.amount);
+  const amount = raw === null ? null : Math.round(raw * 100) / 100;
   if (!amount || amount > 1000000) {
     return { error: "I need an amount between $0.01 and $1,000,000 to draft this." };
   }
@@ -928,7 +947,10 @@ function buildQuickAddText(args = {}, { todayStr, cards = [] }) {
   if (card) {
     const others = new Set(cards.filter((c) => c !== card).flatMap(cardKeywords));
     const keywords = cardKeywords(card);
-    parts.push(keywords.find((kw) => !others.has(kw)) || keywords[0]);
+    const unique = keywords.find((kw) => !others.has(kw));
+    parts.push(unique || keywords[0]);
+    // Every word for this card also fits another one, so Quick Add may pick the other card
+    if (!unique) accountNote = `Check the card in Quick Add: "${keywords[0]}" also matches another card.`;
   }
   if (date !== todayStr) parts.push(`${date > todayStr ? "due" : "on"} ${date}`);
 
@@ -937,7 +959,8 @@ function buildQuickAddText(args = {}, { todayStr, cards = [] }) {
   const status = date > todayStr ? "unpaid" : "paid";
   const summary =
     `${type === "income" ? "Income" : "Expense"}: ${displayTitle}, ${cadFormatter.format(amount)}${where}, ` +
-    `${describeDate(date, todayStr)} (${status}). Not saved yet.`;
+    `${describeDate(date, todayStr)} (${status}). Not saved yet.` +
+    (card && accountNote ? ` ${accountNote}` : "");
 
   return {
     quickAddText: parts.join(" "),

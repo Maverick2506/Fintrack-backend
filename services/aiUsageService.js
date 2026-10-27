@@ -1,4 +1,5 @@
-const { AiUsage, Setting } = require("../models");
+const { Op } = require("sequelize");
+const { sequelize, AiUsage, Setting } = require("../models");
 
 // Daily AI call cap (AI8): one count per request that reaches Gemini, shared by Ask FinTrack, the
 // advice card and category suggestions. Days are Toronto days.
@@ -28,10 +29,12 @@ const getUsage = async (todayStr) => {
   };
 };
 
-// Two requests at once may both try to create today's row; the loser just uses the winner's
+// Two requests at once may both try to create today's row; the loser just uses the winner's.
+// No findOrCreate: its transaction makes parallel calls fail with SQLITE_BUSY on local SQLite.
 const ensureDayRow = async (todayStr) => {
+  if (await AiUsage.findByPk(todayStr)) return;
   try {
-    await AiUsage.findOrCreate({ where: { date: todayStr }, defaults: { date: todayStr } });
+    await AiUsage.create({ date: todayStr });
   } catch (err) {
     if (err.name !== "SequelizeUniqueConstraintError") throw err;
   }
@@ -51,7 +54,15 @@ const reserveCall = async (todayStr) => {
     return { allowed: false, cap: usage.cap, message: capReachedMessage(usage.cap) };
   }
   await ensureDayRow(todayStr);
-  await AiUsage.increment({ calls: 1 }, { where: { date: todayStr } });
+  // Counts the call only while under the cap, in one statement, so requests at the same moment
+  // can't push the count past it
+  const [updated] = await AiUsage.update(
+    { calls: sequelize.literal("calls + 1") },
+    { where: { date: todayStr, calls: { [Op.lt]: usage.cap } } }
+  );
+  if (!updated) {
+    return { allowed: false, cap: usage.cap, message: capReachedMessage(usage.cap) };
+  }
   return { allowed: true };
 };
 
