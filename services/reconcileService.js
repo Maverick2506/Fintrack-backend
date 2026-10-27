@@ -4,6 +4,7 @@ const { adjustAccountForTransaction, getTodayString } = require("./accountBalanc
 const { getCalculatedCheckingBalance } = require("./checkingService");
 const { interestTitle } = require("./debtInterestService");
 const { HttpError } = require("../middleware/errorHandler");
+const { setBalanceAnchor } = require("./balanceAnchorService");
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -133,6 +134,8 @@ const reconcileAccount = async (account, body, dbTx) => {
   );
   // forceApply: a statement date in the past still changes today's balance
   await adjustAccountForTransaction(trx, 1, dbTx, true);
+  // The balance now matches the statement as of `date`; a bank import treats older rows as history
+  await setBalanceAnchor(account.id, date, dbTx);
 
   await account.reload({ transaction: dbTx });
   return {

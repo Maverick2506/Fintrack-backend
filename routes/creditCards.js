@@ -6,6 +6,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
+const { setBalanceAnchor } = require("../services/balanceAnchorService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -152,6 +153,10 @@ router.put(
             : card.initialBalance,
         dueDate: dueDate !== undefined ? dueDate : card.dueDate,
       });
+      // A typed balance includes everything up to today; a bank import treats older rows as history
+      if (currentBalance !== undefined || initialBalance !== undefined) {
+        await setBalanceAnchor(card.id, getTodayString());
+      }
       res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
     } else {
       res.status(404).json({ error: "Credit Card not found" });

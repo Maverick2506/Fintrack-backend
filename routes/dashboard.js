@@ -26,6 +26,7 @@ const {
   getCheckingActivity,
 } = require("../services/checkingService");
 const { usesArchivedAccount } = require("../services/accountArchiveService");
+const { setBalanceAnchor } = require("../services/balanceAnchorService");
 const { getClearedMonthTotals } = require("../services/trendsService");
 
 router.get(
@@ -226,6 +227,8 @@ router.put(
         Math.round((desiredBalance - netCheckingActivity) * 100) / 100;
       checking.initialBalance = calculatedInitial;
       await checking.save({ fields: ["initialBalance", "updatedAt"] });
+      // A typed balance includes everything up to today; a bank import treats older rows as history
+      await setBalanceAnchor(checking.id, todayStr);
     }
 
     const currentBalance =

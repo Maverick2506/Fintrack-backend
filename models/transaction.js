@@ -71,6 +71,12 @@ const Transaction = sequelize.define(
       type: DataTypes.BOOLEAN,
       defaultValue: false,
     },
+    // Rows a bank CSV import created; they show in the "Review new" inbox until confirmed
+    needsReview: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    },
   },
   {
     // Deleted rows stay in the Trash (deletedAt set) until the nightly sweep purges them after 30 days.
