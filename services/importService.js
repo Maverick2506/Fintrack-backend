@@ -1,7 +1,9 @@
 const { Op } = require("sequelize");
 const { sequelize, Account, Transaction, Setting, ImportRef } = require("../models");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
-const { adjustAccountForTransaction } = require("./accountBalanceService");
+const { adjustAccountForTransaction, checkingEffect, recordAsHistory } = require("./accountBalanceService");
+const { getBalanceAnchor } = require("./balanceAnchorService");
+const { getAppBalance } = require("./reconcileService");
 const {
   snapshotArchivedBalances,
   assertArchivedBalancesUnchanged,
@@ -161,11 +163,7 @@ const needsSimilarTitle = (candidate, row, account) =>
 // Money in is Income on checking; on a card it's a payment or a refund (neither is spending).
 const categoryFor = (row, account, rules, history) => {
   if (row.direction === "in") {
-    if (account.type === "CHECKING") return { category: "Income", ruleId: null };
-    return {
-      category: /payment|paiement|thank you|merci/i.test(row.description) ? "Credit Card Payment" : "Refund",
-      ruleId: null,
-    };
+    return { category: account.type === "CHECKING" ? "Income" : "Credit Card Payment", ruleId: null };
   }
   const ruled = applyRules(rules, row.description);
   if (ruled.category) return { category: ruled.category, ruleId: ruled.categoryRuleId };
@@ -173,6 +171,36 @@ const categoryFor = (row, account, rules, history) => {
     history.get(row.description.toLowerCase()) || history.get(normalizeMerchantName(row.description));
   return { category: fromHistory || "Other", ruleId: null };
 };
+
+// Money back from a store. On a card it's any credit that isn't a payment; on checking the bank says so.
+// It is saved as negative spending (an EXPENSE with a negative amount), so it lowers that category's
+// spending and the balance the same way the purchase raised them.
+const CARD_PAYMENT_WORDS = /payment|paiement|thank you|merci/i;
+const REFUND_WORDS = /refund|return|reversal|rembours|credit voucher/i;
+const isRefund = (row, account) =>
+  row.direction === "in" &&
+  (account.type === "CREDIT_CARD" ? !CARD_PAYMENT_WORDS.test(row.description) : REFUND_WORDS.test(row.description));
+
+// A refund takes the category of the purchase it gives back: the newest earlier purchase on this
+// account with a similar title and at least the refunded amount (already in the app, or earlier in
+// the same file). Then the rules; else "Refund", which counts as negative spending on its own.
+const refundCategoryFor = (row, purchases, rules) => {
+  const bought = purchases
+    .filter(
+      (p) =>
+        p.date <= row.date &&
+        daysBetween(p.date, row.date) <= REFUND_LOOKBACK_DAYS &&
+        cents(p.amount) >= cents(row.amount) &&
+        EXPENSE_CATEGORIES.includes(p.category) &&
+        titlesSimilar(p.title, row.description)
+    )
+    .sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+  if (bought) return { category: bought.category, ruleId: null, refundOf: { title: bought.title, date: bought.date } };
+  const ruled = applyRules(rules, row.description);
+  if (ruled.category) return { category: ruled.category, ruleId: ruled.categoryRuleId };
+  return { category: "Refund", ruleId: null };
+};
+const REFUND_LOOKBACK_DAYS = 120;
 
 // Categories the same titles had before (the newest wins), keyed by lower-case and normalized title
 const loadCategoryHistory = async (dbTx) => {
@@ -240,7 +268,7 @@ const buildPreview = async (account, rows, dbTx = null) => {
       toAccountId: { [Op.ne]: null },
       date: { [Op.between]: [shift(dates[0], -MATCH_WINDOW_DAYS), shift(dates[dates.length - 1], MATCH_WINDOW_DAYS)] },
     },
-    include: [{ model: Account, as: "toAccount", where: { type: "CREDIT_CARD" } }],
+    include: [{ model: Account, as: "toAccount", where: { type: { [Op.in]: ["CREDIT_CARD", "DEBT"] } } }],
     order: [["date", "ASC"]],
     transaction: dbTx,
   });
@@ -257,11 +285,32 @@ const buildPreview = async (account, rows, dbTx = null) => {
   }
   const cards =
     account.type === "CHECKING"
-      ? await Account.findAll({ where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } }, transaction: dbTx })
+      ? await Account.findAll({
+          where: { type: { [Op.in]: ["CREDIT_CARD", "DEBT"] }, isActive: { [Op.ne]: false } },
+          transaction: dbTx,
+        })
       : [];
   const rules = await loadRules(dbTx);
   const history = await loadCategoryHistory(dbTx);
   const used = new Set();
+  // Earlier purchases on this account, for the category of a refund
+  const purchases = (
+    await Transaction.findAll({
+      attributes: ["title", "date", "amount", "category"],
+      where: {
+        type: "EXPENSE",
+        isCleared: true,
+        fromAccountId: account.id,
+        amount: { [Op.gt]: 0 },
+        date: { [Op.between]: [shift(dates[0], -REFUND_LOOKBACK_DAYS), dates[dates.length - 1]] },
+      },
+      transaction: dbTx,
+      raw: true,
+    })
+  ).map((p) => ({ ...p, amount: parseFloat(p.amount) }));
+  // Rows dated on or before the last time the balance was set or synced are history: the balance
+  // already includes them, so importing them changes no balance
+  const anchorDate = await getBalanceAnchor(account, dbTx);
 
   const out = rows.map((row, i) => {
     const ref = refs[i];
@@ -276,7 +325,9 @@ const buildPreview = async (account, rows, dbTx = null) => {
     };
     // A chequing debit that pays one of your cards is a TRANSFER to it, not spending
     const payee = account.type === "CHECKING" && row.direction === "out" ? cardPaidBy(row.description, cards) : null;
-    if (payee) base.toCard = { id: payee.id, name: payee.name };
+    if (payee) base.toCard = { id: payee.id, name: payee.name, type: payee.type };
+    const refund = isRefund(row, account);
+    if (refund) base.refund = true;
     const prior = imported.get(ref);
     if (prior) {
       return { ...base, status: "duplicate", existingId: prior.id, inTrash: prior.inTrash, category: null };
@@ -287,6 +338,8 @@ const buildPreview = async (account, rows, dbTx = null) => {
       if (used.has(c.id) || payableCents(c) !== amountCents) continue;
       const gap = daysBetween(c.date, row.date);
       if (gap > MATCH_WINDOW_DAYS || !isEligible(c, row, account)) continue;
+      // A refund isn't a payment: it never pays a scheduled card payment
+      if (refund && c.type === "TRANSFER") continue;
       // A row that names one card never pays a scheduled payment to another card
       if (payee && c.type === "TRANSFER" && c.toAccountId && c.toAccountId !== payee.id) continue;
       if (needsSimilarTitle(c, row, account) && !titlesSimilar(c.title, row.description)) continue;
@@ -307,7 +360,7 @@ const buildPreview = async (account, rows, dbTx = null) => {
         },
       };
     }
-    const link = linkCandidateFor(row, account, transfers, linkedBy, used, payee);
+    const link = refund ? null : linkCandidateFor(row, account, transfers, linkedBy, used, payee);
     if (link) {
       used.add(link.t.id);
       return {
@@ -325,17 +378,37 @@ const buildPreview = async (account, rows, dbTx = null) => {
         },
       };
     }
-    if (payee) return { ...base, status: "new", category: "Credit Card Payment", ruleId: null };
+    if (payee) {
+      return { ...base, status: "new", category: payee.type === "DEBT" ? "Debt" : "Credit Card Payment", ruleId: null };
+    }
+    if (refund) return { ...base, status: "new", ...refundCategoryFor(row, purchases, rules) };
     const { category, ruleId } = categoryFor(row, account, rules, history);
+    // A later refund in the same file takes this purchase's category
+    if (row.direction === "out") purchases.push({ title: row.description, date: row.date, amount: row.amount, category });
     return { ...base, status: "new", category, ruleId };
-  });
+  }).map((row) => withBalanceEffect(row, account, anchorDate));
 
   const counts = {
     matched: out.filter((r) => r.status === "match").length,
     new: out.filter((r) => r.status === "new").length,
     skipped: out.filter((r) => r.status === "duplicate").length,
+    history: out.filter((r) => r.history).length,
+    balanceChanging: out.filter((r) => r.balanceEffect !== 0).length,
   };
-  return { rows: out, counts };
+  const balanceNow = await getAppBalance(account, dbTx);
+  const balanceAfter = Math.round((balanceNow + out.reduce((sum, r) => sum + r.balanceEffect, 0)) * 100) / 100;
+  return { rows: out, counts, anchorDate, balanceNow, balanceAfter };
+};
+
+// What importing a row does to this account's balance (owed on a card): history rows and links to a
+// payment the other statement already recorded change nothing; the client sums the rows it keeps.
+const withBalanceEffect = (row, account, anchorDate) => {
+  if (row.status === "duplicate") return { ...row, history: false, balanceEffect: 0 };
+  const history = Boolean(anchorDate && row.date <= anchorDate);
+  const linkedOnly = row.status === "match" && row.match.alreadyRecorded && !row.match.setFrom;
+  const raises = account.type === "CHECKING" ? row.direction === "in" : row.direction === "out";
+  const effect = history || linkedOnly ? 0 : raises ? row.amount : -row.amount;
+  return { ...row, history, balanceEffect: Math.round(effect * 100) / 100 };
 };
 
 // Applies an import in one database transaction. The rows are the preview's rows as the client
@@ -346,9 +419,10 @@ const commitImport = async ({ accountId, rows, mapping }) => {
   const dbTx = await sequelize.transaction();
   try {
     const account = await getImportAccount(accountId, dbTx);
+    const checking = await getPrimaryCheckingAccount(dbTx);
     const archivedBefore = await snapshotArchivedBalances(dbTx);
     const { rows: preview } = await buildPreview(account, rows, dbTx);
-    const result = { created: 0, matched: 0, skipped: 0, ids: [], matchedIds: [] };
+    const result = { created: 0, matched: 0, skipped: 0, history: 0, ids: [], matchedIds: [] };
 
     for (let i = 0; i < preview.length; i++) {
       const row = preview[i];
@@ -362,15 +436,23 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         // the card side had no from-account yet (then it now comes out of this chequing account)
         if (row.match.setFrom) {
           const transfer = await Transaction.findByPk(row.match.id, { transaction: dbTx });
-          await adjustAccountForTransaction(transfer, -1, dbTx);
-          await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
-          await adjustAccountForTransaction(transfer, 1, dbTx, true);
+          if (row.history) {
+            // Checking's balance already has this payment in it: the card side keeps its effect
+            const before = checkingEffect(transfer, checking.id);
+            await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
+            await recordAsHistory(transfer, checking.id, dbTx, before);
+          } else {
+            await adjustAccountForTransaction(transfer, -1, dbTx);
+            await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
+            await adjustAccountForTransaction(transfer, 1, dbTx, true);
+          }
         }
         await ImportRef.create(
           { ref: row.clientRef, transactionId: row.match.id, accountId: account.id },
           { transaction: dbTx }
         );
         result.matched++;
+        if (row.history) result.history++;
         result.matchedIds.push(row.match.id);
         continue;
       }
@@ -382,19 +464,29 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         if (bill.isTaxExclusive && parseFloat(bill.taxRate) > 0) changes.taxApplied = true;
         if (bill.type === "EXPENSE" && !bill.toAccountId) changes.fromAccountId = account.id;
         await bill.update(changes, { transaction: dbTx });
-        await adjustAccountForTransaction(bill, 1, dbTx, true);
+        if (row.history) await recordAsHistory(bill, checking.id, dbTx);
+        else await adjustAccountForTransaction(bill, 1, dbTx, true);
         await ImportRef.create(
           { ref: row.clientRef, transactionId: bill.id, accountId: account.id },
           { transaction: dbTx }
         );
         result.matched++;
+        if (row.history) result.history++;
         result.matchedIds.push(bill.id);
         continue;
       }
 
       let fields;
+      let amount = row.amount;
       if (row.toCard) {
-        fields = { type: "TRANSFER", category: "Credit Card Payment", fromAccountId: account.id, toAccountId: row.toCard.id };
+        const category = row.toCard.type === "DEBT" ? "Debt" : "Credit Card Payment";
+        fields = { type: "TRANSFER", category, fromAccountId: account.id, toAccountId: row.toCard.id };
+      } else if (row.refund) {
+        // Negative spending: lowers the category's spending and moves the balance back
+        const wanted =
+          sent.category && (EXPENSE_CATEGORIES.includes(sent.category) || sent.category === "Refund") ? sent.category : null;
+        fields = { type: "EXPENSE", category: wanted || row.category, fromAccountId: account.id, toAccountId: null };
+        amount = -row.amount;
       } else if (row.direction === "out") {
         const wanted = sent.category && EXPENSE_CATEGORIES.includes(sent.category) ? sent.category : null;
         const category = wanted || (row.status === "new" ? row.category : null) || "Other";
@@ -402,21 +494,15 @@ const commitImport = async ({ accountId, rows, mapping }) => {
       } else if (account.type === "CHECKING") {
         fields = { type: "INCOME", category: "Income", fromAccountId: null, toAccountId: account.id };
       } else {
-        // A payment or refund on the card lowers what's owed; like a statement-sync Adjustment it
-        // has no from-account, so it doesn't count as spending, income or a checking withdrawal
-        const category =
-          row.status === "new"
-            ? row.category
-            : /payment|paiement|thank you|merci/i.test(row.description)
-            ? "Credit Card Payment"
-            : "Refund";
-        fields = { type: "TRANSFER", category, fromAccountId: null, toAccountId: account.id };
+        // A payment on the card lowers what's owed; like a statement-sync Adjustment it has no
+        // from-account, so it doesn't count as spending, income or a checking withdrawal
+        fields = { type: "TRANSFER", category: "Credit Card Payment", fromAccountId: null, toAccountId: account.id };
       }
       const created = await Transaction.create(
         {
           ...fields,
           title: row.description,
-          amount: row.amount,
+          amount,
           date: row.date,
           isCleared: true,
           recurrence: "none",
@@ -425,19 +511,24 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         },
         { transaction: dbTx }
       );
-      // The bank says it happened, so it changes the balance whatever its date
-      await adjustAccountForTransaction(created, 1, dbTx, true);
+      // The bank says it happened, so it changes the balance whatever its date, unless the balance
+      // was set or synced after it (history)
+      if (row.history) await recordAsHistory(created, checking.id, dbTx);
+      else await adjustAccountForTransaction(created, 1, dbTx, true);
       // Records which account's statement holds this row, so the other side of a card payment can link
       await ImportRef.create(
         { ref: row.clientRef, transactionId: created.id, accountId: account.id },
         { transaction: dbTx }
       );
       result.created++;
+      if (row.history) result.history++;
       result.ids.push(created.id);
     }
 
     await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
     if (mapping) await saveMapping(account.id, mapping, dbTx);
+    await account.reload({ transaction: dbTx });
+    result.balance = await getAppBalance(account, dbTx);
     await dbTx.commit();
     return result;
   } catch (error) {

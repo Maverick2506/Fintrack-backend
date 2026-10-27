@@ -605,6 +605,12 @@ router.put(
         nextTaxApplied = false;
       }
 
+      // A refund is negative spending (bank import): the form edits its size, and it stays negative
+      // while it is still an expense
+      if (parseFloat(trx.amount) < 0) {
+        nextAmount = nextType === "EXPENSE" ? -Math.abs(nextAmount) : Math.abs(nextAmount);
+      }
+
       const nextRecurrence =
         req.body.recurrence !== undefined ? req.body.recurrence : trx.recurrence;
       let nextRecurringGroupId = trx.recurringGroupId;

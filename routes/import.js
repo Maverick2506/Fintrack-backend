@@ -122,6 +122,9 @@ router.post(
       rows: preview.rows,
       invalid: mapped.invalid,
       counts: { ...preview.counts, invalid: mapped.invalid.length },
+      anchorDate: preview.anchorDate,
+      balanceNow: preview.balanceNow,
+      balanceAfter: preview.balanceAfter,
     });
   })
 );

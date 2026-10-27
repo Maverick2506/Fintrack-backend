@@ -171,8 +171,44 @@ const adjustAccountForTransaction = async (
   }
 };
 
+// How much one cleared row moves Checking's balance, which is computed from its rows
+// (the same sums as checkingService.getCheckingActivity)
+const checkingEffect = (trx, checkingId) => {
+  const amount = parseFloat(trx.amount) || 0;
+  if (!trx.isCleared || !checkingId) return 0;
+  if (trx.type === "INCOME") return trx.toAccountId === checkingId || !trx.toAccountId ? amount : 0;
+  let effect = 0;
+  if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.fromAccountId === checkingId) effect -= amount;
+  if (trx.type === "TRANSFER" && trx.toAccountId === checkingId) effect += amount;
+  return effect;
+};
+
+// A cleared row that an account's balance already includes: an imported statement line dated on or
+// before the last time the balance was set or synced (balanceAnchorService). It is marked applied, so
+// editing or deleting it later moves balances like any other row, but recording it changes none.
+// Card and debt balances are stored, so they are simply left alone; Checking is computed from its
+// rows, so its opening balance takes the opposite of what the row adds. previousCheckingEffect is the
+// row's Checking effect before this change (a card payment that now comes out of Checking).
+const recordAsHistory = async (trx, checkingId, dbTx = null, previousCheckingEffect = 0) => {
+  if (!trx.isCleared) return;
+  if (!trx.balanceApplied) {
+    trx.balanceApplied = true;
+    await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
+  }
+  const change = checkingEffect(trx, checkingId) - previousCheckingEffect;
+  if (change !== 0) {
+    await Account.increment("initialBalance", {
+      by: -change,
+      where: { id: checkingId },
+      transaction: dbTx,
+    });
+  }
+};
+
 module.exports = {
   adjustAccountForTransaction,
+  checkingEffect,
+  recordAsHistory,
   getTodayString,
   TIMEZONE,
 };

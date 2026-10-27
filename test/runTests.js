@@ -7337,8 +7337,22 @@ async function runTestSuite() {
       ...(edits[i] || {}),
     }));
 
+  // Bank imports treat rows dated on or before an account's balance anchor (created, balance typed,
+  // synced) as history. These suites import old statements into accounts made today, so they date the
+  // accounts back and clear anchors earlier suites stored; Suite 52 covers the anchor itself.
+  const s45Opened = async (account, date = "2025-01-01") => {
+    await sequelize.query(`UPDATE "${Account.getTableName()}" SET "createdAt" = :at WHERE "id" = :id`, {
+      replacements: { at: `${date} 12:00:00.000 +00:00`, id: account.id },
+    });
+    await account.reload();
+    return account;
+  };
+  await Setting.destroy({ where: { key: { [Op.like]: "balance_anchor:%" } } });
+  await Transaction.destroy({ where: { title: { [Op.like]: "Statement sync – %" } }, force: true });
+  await s45Opened(await s45GetChecking());
+
   console.log("\n--- Suite 45: Rules (CRUD, priority order, POST /expenses, categorize) ---");
-  const s45Card = await Account.create({ name: "Suite45 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 5000 });
+  const s45Card = await s45Opened(await Account.create({ name: "Suite45 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 5000 }));
   const s45Goal = await Account.create({ name: "Suite45 Goal", type: "SAVINGS_GOAL", initialBalance: 0 });
   const s45Bad = await Promise.all([
     api("POST", "/api/rules", { match: "uber" }),
@@ -7496,7 +7510,7 @@ async function runTestSuite() {
   );
 
   console.log("\n--- Suite 48: Card import (TD format): charges, payment match, refund ---");
-  const s48Card = await Account.create({ name: "Suite48 TD Visa", type: "CREDIT_CARD", initialBalance: 1000, creditLimit: 5000 });
+  const s48Card = await s45Opened(await Account.create({ name: "Suite48 TD Visa", type: "CREDIT_CARD", initialBalance: 1000, creditLimit: 5000 }));
   const s48Checking = await s45GetChecking();
   const s48Payment = await Transaction.create({
     title: "Payment for Suite48 TD Visa", amount: 200, date: "2026-09-09", type: "TRANSFER", category: "Credit Card Payment",
@@ -7532,10 +7546,12 @@ async function runTestSuite() {
     Math.abs(s48CheckingAfter - (s48CheckingBefore - 200)) < 0.005 && (await Transaction.findByPk(s48Payment.id)).isCleared === true,
     `The matched card payment is paid from Checking: Checking goes down by 200 (got ${s48CheckingBefore} -> ${s48CheckingAfter})`
   );
+  const s48Purchase = await Transaction.findOne({ where: { title: "ONLINESHOP.CA*XY12AB" } });
   assert(
-    s48Refund.type === "TRANSFER" && s48Refund.toAccountId === s48Card.id && !s48Refund.fromAccountId && s48Refund.category === "Refund" &&
-      s48GasAfter.isCleared && s48GasAfter.fromAccountId === s48Card.id,
-    "A refund lowers the card without counting as income or spending; the matched gas bill moves to the card"
+    s48Refund.type === "EXPENSE" && Math.abs(parseFloat(s48Refund.amount) + 19.99) < 0.005 && s48Refund.fromAccountId === s48Card.id &&
+      s48Refund.category === s48Purchase.category && s48GasAfter.isCleared && s48GasAfter.fromAccountId === s48Card.id,
+    `A refund is negative spending in its purchase's category (${s48Purchase.category}) and lowers the card; the matched gas bill moves to the card ` +
+      `(got ${s48Refund.type} ${s48Refund.amount} ${s48Refund.category})`
   );
   const s48Again = await uploadCsv({ accountId: s48Card.id, csv: fixtureCsv("td-visa.csv") });
   const s48AgainCommit = await api("POST", "/api/import/commit", { accountId: s48Card.id, rows: commitRows(s48Again.body) });
@@ -7629,7 +7645,7 @@ async function runTestSuite() {
   // Each scenario's card has its own bank name, so the chequing line names exactly one card.
   const s51Run = async (label, month, { scheduled, cardFirst }) => {
     const name = `${label} (${scheduled ? "scheduled payment" : "no scheduled payment"}, ${cardFirst ? "card file first" : "chequing file first"})`;
-    const card = await Account.create({ name: `${label} Card`, type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 });
+    const card = await s45Opened(await Account.create({ name: `${label} Card`, type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 }));
     const chequingCsv = `2026-${month}-08,${label.toUpperCase()} CARD PAYMENT,-200.00\n`;
     const cardCsv = `2026-${month}-09,PAYMENT - THANK YOU,200.00\n`;
     if (scheduled) {
@@ -7676,8 +7692,8 @@ async function runTestSuite() {
     await s51Run("Tolbin", "08", { scheduled: false, cardFirst: true }),
   ];
 
-  // A no-op Save from Review on a card statement's refund keeps it off Checking
-  const s51RefundCsv = "2026-04-10,TOLBIN REFUND,25.00\n";
+  // A no-op Save from Review on a card statement's payment keeps it off Checking
+  const s51RefundCsv = "2026-04-10,PAYMENT RECEIVED,25.00\n";
   const s51RefundPreview = await uploadCsv({ accountId: s51Cards[3].id, csv: s51RefundCsv, mapping: s51Map });
   const s51RefundCommit = await api("POST", "/api/import/commit", { accountId: s51Cards[3].id, rows: commitRows(s51RefundPreview.body) });
   const s51RefundId = s51RefundCommit.body.ids[0];
@@ -7685,7 +7701,7 @@ async function runTestSuite() {
   await s51Cards[3].reload();
   const s51CardBeforeSave = parseFloat(s51Cards[3].initialBalance);
   const s51Save = await api("PUT", `/api/expenses/${s51RefundId}`, {
-    name: "TOLBIN REFUND", amount: 25, due_date: "2026-04-10", category: "Refund", is_paid: true, creditCardId: null, recurrence: "none",
+    name: "PAYMENT RECEIVED", amount: 25, due_date: "2026-04-10", category: "Credit Card Payment", is_paid: true, creditCardId: null, recurrence: "none",
   });
   const s51RefundAfter = await Transaction.findByPk(s51RefundId);
   await s51Cards[3].reload();
@@ -7693,7 +7709,7 @@ async function runTestSuite() {
     s51Save.status === 200 && s51RefundAfter.fromAccountId === null &&
       Math.abs((await s45CheckingBalance(s51Checking, s51Today)) - s51BeforeSave) < 0.005 &&
       Math.abs(parseFloat(s51Cards[3].initialBalance) - s51CardBeforeSave) < 0.005,
-    `Saving an imported card refund unchanged keeps it with no from-account; chequing and card don't move (from ${s51RefundAfter.fromAccountId})`
+    `Saving an imported card payment unchanged keeps it with no from-account; chequing and card don't move (from ${s51RefundAfter.fromAccountId})`
   );
 
   // A saved mapping that doesn't fit a new file falls back to the guess from the file
@@ -7705,8 +7721,8 @@ async function runTestSuite() {
   );
   // Two cards paid the same amount the same week; both chequing lines say a card word ("visa", "mastercard").
   // Mastercard statement first, then chequing, then Visa: each chequing line links only to the card it names.
-  const s51Visa = await Account.create({ name: "Pemwick Visa", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 });
-  const s51Mc = await Account.create({ name: "Drossel Mastercard", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 });
+  const s51Visa = await s45Opened(await Account.create({ name: "Pemwick Visa", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 }));
+  const s51Mc = await s45Opened(await Account.create({ name: "Drossel Mastercard", type: "CREDIT_CARD", initialBalance: 500, creditLimit: 2000 }));
   s51Cards.push(s51Visa, s51Mc);
   const s51TwoBefore = await s45CheckingBalance(s51Checking, s51Today);
   const s51Import = async (accountId, csv) => {
@@ -7734,7 +7750,123 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { toAccountId: { [Op.in]: s51Cards.map((c) => c.id) } }, force: true });
   await Account.destroy({ where: { id: { [Op.in]: s51Cards.map((c) => c.id) } } });
 
-  // Cleanup Suites 45, 47-51
+  console.log("\n--- Suite 52: Imports and the balance anchor, payments in both files, refunds as negative spending ---");
+  const { getClearedMonthTotals: s52MonthTotals } = require("../services/trendsService");
+  const s52Map = { hasHeader: false, date: 0, description: [1], amount: 2, dateFormat: "YYYY-MM-DD" };
+  const s52Import = async (accountId, csv) => {
+    const preview = await uploadCsv({ accountId, csv, mapping: s52Map });
+    const commit = await api("POST", "/api/import/commit", { accountId, rows: commitRows(preview.body) });
+    return { preview: preview.body, commit: commit.body };
+  };
+  const s52Checking = await s45GetChecking();
+  const s52Today = getTorontoToday();
+
+  // A card synced with its statement on Feb 28: February's rows are already in that balance
+  const s52Card = await s45Opened(await Account.create({ name: "Brindle Card", type: "CREDIT_CARD", initialBalance: 300, creditLimit: 2000 }));
+  const s52Sync = await api("POST", `/api/accounts/${s52Card.id}/reconcile`, { actualBalance: 400, date: "2026-02-28", reason: "adjustment" });
+  await s52Card.reload();
+  const s52CardSynced = parseFloat(s52Card.initialBalance);
+  const s52CardImport = await s52Import(
+    s52Card.id,
+    "2026-02-10,BRINDLE HARDWARE,-80.00\n2026-02-20,BRINDLE HARDWARE REFUND,30.00\n2026-02-28,CORNER GROCER,-15.00\n2026-03-03,CORNER GROCER,-12.50\n"
+  );
+  await s52Card.reload();
+  assert(
+    s52Sync.status === 201 && Math.abs(s52CardSynced - 400) < 0.005 &&
+      s52CardImport.preview.counts.history === 3 && s52CardImport.preview.counts.balanceChanging === 1 &&
+      s52CardImport.preview.anchorDate === "2026-02-28" && Math.abs(s52CardImport.preview.balanceNow - 400) < 0.005 &&
+      Math.abs(s52CardImport.preview.balanceAfter - 412.5) < 0.005,
+    `Preview after a Feb 28 sync: 3 history rows, 1 that changes the balance, balance 400 -> 412.50 ` +
+      `(got ${JSON.stringify(s52CardImport.preview.counts)}, anchor ${s52CardImport.preview.anchorDate}, ${s52CardImport.preview.balanceNow} -> ${s52CardImport.preview.balanceAfter})`
+  );
+  assert(
+    s52CardImport.commit.created === 4 && s52CardImport.commit.history === 3 && Math.abs(parseFloat(s52Card.initialBalance) - 412.5) < 0.005 &&
+      Math.abs(s52CardImport.commit.balance - 412.5) < 0.005,
+    `Rows on or before the sync are saved as history: only March's 12.50 moves the card (got ${s52Card.initialBalance}, ${JSON.stringify(s52CardImport.commit)})`
+  );
+  const s52History = await Transaction.findAll({ where: { type: "EXPENSE", fromAccountId: s52Card.id, date: { [Op.lte]: "2026-02-28" } } });
+  assert(
+    s52History.length === 3 && s52History.every((t) => t.balanceApplied && t.isCleared),
+    "History rows are cleared and marked applied, so editing or deleting them later works like any other row"
+  );
+
+  // Checking with its balance typed today: last month's statement is all history
+  const s52CheckingSet = await api("PUT", "/api/checking", { balance: 2500 });
+  const s52CheckingImport = await s52Import(
+    s52Checking.id,
+    "2026-01-05,PAYROLL DEPOSIT,1800.00\n2026-01-07,CORNER GROCER,-64.10\n2026-01-12,BRINDLE CARD PAYMENT,-150.00\n"
+  );
+  const s52CheckingAfter = await s45CheckingBalance(await s45GetChecking(), s52Today);
+  await s52Card.reload();
+  assert(
+    s52CheckingSet.status === 200 && s52CheckingImport.preview.counts.history === 3 && s52CheckingImport.preview.counts.balanceChanging === 0 &&
+      Math.abs(s52CheckingImport.preview.balanceAfter - 2500) < 0.005 && Math.abs(s52CheckingAfter - 2500) < 0.005 &&
+      Math.abs(parseFloat(s52Card.initialBalance) - 412.5) < 0.005,
+    `Importing a checking statement older than the typed balance leaves Checking at 2,500 and the card alone ` +
+      `(got Checking ${s52CheckingAfter}, card ${s52Card.initialBalance}, ${JSON.stringify(s52CheckingImport.preview.counts)})`
+  );
+
+  // A card payment the app already has ("Payment for <card>", paid) and both statements: one transfer
+  const s52Card2 = await s45Opened(await Account.create({ name: "Quorra Card", type: "CREDIT_CARD", initialBalance: 600, creditLimit: 2000 }));
+  const s52Paid = await api("POST", "/api/expenses", {
+    name: "Payment for Quorra Card", amount: 175, due_date: s52Today, category: "Credit Card Payment", is_paid: true,
+    targetAccountId: s52Card2.id, recurrence: "none",
+  });
+  await s52Card2.reload();
+  const s52Card2Paid = parseFloat(s52Card2.initialBalance);
+  const s52CheckingPaid = await s45CheckingBalance(await s45GetChecking(), s52Today);
+  // Both statements are newer than the anchors, so only links (no balance change) are expected
+  await s45Opened(s52Card2, "2025-01-01");
+  await Setting.destroy({ where: { key: { [Op.like]: "balance_anchor:%" } } });
+  const s52Chq2 = await s52Import(s52Checking.id, `${s52Today},QUORRA CARD PAYMENT,-175.00\n`);
+  const s52Card2Import = await s52Import(s52Card2.id, `${s52Today},PAYMENT - THANK YOU,175.00\n`);
+  await s52Card2.reload();
+  const s52Transfers = await Transaction.findAll({ where: { type: "TRANSFER", toAccountId: s52Card2.id } });
+  assert(
+    s52Paid.status === 201 && Math.abs(s52Card2Paid - 425) < 0.005 && s52Transfers.length === 1 &&
+      s52Chq2.preview.rows[0].status === "match" && s52Card2Import.preview.rows[0].status === "match" &&
+      Math.abs(parseFloat(s52Card2.initialBalance) - 425) < 0.005 &&
+      Math.abs((await s45CheckingBalance(await s45GetChecking(), s52Today)) - s52CheckingPaid) < 0.005,
+    `A paid "Payment for" row is the one transfer for both statements (got ${s52Transfers.length} transfers, card ${s52Card2.initialBalance}, ` +
+      `rows ${s52Chq2.preview.rows[0]?.status}/${s52Card2Import.preview.rows[0]?.status})`
+  );
+
+  // Refunds: negative spending in the purchase's category, or "Refund" when there's no purchase
+  const s52Card3 = await s45Opened(await Account.create({ name: "Vellum Card", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 2000 }));
+  await api("POST", "/api/rules", { match: "lumen outfitters", category: "Shopping", priority: 5 });
+  const s52Refunds = await s52Import(
+    s52Card3.id,
+    "2026-03-04,LUMEN OUTFITTERS 0042,-60.00\n2026-03-11,LUMEN OUTFITTERS REFUND,20.00\n2026-03-15,MYSTERY STORE CREDIT,5.00\n"
+  );
+  await s52Card3.reload();
+  const s52March = (await s52MonthTotals("2026-03-01", "2026-03-31"))["2026-03"] || { byCategory: {} };
+  const s52RefundRows = s52Refunds.preview.rows.filter((r) => r.refund);
+  assert(
+    s52RefundRows.length === 2 && s52RefundRows[0].category === "Shopping" && s52RefundRows[1].category === "Refund" &&
+      Math.abs((s52March.byCategory.Shopping || 0) - 40) < 0.005 && Math.abs((s52March.byCategory.Refund || 0) + 5) < 0.005 &&
+      Math.abs(parseFloat(s52Card3.initialBalance) - 35) < 0.005,
+    `A refund lowers its purchase's category (Shopping 60 - 20 = 40); one with no purchase is Refund (-5); the card owes 35 ` +
+      `(got ${JSON.stringify(s52March.byCategory)}, card ${s52Card3.initialBalance}, ${s52RefundRows.map((r) => r.category)})`
+  );
+  // Editing a refund keeps it negative
+  const s52RefundRow = await Transaction.findOne({ where: { title: "LUMEN OUTFITTERS REFUND" } });
+  const s52RefundSave = await api("PUT", `/api/expenses/${s52RefundRow.id}`, {
+    name: "LUMEN OUTFITTERS REFUND", amount: 20, due_date: "2026-03-11", category: "Shopping", is_paid: true, creditCardId: s52Card3.id, recurrence: "none",
+  });
+  await s52RefundRow.reload();
+  await s52Card3.reload();
+  assert(
+    s52RefundSave.status === 200 && Math.abs(parseFloat(s52RefundRow.amount) + 20) < 0.005 && Math.abs(parseFloat(s52Card3.initialBalance) - 35) < 0.005,
+    `Saving a refund unchanged keeps it -20 and the card at 35 (got ${s52RefundRow.amount}, card ${s52Card3.initialBalance})`
+  );
+  const s52Cards = [s52Card, s52Card2, s52Card3].map((c) => c.id);
+  await Transaction.destroy({
+    where: { [Op.or]: [{ toAccountId: { [Op.in]: s52Cards } }, { fromAccountId: { [Op.in]: s52Cards } }] },
+    force: true,
+  });
+  await Account.destroy({ where: { id: { [Op.in]: s52Cards } } });
+
+  // Cleanup Suites 45, 47-52
   await Rule.destroy({ where: {} });
   await ImportRef.destroy({ where: {} });
   await Setting.destroy({ where: { key: { [Op.like]: "import_mapping:%" } } });
