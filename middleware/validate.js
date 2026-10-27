@@ -234,6 +234,10 @@ const schemas = {
     reason: z.enum(["interest", "adjustment"]).optional().default("adjustment"),
   }),
 
+  setAiDailyCap: z.object({
+    cap: z.coerce.number().int("The limit must be a whole number").min(0).max(10000),
+  }),
+
   setDebtInterest: z.object({
     enabled: z.union([
       z.boolean(),
