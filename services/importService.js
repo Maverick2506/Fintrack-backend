@@ -1,7 +1,7 @@
 const { Op } = require("sequelize");
 const { sequelize, Account, Transaction, Setting, ImportRef } = require("../models");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
-const { adjustAccountForTransaction, checkingEffect, recordAsHistory } = require("./accountBalanceService");
+const { adjustAccountForTransaction, checkingEffect, applyImportedRow } = require("./accountBalanceService");
 const { getBalanceAnchor } = require("./balanceAnchorService");
 const { getAppBalance } = require("./reconcileService");
 const {
@@ -423,6 +423,25 @@ const commitImport = async ({ accountId, rows, mapping }) => {
     const archivedBefore = await snapshotArchivedBalances(dbTx);
     const { rows: preview } = await buildPreview(account, rows, dbTx);
     const result = { created: 0, matched: 0, skipped: 0, history: 0, ids: [], matchedIds: [] };
+    // Which sides of a row the balances already include: Checking's side by Checking's anchor, the
+    // card's or debt's side by its own (a card payment touches both)
+    const anchors = new Map();
+    const anchorOf = async (id) => {
+      if (!anchors.has(id)) {
+        const acc = await Account.findByPk(id, { transaction: dbTx });
+        anchors.set(id, acc ? await getBalanceAnchor(acc, dbTx) : null);
+      }
+      return anchors.get(id);
+    };
+    const sidesFor = async (trx, date) => {
+      const storedId = [trx.toAccountId, trx.fromAccountId].find((id) => id && id !== checking.id);
+      const checkingAnchor = await anchorOf(checking.id);
+      const storedAnchor = storedId ? await anchorOf(storedId) : null;
+      return {
+        checkingHistory: Boolean(checkingAnchor && date <= checkingAnchor),
+        storedHistory: Boolean(storedAnchor && date <= storedAnchor),
+      };
+    };
 
     for (let i = 0; i < preview.length; i++) {
       const row = preview[i];
@@ -436,16 +455,11 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         // the card side had no from-account yet (then it now comes out of this chequing account)
         if (row.match.setFrom) {
           const transfer = await Transaction.findByPk(row.match.id, { transaction: dbTx });
-          if (row.history) {
-            // Checking's balance already has this payment in it: the card side keeps its effect
-            const before = checkingEffect(transfer, checking.id);
-            await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
-            await recordAsHistory(transfer, checking.id, dbTx, before);
-          } else {
-            await adjustAccountForTransaction(transfer, -1, dbTx);
-            await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
-            await adjustAccountForTransaction(transfer, 1, dbTx, true);
-          }
+          // The card statement already applied (or recorded as history) the card's side; this
+          // adds Checking's side, unless Checking's balance already includes it
+          const before = checkingEffect(transfer, checking.id);
+          await transfer.update({ fromAccountId: account.id }, { transaction: dbTx });
+          await applyImportedRow(transfer, checking.id, await sidesFor(transfer, row.date), dbTx, before);
         }
         await ImportRef.create(
           { ref: row.clientRef, transactionId: row.match.id, accountId: account.id },
@@ -464,8 +478,7 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         if (bill.isTaxExclusive && parseFloat(bill.taxRate) > 0) changes.taxApplied = true;
         if (bill.type === "EXPENSE" && !bill.toAccountId) changes.fromAccountId = account.id;
         await bill.update(changes, { transaction: dbTx });
-        if (row.history) await recordAsHistory(bill, checking.id, dbTx);
-        else await adjustAccountForTransaction(bill, 1, dbTx, true);
+        await applyImportedRow(bill, checking.id, await sidesFor(bill, row.date), dbTx);
         await ImportRef.create(
           { ref: row.clientRef, transactionId: bill.id, accountId: account.id },
           { transaction: dbTx }
@@ -511,10 +524,9 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         },
         { transaction: dbTx }
       );
-      // The bank says it happened, so it changes the balance whatever its date, unless the balance
-      // was set or synced after it (history)
-      if (row.history) await recordAsHistory(created, checking.id, dbTx);
-      else await adjustAccountForTransaction(created, 1, dbTx, true);
+      // The bank says it happened, so it changes balances whatever its date, except on a side whose
+      // account's balance was set or synced on or after it (history)
+      await applyImportedRow(created, checking.id, await sidesFor(created, row.date), dbTx);
       // Records which account's statement holds this row, so the other side of a card payment can link
       await ImportRef.create(
         { ref: row.clientRef, transactionId: created.id, accountId: account.id },

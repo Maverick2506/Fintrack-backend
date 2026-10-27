@@ -183,32 +183,46 @@ const checkingEffect = (trx, checkingId) => {
   return effect;
 };
 
-// A cleared row that an account's balance already includes: an imported statement line dated on or
-// before the last time the balance was set or synced (balanceAnchorService). It is marked applied, so
-// editing or deleting it later moves balances like any other row, but recording it changes none.
-// Card and debt balances are stored, so they are simply left alone; Checking is computed from its
-// rows, so its opening balance takes the opposite of what the row adds. previousCheckingEffect is the
-// row's Checking effect before this change (a card payment that now comes out of Checking).
-const recordAsHistory = async (trx, checkingId, dbTx = null, previousCheckingEffect = 0) => {
+// Records a cleared imported row against balances one side at a time. A row can touch two accounts
+// (a card payment leaves Checking and reaches the card), and each side is history when its own
+// account's balance was set or synced on or after the row's date (balanceAnchorService):
+// - the stored side (card, debt, savings goal) is applied through adjustAccountForTransaction, or,
+//   when it's history, only marked applied so editing or deleting the row later works like any other;
+// - Checking is computed from its rows, so when its side is history its opening balance takes the
+//   opposite of what the row adds. previousCheckingEffect is the row's Checking effect before this
+//   change (a card payment the card statement recorded, that now comes out of Checking).
+// A row already marked applied (the other statement recorded it) keeps its stored side as it is.
+const applyImportedRow = async (
+  trx,
+  checkingId,
+  { checkingHistory = false, storedHistory = false } = {},
+  dbTx = null,
+  previousCheckingEffect = 0
+) => {
   if (!trx.isCleared) return;
   if (!trx.balanceApplied) {
-    trx.balanceApplied = true;
-    await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
+    if (!storedHistory) await adjustAccountForTransaction(trx, 1, dbTx, true);
+    if ((storedHistory || checkingHistory) && !trx.balanceApplied) {
+      trx.balanceApplied = true;
+      await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
+    }
   }
-  const change = checkingEffect(trx, checkingId) - previousCheckingEffect;
-  if (change !== 0) {
-    await Account.increment("initialBalance", {
-      by: -change,
-      where: { id: checkingId },
-      transaction: dbTx,
-    });
+  if (checkingHistory) {
+    const change = checkingEffect(trx, checkingId) - previousCheckingEffect;
+    if (change !== 0) {
+      await Account.increment("initialBalance", {
+        by: -change,
+        where: { id: checkingId },
+        transaction: dbTx,
+      });
+    }
   }
 };
 
 module.exports = {
   adjustAccountForTransaction,
   checkingEffect,
-  recordAsHistory,
+  applyImportedRow,
   getTodayString,
   TIMEZONE,
 };

@@ -7831,6 +7831,62 @@ async function runTestSuite() {
       `rows ${s52Chq2.preview.rows[0]?.status}/${s52Card2Import.preview.rows[0]?.status})`
   );
 
+  // History is decided per side of a card payment: Checking's side by Checking's anchor, the card's by its own
+  const s52SetAnchor = async (accountId, date) => {
+    await Setting.destroy({ where: { key: `balance_anchor:${accountId}` } });
+    if (date) await Setting.create({ key: `balance_anchor:${accountId}`, value: date });
+  };
+  const s52Sides = async (label, { checkingAnchor, cardAnchor, cardFirst, expectCardDrop, expectCheckingDrop }) => {
+    const card = await s45Opened(await Account.create({ name: `${label} Card`, type: "CREDIT_CARD", initialBalance: 900, creditLimit: 5000 }));
+    await s52SetAnchor(s52Checking.id, checkingAnchor);
+    await s52SetAnchor(card.id, cardAnchor);
+    const checkingBefore = await s45CheckingBalance(await s45GetChecking(), s52Today);
+    const files = [
+      [s52Checking.id, `2026-01-20,${label.toUpperCase()} CARD PAYMENT,-251.37\n`],
+      [card.id, "2026-01-21,PAYMENT - THANK YOU,251.37\n"],
+    ];
+    if (cardFirst) files.reverse();
+    for (const [id, csv] of files) await s52Import(id, csv);
+    await card.reload();
+    const checkingAfter = await s45CheckingBalance(await s45GetChecking(), s52Today);
+    const transfers = await Transaction.findAll({ where: { type: "TRANSFER", toAccountId: card.id } });
+    const wantCard = expectCardDrop ? 648.63 : 900;
+    const wantChecking = expectCheckingDrop ? checkingBefore - 251.37 : checkingBefore;
+    assert(
+      transfers.length === 1 && transfers[0].fromAccountId === s52Checking.id &&
+        Math.abs(parseFloat(card.initialBalance) - wantCard) < 0.005 && Math.abs(checkingAfter - wantChecking) < 0.005,
+      `${label} (${cardFirst ? "card file first" : "chequing file first"}): one transfer; card 900 -> ${wantCard}, ` +
+        `chequing ${expectCheckingDrop ? "down 251.37" : "unchanged"} (got card ${card.initialBalance}, chequing ${checkingBefore} -> ${checkingAfter}, ${transfers.length} transfers)`
+    );
+    return card;
+  };
+  // Repro A: Checking's balance typed after the payment, the card's set before it
+  const s52SideCards = [
+    await s52Sides("Harbour", { checkingAnchor: "2026-01-25", cardAnchor: "2026-01-01", cardFirst: false, expectCardDrop: true, expectCheckingDrop: false }),
+    await s52Sides("Halyard", { checkingAnchor: "2026-01-25", cardAnchor: "2026-01-01", cardFirst: true, expectCardDrop: true, expectCheckingDrop: false }),
+    // Repro B: the card synced after the payment, Checking set before it
+    await s52Sides("Lantern", { checkingAnchor: "2026-01-01", cardAnchor: "2026-01-25", cardFirst: false, expectCardDrop: false, expectCheckingDrop: true }),
+    await s52Sides("Lumen", { checkingAnchor: "2026-01-01", cardAnchor: "2026-01-25", cardFirst: true, expectCardDrop: false, expectCheckingDrop: true }),
+  ];
+  // A scheduled "Payment for" matched by one statement: each side by its own anchor too
+  const s52Sched = await s45Opened(await Account.create({ name: "Mooring Card", type: "CREDIT_CARD", initialBalance: 900, creditLimit: 5000 }));
+  await s52SetAnchor(s52Checking.id, "2026-01-01");
+  await s52SetAnchor(s52Sched.id, "2026-01-25");
+  await Transaction.create({
+    title: "Payment for Mooring Card", amount: 251.37, date: "2026-01-20", type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, fromAccountId: s52Checking.id, toAccountId: s52Sched.id,
+  });
+  const s52SchedBefore = await s45CheckingBalance(await s45GetChecking(), s52Today);
+  const s52SchedImport = await s52Import(s52Checking.id, "2026-01-20,MOORING CARD PAYMENT,-251.37\n");
+  await s52Sched.reload();
+  assert(
+    s52SchedImport.preview.rows[0].status === "match" && Math.abs(parseFloat(s52Sched.initialBalance) - 900) < 0.005 &&
+      Math.abs((await s45CheckingBalance(await s45GetChecking(), s52Today)) - (s52SchedBefore - 251.37)) < 0.005,
+    `A scheduled payment matched from chequing: Checking pays it, the card synced after it stays at 900 (got card ${s52Sched.initialBalance})`
+  );
+  s52SideCards.push(s52Sched);
+  await Setting.destroy({ where: { key: { [Op.like]: "balance_anchor:%" } } });
+
   // Refunds: negative spending in the purchase's category, or "Refund" when there's no purchase
   const s52Card3 = await s45Opened(await Account.create({ name: "Vellum Card", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 2000 }));
   await api("POST", "/api/rules", { match: "lumen outfitters", category: "Shopping", priority: 5 });
@@ -7859,7 +7915,7 @@ async function runTestSuite() {
     s52RefundSave.status === 200 && Math.abs(parseFloat(s52RefundRow.amount) + 20) < 0.005 && Math.abs(parseFloat(s52Card3.initialBalance) - 35) < 0.005,
     `Saving a refund unchanged keeps it -20 and the card at 35 (got ${s52RefundRow.amount}, card ${s52Card3.initialBalance})`
   );
-  const s52Cards = [s52Card, s52Card2, s52Card3].map((c) => c.id);
+  const s52Cards = [s52Card, s52Card2, s52Card3, ...s52SideCards].map((c) => c.id);
   await Transaction.destroy({
     where: { [Op.or]: [{ toAccountId: { [Op.in]: s52Cards } }, { fromAccountId: { [Op.in]: s52Cards } }] },
     force: true,
