@@ -256,6 +256,25 @@ const schemas = {
     ]),
   }),
 
+  // PUT /settings/expected-pay: the bridge used while there's no pay history
+  setExpectedPay: z.object({
+    nextDate: z
+      .string()
+      .regex(dateRegex, "Next pay date must be in YYYY-MM-DD format")
+      .refine((v) => !isNaN(Date.parse(`${v}T12:00:00Z`)) && new Date(`${v}T12:00:00Z`).toISOString().startsWith(v), "Next pay date is not a real date"),
+    cadence: z.enum(["weekly", "bi-weekly", "monthly"]).optional().default("bi-weekly"),
+    amount: z.coerce
+      .number("Planning amount must be a number")
+      .finite()
+      .gt(0, "Planning amount must be greater than 0")
+      .max(1000000, "Planning amount is too large"),
+  }),
+
+  // PUT /settings/pay-title: which income name is the pay (null = detect automatically)
+  setPayTitle: z.object({
+    title: z.string().trim().min(1).max(200).nullable(),
+  }),
+
   setForecastBuffer: z.object({
     buffer: z.coerce.number().min(0, "Buffer must be non-negative"),
   }),

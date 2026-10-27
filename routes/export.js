@@ -61,6 +61,13 @@ const regenerateFeedToken = async () => {
 
 const money = (n) => (Math.round((parseFloat(n) || 0) * 100) / 100).toFixed(2);
 
+const INCOME_SOURCE_NOTES = {
+  recurring: "Income comes from recurring paycheques or income already entered",
+  estimated: "Paycheques estimated from pay history",
+  "expected-pay": "Paycheques from the Expected pay setting",
+  none: "No income in the forecast",
+};
+
 // FORECAST section: the forecast service's numbers, unchanged, so the Gem matches the app
 const buildForecastSummary = (f) => {
   const lastDay = f.days && f.days.length ? f.days[f.days.length - 1].date : f.today;
@@ -75,6 +82,9 @@ const buildForecastSummary = (f) => {
     lowestBalance: f.lowestPoint.balance,
     lowestDate: f.lowestPoint.date,
     nextPayday: f.nextPayday || "",
+    incomeSource: f.incomeSource || "none",
+    planningPay: f.planningAmount,
+    typicalPay: f.typicalAmount,
     estimatedIncomeIncluded: Boolean(est),
     estimatedIncomeNote: est
       ? `Estimated ${est.cadence} paycheque of $${money(est.amount)} on ${est.dates.join("; ")}`
@@ -379,6 +389,9 @@ const generateCSV = (d) => {
   push("FORECAST", "LOWEST_BALANCE", money(f.lowestBalance), `Lowest projected checking balance in the next ${FORECAST_DAYS} days`);
   push("FORECAST", "LOWEST_DATE", f.lowestDate, "Date of LOWEST_BALANCE");
   push("FORECAST", "NEXT_PAYDAY", f.nextPayday, f.nextPayday ? "" : `No income expected in the next ${FORECAST_DAYS} days`);
+  push("FORECAST", "INCOME_SOURCE", f.incomeSource, INCOME_SOURCE_NOTES[f.incomeSource]);
+  push("FORECAST", "PLANNING_PAY", f.planningPay === null ? "" : money(f.planningPay), "Paycheque Safe to Spend plans with (cautious when pay varies)");
+  push("FORECAST", "TYPICAL_PAY", f.typicalPay === null ? "" : money(f.typicalPay), "Typical (median) paycheque");
   push("FORECAST", "ESTIMATED_INCOME_INCLUDED", f.estimatedIncomeIncluded ? "YES" : "NO", f.estimatedIncomeNote);
 
   // 2. OVERVIEW
@@ -475,6 +488,9 @@ const generateMarkdown = (d) => {
 - **LOWEST_BALANCE:** $${money(d.forecast.lowestBalance)}
 - **LOWEST_DATE:** ${d.forecast.lowestDate}
 - **NEXT_PAYDAY:** ${d.forecast.nextPayday || "none in the next " + FORECAST_DAYS + " days"}
+- **INCOME_SOURCE:** ${d.forecast.incomeSource} (${INCOME_SOURCE_NOTES[d.forecast.incomeSource]})
+- **PLANNING_PAY:** ${d.forecast.planningPay === null ? "none" : "$" + money(d.forecast.planningPay)} (the paycheque Safe to Spend plans with)
+- **TYPICAL_PAY:** ${d.forecast.typicalPay === null ? "none" : "$" + money(d.forecast.typicalPay)}
 - **ESTIMATED_INCOME_INCLUDED:** ${d.forecast.estimatedIncomeIncluded ? "YES" : "NO"} (${d.forecast.estimatedIncomeNote})
 
 ---
@@ -629,6 +645,7 @@ You have continuous access to Maverick's live FinTrack financial data connected 
    - Use FORECAST SAFE_TO_SPEND. It is the same number the FinTrack app shows, and it already accounts for upcoming bills, expected income (see ESTIMATED_INCOME_INCLUDED) and the BUFFER until the UNTIL date.
    - NEVER compute your own affordability or "safe float" from balances, bills or income. The OVERVIEW "Projected End-of-Month Float" is context only.
    - Verdict: **Yes** if the amount is comfortably under SAFE_TO_SPEND, **Caution** if it uses most of it, **No** if it is over it. Quote SAFE_TO_SPEND, what would be left of it, and the UNTIL date.
+   - Pay varies; Safe to Spend already uses a cautious paycheque. That paycheque is PLANNING_PAY; never add income back or swap in TYPICAL_PAY.
    - For a purchase on a credit card, also mention the card's balance and limit from ACCOUNTS.
    - If LOWEST_BALANCE is low, mention LOWEST_DATE as the tight day.
 4. **History Questions ("How much did I spend on X?", "When did I last pay Y?"):**

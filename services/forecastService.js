@@ -16,6 +16,7 @@ const {
   isDebtInterestEnabled,
   projectDebtSchedule,
 } = require("./debtInterestService");
+const { loadPayContext, expectedPayDates } = require("./payForecastService");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
 const addCalendarDays = (baseDateStr, daysToAdd) => {
@@ -33,76 +34,80 @@ const dayDiff = (a, b) => {
   const [y2, m2, d2] = b.split("-").map(Number);
   return Math.round((Date.UTC(y1, m1 - 1, d1) - Date.UTC(y2, m2 - 1, d2)) / DAY_MS);
 };
-const median = (nums) => {
-  const s = [...nums].sort((x, y) => x - y);
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-};
+
+const hasIncomeNear = (daysMap, dateStr) =>
+  Object.values(daysMap).some(
+    (d) => Math.abs(dayDiff(d.date, dateStr)) <= 3 && d.items.some((it) => it.amount > 0)
+  );
 
 /**
- * Adds "Estimated paycheque" income items on projected paydays when the user's
- * income isn't a recurring series (e.g. paycheques logged one at a time).
- * Cadence comes from the gaps between recent paycheques; amount is their median.
- * A projected date is skipped when any real or recurring income is within 3 days.
+ * Adds "Estimated paycheque" income items on projected paydays when the pay isn't a recurring
+ * series (e.g. hourly paycheques logged one at a time). The pay series is found by name
+ * (payForecastService.detectPaySeries); other income never changes its cadence or amount.
+ * Each projected payday uses the cautious planningAmount. A projected date is skipped when any
+ * real or recurring income is within 3 days.
+ * Returns { estimate, recurring }: recurring is true when the pay series is already projected.
  */
-const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, dbTx }) => {
-  const setting = await Setting.findByPk("forecast_estimate_income", { transaction: dbTx });
-  if (setting && setting.value === "false") return null;
-
-  const recent = await Transaction.findAll({
-    where: {
-      type: "INCOME",
-      date: { [Op.lte]: endDateStr },
-      [Op.or]: [{ toAccountId: checkingId }, { toAccountId: null }],
-    },
-    order: [["date", "DESC"]],
-    limit: 6,
-    transaction: dbTx,
-  });
-  if (recent.length < 2) return null;
+const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, pay, dbTx }) => {
+  if (!pay) return { estimate: null, recurring: false };
 
   // A recurring series is already projected by step 3, also when its newest paycheque was a One-time edit
-  if (recent[0].recurrence && recent[0].recurrence !== "none") return null;
+  const newest = pay.newestRow;
+  if (newest.recurrence && newest.recurrence !== "none") return { estimate: null, recurring: true };
   if (
-    recent[0].recurringGroupId &&
+    newest.recurringGroupId &&
     (await Transaction.count({
       where: {
-        recurringGroupId: recent[0].recurringGroupId,
+        recurringGroupId: newest.recurringGroupId,
         recurrence: { [Op.in]: ACTIVE_RECURRENCES },
       },
       transaction: dbTx,
     })) > 0
   ) {
-    return null;
+    return { estimate: null, recurring: true };
   }
 
-  const gaps = [];
-  for (let i = 0; i < recent.length - 1; i++) gaps.push(dayDiff(recent[i].date, recent[i + 1].date));
-  const gap = median(gaps);
-  let cadence = null;
-  if (gap >= 6 && gap <= 8) cadence = "weekly";
-  else if (gap >= 12 && gap <= 17) cadence = "bi-weekly";
-  else if (gap >= 27 && gap <= 35) cadence = "monthly";
-  if (!cadence) return null; // irregular income: don't guess
-
-  const amount = Math.round(median(recent.map((t) => parseFloat(t.amount) || 0)) * 100) / 100;
-  if (amount <= 0) return null;
-
-  const hasIncomeNear = (dateStr) =>
-    Object.values(daysMap).some(
-      (d) => Math.abs(dayDiff(d.date, dateStr)) <= 3 && d.items.some((it) => it.amount > 0)
-    );
+  const setting = await Setting.findByPk("forecast_estimate_income", { transaction: dbTx });
+  if (setting && setting.value === "false") return { estimate: null, recurring: false };
+  if (pay.planningAmount <= 0) return { estimate: null, recurring: false };
 
   const dates = [];
   for (let step = 1; step <= 60; step++) {
-    const next = getNextOccurrenceDate(recent[0].date, cadence, step);
+    const next = getNextOccurrenceDate(pay.lastDate, pay.cadence, step);
     if (!next || next > endDateStr) break;
-    if (next <= todayStr || !daysMap[next] || hasIncomeNear(next)) continue;
-    daysMap[next].items.push({ title: "Estimated paycheque", amount, type: "income", estimated: true });
+    if (next <= todayStr || !daysMap[next] || hasIncomeNear(daysMap, next)) continue;
+    daysMap[next].items.push({ title: "Estimated paycheque", amount: pay.planningAmount, type: "income", estimated: true });
     dates.push(next);
   }
 
-  return dates.length ? { amount, cadence, basedOn: recent.length, dates } : null;
+  const estimate = dates.length
+    ? {
+        // amount is the planning amount, the one the forecast uses
+        amount: pay.planningAmount,
+        planningAmount: pay.planningAmount,
+        typicalAmount: pay.typicalAmount,
+        range: pay.range,
+        cadence: pay.cadence,
+        title: pay.label,
+        basedOn: pay.basedOn,
+        dates,
+      }
+    : null;
+  return { estimate, recurring: false };
+};
+
+/**
+ * Expected pay (Setting expected_pay): the user's own next pay date, cadence and planning amount,
+ * used only while there's no pay series. Adds "Expected pay" items; creates no transactions.
+ */
+const addExpectedPay = ({ daysMap, todayStr, endDateStr, expectedPay }) => {
+  const dates = [];
+  for (const date of expectedPayDates(expectedPay, todayStr, endDateStr)) {
+    if (!daysMap[date] || hasIncomeNear(daysMap, date)) continue;
+    daysMap[date].items.push({ title: "Expected pay", amount: expectedPay.amount, type: "income", estimated: true });
+    dates.push(date);
+  }
+  return dates;
 };
 
 /**
@@ -117,7 +122,10 @@ const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, d
  *   nextPayday: string|null,
  *   safeToSpend: number,
  *   lowestPoint: { date: string, balance: number },
- *   days: Array<{ date: string, balance: number, items: Array<{ title: string, amount: number }> }>
+ *   days: Array<{ date: string, balance: number, items: Array<{ title: string, amount: number }> }>,
+ *   incomeSource: "recurring"|"estimated"|"expected-pay"|"none",
+ *   planningAmount: number|null,
+ *   typicalAmount: number|null
  * }>}
  */
 const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options = {}) => {
@@ -331,8 +339,19 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     }
   }
 
-  // 3b. Estimated paycheques: fill future paydays when income isn't set up as a recurring series
-  const estimatedIncome = await estimatePaycheques({ daysMap, todayStr, endDateStr, checkingId, dbTx });
+  // 3b. Pay: estimated paycheques for a pay series that isn't recurring, or Expected pay while
+  //     there's no pay series at all
+  const payContext = await loadPayContext({ todayStr, checkingId, dbTx });
+  const { estimate: estimatedIncome, recurring: payIsRecurring } = await estimatePaycheques({
+    daysMap,
+    todayStr,
+    endDateStr,
+    pay: payContext.pay,
+    dbTx,
+  });
+  const expectedPayUsed = !payContext.pay && payContext.expectedPay
+    ? addExpectedPay({ daysMap, todayStr, endDateStr, expectedPay: payContext.expectedPay })
+    : [];
 
   // 4. Debts: interest on each due date, then auto-pay, projected exactly as the daily sweep runs them
   //    (debtInterestService.projectDebtSchedule). Only auto-pay leaves Checking; interest changes how
@@ -464,6 +483,30 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     Math.round((minBalanceBeforePayday - buffer) * 100) / 100
   );
 
+  // Where the forecast's income comes from, and the paycheque it plans with
+  const paydayIncome = nextPayday
+    ? Math.round(
+        days.find((d) => d.date === nextPayday).items.reduce((sum, it) => sum + (it.amount > 0 ? it.amount : 0), 0) * 100
+      ) / 100
+    : null;
+  let incomeSource = "none";
+  let planningAmount = null;
+  let typicalAmount = null;
+  let payRange = null;
+  if (estimatedIncome) {
+    incomeSource = "estimated";
+    planningAmount = estimatedIncome.planningAmount;
+    typicalAmount = estimatedIncome.typicalAmount;
+    payRange = estimatedIncome.range;
+  } else if (expectedPayUsed.length) {
+    incomeSource = "expected-pay";
+    planningAmount = typicalAmount = payContext.expectedPay.amount;
+  } else if (days.some((d) => d.items.some((it) => it.amount > 0 && !it.simulated))) {
+    // Recurring paycheques or income already entered for a future date
+    incomeSource = "recurring";
+    planningAmount = typicalAmount = paydayIncome;
+  }
+
   return {
     today: todayStr,
     startBalance: Math.round(startBalance * 100) / 100,
@@ -473,6 +516,21 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     lowestPoint: lowestPoint || { date: todayStr, balance: Math.round(startBalance * 100) / 100 },
     days,
     estimatedIncome,
+    incomeSource,
+    planningAmount,
+    typicalAmount,
+    payRange,
+    paySeries: payContext.pay
+      ? {
+          title: payContext.pay.title,
+          label: payContext.pay.label,
+          cadence: payContext.pay.cadence,
+          basedOn: payContext.pay.basedOn,
+          override: payContext.pay.override,
+          recurring: payIsRecurring,
+        }
+      : null,
+    expectedPayActive: incomeSource === "expected-pay",
     debts: debtProjections,
   };
 };
