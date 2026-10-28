@@ -11,6 +11,7 @@ const { normalizePayeeTitle } = require("../utils/payeeNormalizer");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { usesArchivedAccount } = require("../services/accountArchiveService");
 const { feedLimiter } = require("../middleware/rateLimit");
+const { tagsOf } = require("../utils/transactionTags");
 
 // Helper: Timing-safe token comparison
 const constantTimeCompare = (a, b) => {
@@ -59,6 +60,9 @@ const regenerateFeedToken = async () => {
   return record.value;
 };
 
+// A recent row's tags ("work; trip") and notes on one line, for the feed (F11)
+const feedTags = (t) => tagsOf(t).join("; ");
+const feedNotes = (t) => String(t.notes || "").replace(/\s*\n\s*/g, " ").trim();
 const money = (n) => (Math.round((parseFloat(n) || 0) * 100) / 100).toFixed(2);
 
 const INCOME_SOURCE_NOTES = {
@@ -449,9 +453,9 @@ const generateCSV = (d) => {
 
   // 5. RECENT TRANSACTIONS (paid, dated today or earlier)
   rows.push([]);
-  push("SECTION", "DATE", "TYPE", "CATEGORY", "TITLE", "AMOUNT", "ACCOUNT");
+  push("SECTION", "DATE", "TYPE", "CATEGORY", "TITLE", "AMOUNT", "ACCOUNT", "TAGS", "NOTES");
   for (const t of d.recentTransactions) {
-    push("RECENT_TRANSACTIONS", t.date, t.type, t.category, t.title, money(t.amount), d.accountLabel(t));
+    push("RECENT_TRANSACTIONS", t.date, t.type, t.category, t.title, money(t.amount), d.accountLabel(t), feedTags(t), feedNotes(t));
   }
 
   // 6. PAYEES (last 12 months, biggest first)
@@ -597,12 +601,12 @@ ${
 ---
 
 ## 4. Recent Transactions Ledger (Last ${RECENT_LIMIT} paid, today or earlier)
-| Date | Type | Category | Description | Amount | Account |
-| :--- | :--- | :--- | :--- | :--- | :--- |
+| Date | Type | Category | Description | Amount | Account | Tags | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 ${d.recentTransactions
   .map(
     (t) =>
-      `| ${t.date} | ${t.type} | ${t.category} | ${mdCell(t.title)} | $${money(t.amount)} | ${mdCell(d.accountLabel(t))} |`
+      `| ${t.date} | ${t.type} | ${t.category} | ${mdCell(t.title)} | $${money(t.amount)} | ${mdCell(d.accountLabel(t))} | ${mdCell(feedTags(t))} | ${mdCell(feedNotes(t))} |`
   )
   .join("\n")}
 
@@ -649,7 +653,7 @@ You have continuous access to Maverick's live FinTrack financial data connected 
    - For a purchase on a credit card, also mention the card's balance and limit from ACCOUNTS.
    - If LOWEST_BALANCE is low, mention LOWEST_DATE as the tight day.
 4. **History Questions ("How much did I spend on X?", "When did I last pay Y?"):**
-   - Use PAYEES (per payee: last paid date and amount, times and totals for the last 12 months and year to date) and MONTHLY_CATEGORIES (spent and budget per category for each of the last 12 months). RECENT_TRANSACTIONS has the last ${RECENT_LIMIT} paid transactions with their ACCOUNT.
+   - Use PAYEES (per payee: last paid date and amount, times and totals for the last 12 months and year to date) and MONTHLY_CATEGORIES (spent and budget per category for each of the last 12 months). RECENT_TRANSACTIONS has the last ${RECENT_LIMIT} paid transactions with their ACCOUNT, and Maverick's TAGS (separated by "; ") and NOTES when set.
    - BUDGET in MONTHLY_CATEGORIES is today's monthly limit, repeated for past months; FinTrack keeps no budget history, so don't describe it as what the budget was back then.
    - If the answer is not in these sections, say so plainly. Do not estimate or guess history.
 5. **Adding, Recording or Logging ("add", "record", "log", "I spent ..."):**

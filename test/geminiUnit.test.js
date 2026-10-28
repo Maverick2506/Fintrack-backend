@@ -517,6 +517,34 @@ async function runGeminiUnitTests() {
     assert(draft({ amount: 5, title: "  $ " }).error);
   });
 
+  // --- Suite H: Month close commentary (F6): Gemini's lines may only quote the month's numbers ---
+  console.log("\n--- Suite H: Month close commentary ---");
+  const { sanitizeCommentary, buildCommentaryPrompt } = require("../services/monthCloseService");
+  const hFacts = { spending: 1234.5, spendingChange: 80, biggestIncreases: [{ category: "Dining", change: 80, percent: 160 }], netWorthChange: -42.1 };
+
+  test("At most 3 lines; bullets, numbering and markdown are stripped", () => {
+    const lines = sanitizeCommentary(["- **Dining** up $80.00", "2) Spent $1,234.50", "• Net worth down $42.10", "Fourth line"], hFacts);
+    assert.deepStrictEqual(lines, ["Dining up $80.00", "Spent $1,234.50", "Net worth down $42.10"]);
+  });
+
+  test("A line quoting a $ amount or % that isn't in the numbers is dropped", () => {
+    const lines = sanitizeCommentary(["Dining rose 160%", "You saved $500 this month", "Dining is up 75%", "Spending was about $1,235"], hFacts);
+    assert.deepStrictEqual(lines, ["Dining rose 160%", "Spending was about $1,235"]);
+  });
+
+  test("Blank or non-text answers give no lines; a long line is cut at a word", () => {
+    assert.deepStrictEqual(sanitizeCommentary(null, hFacts), []);
+    assert.deepStrictEqual(sanitizeCommentary(["", "   "], hFacts), []);
+    const [long] = sanitizeCommentary(["word ".repeat(60)], hFacts);
+    assert(long.length <= 160 && long.endsWith("…"), long);
+  });
+
+  test("The prompt carries the numbers and the rules, and nothing else to compute from", () => {
+    const prompt = buildCommentaryPrompt(hFacts);
+    assert(prompt.includes(JSON.stringify(hFacts)));
+    assert(/at most 3 short lines/i.test(prompt) && /Use only the numbers above/.test(prompt));
+  });
+
   console.log("\n==================================================");
   console.log(`   UNIT TEST RUN: ${passed} passed, ${failed} failed`);
   console.log("==================================================");

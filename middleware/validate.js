@@ -102,6 +102,21 @@ const importMapping = z
     { message: "Map an amount column, or both a debit and a credit column", path: ["amount"] }
   );
 
+// Notes and tags on a transaction (F11): blank notes and an empty tag list are stored as null
+const { MAX_TAGS, MAX_TAG_LENGTH, MAX_NOTES_LENGTH, normalizeTags, normalizeNotes } = require("../utils/transactionTags");
+const notesField = z
+  .string()
+  .max(MAX_NOTES_LENGTH, `Notes can be up to ${MAX_NOTES_LENGTH} characters`)
+  .nullable()
+  .optional()
+  .transform((v) => (v === undefined ? undefined : normalizeNotes(v)));
+const tagsField = z
+  .array(z.string().trim().max(MAX_TAG_LENGTH, `A tag can be up to ${MAX_TAG_LENGTH} characters`))
+  .nullable()
+  .optional()
+  .transform((v) => (v === undefined ? undefined : normalizeTags(v)))
+  .refine((v) => !v || v.length <= MAX_TAGS, `Up to ${MAX_TAGS} tags`);
+
 // Card payments: each bill on the payment that a savings goal saves for, and whether its fund pays
 const fundBillsSchema = z
   .array(z.object({ billId: z.string().uuid(), useFund: z.boolean() }))
@@ -130,6 +145,8 @@ const schemas = {
     recurringGroupId: z.string().uuid().nullable().optional(),
     applyToBalance: z.boolean().optional(),
     clientRef: z.string().uuid().nullable().optional(),
+    notes: notesField,
+    tags: tagsField,
   }),
 
   updateExpense: z.object({
@@ -151,6 +168,8 @@ const schemas = {
     taxApplied: z.boolean().optional(),
     recurringGroupId: z.string().uuid().nullable().optional(),
     clientRef: z.string().uuid().nullable().optional(),
+    notes: notesField,
+    tags: tagsField,
     // "Pay from <fund>" when marking a bill paid: the savings goal saving for this bill
     payFromGoalId: z.string().uuid().nullable().optional(),
     // "Use $X from <fund>" when marking a card payment paid: the bills on it that funds save for
@@ -166,6 +185,8 @@ const schemas = {
       .optional()
       .default("none"),
     clientRef: z.string().uuid().nullable().optional(),
+    notes: notesField,
+    tags: tagsField,
   }),
 
   paymentAmount: z.object({
@@ -415,6 +436,14 @@ const schemas = {
   // PUT /expenses/:id?dryRun=1 previews the change (e.g. ending a series) and saves nothing
   dryRunQuery: z.object({
     dryRun: z.enum(["0", "1", "true", "false"]).optional(),
+  }),
+
+  // GET /reports/month-close?month=YYYY-MM (defaults to the current Toronto month)
+  monthCloseQuery: z.object({
+    month: z
+      .string()
+      .regex(/^\d{4}-(0[1-9]|1[0-2])$/, "Month must be YYYY-MM")
+      .optional(),
   }),
 
   monthQuery: z.object({

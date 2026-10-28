@@ -21,6 +21,7 @@ const {
   reverseCardFundPayments,
 } = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
+const { normalizeTag, hasTag, tagsOf } = require("../utils/transactionTags");
 const {
   snapshotArchivedBalances,
   assertArchivedBalancesUnchanged,
@@ -198,11 +199,12 @@ router.get(
   })
 );
 
-// Full ledger: Transactions of ALL types combined natively
+// Full ledger: Transactions of ALL types combined natively. ?tag=work keeps only rows with that tag.
 router.get(
   "/expenses/all",
   asyncHandler(async (req, res) => {
-    const all = await Transaction.findAll({
+    const tag = typeof req.query.tag === "string" ? normalizeTag(req.query.tag) : "";
+    const found = await Transaction.findAll({
       order: [
         ["date", "DESC"],
         ["createdAt", "DESC"],
@@ -212,6 +214,9 @@ router.get(
         { model: Account, as: "toAccount" },
       ],
     });
+
+    // JSON columns can't be filtered the same way on SQLite and Postgres, so the tag filter runs here
+    const all = tag ? found.filter((t) => hasTag(t, tag)) : found;
 
     const rows = all.map((t) => ({
       id: t.id,
@@ -234,6 +239,8 @@ router.get(
       taxApplied: Boolean(t.taxApplied),
       // Imported from a bank CSV and not yet confirmed in the "Review new" inbox
       needsReview: Boolean(t.needsReview),
+      notes: t.notes || null,
+      tags: tagsOf(t),
       creditCardId:
         t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
           ? t.fromAccount.id
@@ -394,6 +401,8 @@ router.post(
           fromAccountId: fromAccount.id,
           toAccountId: resolvedToAccountId,
           clientRef: req.body.clientRef || null,
+          notes: req.body.notes ?? null,
+          tags: req.body.tags ?? null,
         },
         { transaction: dbTx }
       );
@@ -673,6 +682,9 @@ router.put(
           recurringGroupId: nextRecurringGroupId,
           fromAccountId,
           toAccountId: nextToAccountId,
+          // Left out of the body: unchanged. null clears them.
+          ...(req.body.notes !== undefined ? { notes: req.body.notes } : {}),
+          ...(req.body.tags !== undefined ? { tags: req.body.tags } : {}),
         },
         { transaction: dbTx }
       );

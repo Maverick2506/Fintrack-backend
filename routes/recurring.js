@@ -385,6 +385,8 @@ const createRecurringExpenses = async (dbTx = null, options = {}) => {
             recurringGroupId: seriesId,
             // clientRef is unique (Quick Add idempotency); copying it made every insert fail as a "duplicate" (N1)
             clientRef: null,
+            // Tags carry on to the next occurrence; a note is about one occurrence only
+            notes: null,
             createdAt: new Date(),
             updatedAt: new Date(),
           };
