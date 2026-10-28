@@ -150,6 +150,7 @@ async function runTestSuite() {
     { prefix: "/api/subscriptions", r: require("../routes/subscriptions") },
     { prefix: "/api/rules", r: require("../routes/rules") },
     { prefix: "/api/import", r: require("../routes/import") },
+    { prefix: "/api/alerts", r: require("../routes/alerts") },
   ];
   const publicAllowlist = [
     /^\/api\/health/,
@@ -8044,6 +8045,348 @@ async function runTestSuite() {
   await Setting.destroy({ where: { key: { [Op.like]: "import_mapping:%" } } });
   await Transaction.destroy({ where: {}, force: true });
   await Account.destroy({ where: { id: { [Op.in]: [s45Card.id, s45Goal.id, s48Card.id] } } });
+
+
+  // ===================================================================================================
+  // Batch 8: card statement cycles, sinking funds, price-change alerts, subscription suggestions
+  // ===================================================================================================
+  const { getStatementDate: s54Stmt, getStatementDueDate: s54Due, getCardStatement: s54CardStatement } =
+    require("../services/statementService");
+  const { getForecast: s54Forecast } = require("../services/forecastService");
+  const s54ItemsOn = (forecast, date) => (forecast.days.find((d) => d.date === date) || { items: [] }).items;
+
+  console.log("\n--- Suite 54: Card statement cycles (statement balance, new charges, forecast) ---");
+  const s54Dates = [
+    [s54Stmt("2026-03-01", 31), "2026-02-28", "statement day 31 closes Feb 28 in February"],
+    [s54Stmt("2024-03-01", 31), "2024-02-29", "and Feb 29 in a leap year"],
+    [s54Stmt("2026-03-31", 31), "2026-03-31", "a statement closing today is the latest statement"],
+    [s54Stmt("2026-03-30", 31), "2026-02-28", "the day before a 31st closing, the last statement is February's"],
+    [s54Stmt("2026-05-01", 31), "2026-04-30", "statement day 31 closes Apr 30"],
+    [s54Stmt("2026-01-10", 15), "2025-12-15", "January before the 15th goes back to December"],
+    [s54Due("2026-10-15", 10), "2026-11-10", "due day before the statement day: due next month"],
+    [s54Due("2026-10-05", 28), "2026-10-28", "due day after the statement day: due the same month"],
+    [s54Due("2026-01-31", 31), "2026-02-28", "a 31st due day after a Jan 31 statement is Feb 28"],
+    [s54Due("2026-02-28", 31), "2026-03-31", "and after a Feb 28 statement it is Mar 31"],
+  ];
+  for (const [got, want, label] of s54Dates) assert(got === want, `Statement dates: ${label} (got ${got})`);
+
+  const s54Bad = await Promise.all([
+    s33("POST", "/api/credit-cards", { name: "Suite54 Bad", creditLimit: 1000, statementDay: 0 }),
+    s33("POST", "/api/credit-cards", { name: "Suite54 Bad", creditLimit: 1000, statementDay: 32 }),
+    s33("POST", "/api/credit-cards", { name: "Suite54 Bad", creditLimit: 1000, statementDay: 2.5 }),
+  ]);
+  assert(s54Bad.every((r) => r.status === 400), `statementDay must be a whole day 1-31 (got ${s54Bad.map((r) => r.status)})`);
+  const s54Created = await s33("POST", "/api/credit-cards", {
+    name: "Suite54 Visa", creditLimit: 5000, currentBalance: 0, dueDate: "2026-01-25", statementDay: 31,
+  });
+  const s54Card = await Account.findByPk(s54Created.body.id);
+  const s54List = (await s33("GET", "/api/credit-cards")).body.find((c) => c.id === s54Card.id);
+  const s54Expected = await s54CardStatement(s54Card, getTorontoToday());
+  assert(
+    s54Created.status === 201 && s54Card.statementDay === 31 && s54List.statement &&
+      s54List.statement.statementDate === s54Expected.statementDate && s54List.statement.dueDate === s54Expected.dueDate,
+    `A card saves its statement day and GET /credit-cards returns its statement (got ${JSON.stringify(s54List.statement)})`
+  );
+
+  // A fixed "today" of Mar 5, 2026: the last statement closed Feb 28 (statement day 31), due Mar 25
+  const s54Today = "2026-03-05";
+  await s54Card.update({ initialBalance: 700 });
+  const s54Row = (title, amount, date, extra = {}) =>
+    Transaction.create({
+      title, amount, date, type: "EXPENSE", category: "Shopping", isCleared: true, balanceApplied: true,
+      fromAccountId: s54Card.id, ...extra,
+    });
+  await s54Row("Suite54 Feb 27", 100, "2026-02-27");
+  await s54Row("Suite54 Feb 28", 50, "2026-02-28");
+  await s54Row("Suite54 Mar 1", 120, "2026-03-01");
+  await s54Row("Suite54 refund", -20, "2026-03-03");
+  await s54Row("Suite54 interest up", 5, "2026-03-04", { type: "TRANSFER", category: "Adjustment" });
+  await s54Row("Suite54 pending", 999, "2026-03-04", { isCleared: false, balanceApplied: false });
+  await s54Row("Suite54 tomorrow", 300, "2026-03-06");
+  await (await s54Row("Suite54 deleted", 500, "2026-03-02")).destroy();
+  await Transaction.create({
+    title: "Suite54 payment", amount: 200, date: "2026-03-02", type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: true, balanceApplied: true, toAccountId: s54Card.id,
+  });
+  const s54Split = await s54CardStatement(s54Card, s54Today);
+  assert(
+    s54Split.statementDate === "2026-02-28" && s54Split.dueDate === "2026-03-25" && s54Split.newCharges === 105 &&
+      s54Split.statementBalance === 595 && s54Split.nextStatementDate === "2026-03-31",
+    `Balance $700 splits at Feb 28: new charges $105 (Mar 1 $120, refund -$20, adjustment $5; the Feb 28 charge is ` +
+      `on the statement; pending, future, deleted rows and payments are not charges), statement balance $595 due Mar 25 ` +
+      `(got ${JSON.stringify(s54Split)})`
+  );
+  const s54OnClose = await s54CardStatement(s54Card, "2026-03-31");
+  assert(
+    s54OnClose.statementDate === "2026-03-31" && s54OnClose.newCharges === 0 && s54OnClose.statementBalance === 700,
+    `On the closing day (Mar 31) everything is on the new statement (got ${JSON.stringify(s54OnClose)})`
+  );
+  await s54Card.update({ initialBalance: 60 });
+  const s54Paid = await s54CardStatement(s54Card, s54Today);
+  assert(
+    s54Paid.statementBalance === 0,
+    `A statement paid off (balance below the new charges) is $0, never negative (got ${s54Paid.statementBalance})`
+  );
+
+  // Forecast: a $1,000 scheduled payment on Mar 20 (a monthly series) becomes the $595 statement balance;
+  // the Apr 20 payment after the due date stays as scheduled
+  await s54Card.update({ initialBalance: 700 });
+  const s54Checking = await s45GetChecking();
+  const s54Series = await Transaction.create({
+    title: "Suite54 Visa autopay", amount: 1000, date: "2026-03-20", type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, recurrence: "monthly", fromAccountId: s54Checking.id, toAccountId: s54Card.id,
+  });
+  const s54F1 = await s54Forecast(60, null, [], { todayStr: s54Today });
+  const s54Mar20 = s54ItemsOn(s54F1, "2026-03-20");
+  const s54Apr20 = s54ItemsOn(s54F1, "2026-04-20");
+  assert(
+    s54Mar20.length === 1 && s54Mar20[0].amount === -595 && s54Mar20[0].statement === true &&
+      s54Apr20.some((it) => it.title === "Suite54 Visa autopay" && it.amount === -1000) &&
+      s54F1.cardPayments.some((c) => c.id === s54Card.id && c.statementBalance === 595 && c.paymentDate === "2026-03-20"),
+    `The forecast pays the statement balance ($595) on the scheduled date instead of $1,000; later payments stay ` +
+      `(got Mar 20 ${JSON.stringify(s54Mar20)}, Apr 20 ${JSON.stringify(s54Apr20)})`
+  );
+  await s54Series.update({ date: "2026-04-02" });
+  const s54F2 = await s54Forecast(60, null, [], { todayStr: s54Today });
+  assert(
+    s54ItemsOn(s54F2, "2026-03-25").some((it) => it.amount === -595 && it.statement) &&
+      s54ItemsOn(s54F2, "2026-04-02").some((it) => it.amount === -1000),
+    "With no payment scheduled before the due date, the statement balance is paid on the due date (Mar 25)"
+  );
+  await s54Card.update({ statementDay: null });
+  const s54F3 = await s54Forecast(60, null, [], { todayStr: s54Today });
+  assert(
+    !s54F3.days.some((d) => d.items.some((it) => it.statement)) && s54ItemsOn(s54F3, "2026-04-02").some((it) => it.amount === -1000) &&
+      !s54F3.cardPayments.some((c) => c.id === s54Card.id),
+    "Without a statement day the forecast is unchanged: no statement payment, scheduled payments as entered"
+  );
+  const s54Clear = await s33("PUT", `/api/credit-cards/${s54Card.id}`, { statementDay: 15 });
+  const s54Clear2 = await s33("PUT", `/api/credit-cards/${s54Card.id}`, { statementDay: "" });
+  assert(
+    s54Clear.status === 200 && s54Clear.body.statementDay === 15 && s54Clear.body.statement?.statementDay === 15 &&
+      s54Clear2.status === 200 && s54Clear2.body.statementDay === null && s54Clear2.body.statement === null,
+    "PUT /credit-cards sets and clears the statement day"
+  );
+  await Transaction.destroy({ where: { [Op.or]: [{ fromAccountId: s54Card.id }, { toAccountId: s54Card.id }] }, force: true });
+  await Account.destroy({ where: { id: s54Card.id } });
+
+  console.log("\n--- Suite 55: Sinking funds (linked bill, monthly amount, Safe to Spend, monthly transfer) ---");
+  const { computeSinkingFund: s55Compute } = require("../services/sinkingFundService");
+  const s55A = s55Compute({ current: 100, target: 1200, dueDate: "2027-03-01", todayStr: "2026-10-28" });
+  const s55B = s55Compute({ current: 100, target: 1200, dueDate: "2027-03-01", todayStr: "2026-10-28", contributedThisMonth: true });
+  const s55C = s55Compute({ current: 0, target: 1000, dueDate: "2027-01-15", todayStr: "2026-10-28" });
+  const s55D = s55Compute({ current: 0, target: 100, dueDate: "2026-10-01", todayStr: "2026-10-28" });
+  const s55E = s55Compute({ current: 500, target: 500, dueDate: "2027-01-01", todayStr: "2026-10-28" });
+  const s55F = s55Compute({ current: 0, target: 310, dueDate: "2026-12-31", todayStr: "2026-10-31" });
+  assert(
+    s55A.monthly === 220 && s55A.dates.join() === "2026-10-28,2026-11-28,2026-12-28,2027-01-28,2027-02-28",
+    `$1,100 left by Mar 1 from Oct 28: 5 monthly contributions of $220 starting today (got ${s55A.monthly}, ${s55A.dates})`
+  );
+  assert(
+    s55B.monthly === 220 && s55B.dates[0] === "2026-11-01" && s55B.dates.length === 5,
+    `Already contributed this month: contributions start Nov 1 (Nov-Mar, 5 of $220) (got ${s55B.dates})`
+  );
+  assert(s55C.monthly === 333.34 && s55C.dates.length === 3, `$1,000 over 3 months rounds up to $333.34 (got ${s55C.monthly})`);
+  assert(s55D.monthly === 100 && s55D.overdue && s55D.dates.join() === "2026-10-28", "A due date that passed needs the rest today");
+  assert(s55E.ready && s55E.monthly === 0, "A goal with enough saved needs nothing more");
+  assert(
+    s55F.dates.join() === "2026-10-31,2026-11-30,2026-12-31" && s55F.monthly === 103.34,
+    `Month-end: from Oct 31, contributions fall on Nov 30 and Dec 31 (got ${s55F.dates})`
+  );
+
+  const s55Today = getTorontoToday();
+  const s55Due = getTorontoOffsetDate(100);
+  const s55Bill = await Transaction.create({
+    title: "Suite55 Car Insurance", amount: 1200, date: s55Due, type: "EXPENSE", category: "Insurance",
+    isCleared: false, recurrence: "yearly",
+  });
+  const s55Pay = await Transaction.create({
+    title: "Suite55 Pay", amount: 2000, date: getTorontoOffsetDate(-20), type: "INCOME", category: "Income",
+    isCleared: true, recurrence: "monthly", toAccountId: s54Checking.id,
+  });
+  const s55BadLinks = await Promise.all([
+    s33("POST", "/api/savings-goals", { name: "Suite55 Bad", linkedRecurringGroupId: s55Pay.recurringGroupId }),
+    s33("POST", "/api/savings-goals", { name: "Suite55 Bad", linkedRecurringGroupId: "00000000-0000-4000-8000-000000000000" }),
+    s33("POST", "/api/savings-goals", { name: "Suite55 Bad", linkedRecurringGroupId: "nope" }),
+  ]);
+  assert(
+    s55BadLinks.every((r) => r.status === 400) && (await Account.count({ where: { name: "Suite55 Bad" } })) === 0,
+    `Only an expense series can be linked (income series, unknown and malformed ids refused) (got ${s55BadLinks.map((r) => r.status)})`
+  );
+  const s55Created = await s33("POST", "/api/savings-goals", { name: "Suite55 Fund", linkedRecurringGroupId: s55Bill.recurringGroupId });
+  const s55Goal = await Account.findByPk(s55Created.body.id);
+  const s55Expect = s55Compute({ current: 0, target: 1200, dueDate: s55Due, todayStr: s55Today });
+  const s55Get = async () => (await s33("GET", "/api/savings-goals")).body.find((g) => g.id === s55Goal.id);
+  const s55G1 = await s55Get();
+  assert(
+    s55Created.status === 201 && s55G1.linkedRecurringGroupId === s55Bill.recurringGroupId &&
+      s55G1.sinkingFund?.linkedBill?.title === "Suite55 Car Insurance" && s55G1.sinkingFund.linkedBill.nextDate === s55Due &&
+      s55G1.sinkingFund.targetAmount === 1200 && s55G1.sinkingFund.dueDate === s55Due &&
+      s55G1.sinkingFund.monthly === s55Expect.monthly && s55G1.sinkingFund.firstDate === s55Today &&
+      s55G1.sinkingFund.monthlyTransfer === null,
+    `A goal linked to a $1,200 bill due in 100 days saves $${s55Expect.monthly}/month from today, using the bill's ` +
+      `amount and date (got ${JSON.stringify(s55G1.sinkingFund)})`
+  );
+  const s55Own = await s33("PUT", `/api/savings-goals/${s55Goal.id}`, { target_amount: 900 });
+  assert(
+    s55Own.status === 200 && s55Own.body.sinkingFund.targetAmount === 900,
+    "The goal's own target amount wins over the bill's"
+  );
+  await s33("PUT", `/api/savings-goals/${s55Goal.id}`, { target_amount: 1200 });
+
+  // Safe to Spend: the monthly amount is planned today (Checking raised so the buffer never hides it)
+  await s54Checking.update({ initialBalance: parseFloat(s54Checking.initialBalance) + 100000 });
+  const s55WithFund = await s54Forecast(60);
+  await s33("PUT", `/api/savings-goals/${s55Goal.id}`, { linkedRecurringGroupId: null });
+  const s55Unlinked = await s54Forecast(60);
+  await s33("PUT", `/api/savings-goals/${s55Goal.id}`, { linkedRecurringGroupId: s55Bill.recurringGroupId });
+  const s55Planned = s54ItemsOn(s55WithFund, s55Today).find((it) => it.planned);
+  assert(
+    s55Planned && s55Planned.title === "Set aside for Suite55 Fund" && s55Planned.amount === -s55Expect.monthly &&
+      Math.abs(s55Unlinked.safeToSpend - s55WithFund.safeToSpend - s55Expect.monthly * s55WithFund.sinkingFunds[0].plannedDates.filter((d) => !s55WithFund.nextPayday || d < s55WithFund.nextPayday).length) < 0.005 &&
+      !s55Unlinked.days.some((d) => d.items.some((it) => it.planned)),
+    `Safe to Spend sets the monthly amount aside on each contribution date before payday ` +
+      `(got ${s55WithFund.safeToSpend} vs ${s55Unlinked.safeToSpend} unlinked, planned ${JSON.stringify(s55Planned)})`
+  );
+
+  const s55NoLink = await s33("POST", "/api/savings-goals", { name: "Suite55 Plain", target_amount: 500, target_date: s55Due });
+  const s55NoLinkSetup = await s33("POST", `/api/savings-goals/${s55NoLink.body.id}/monthly-transfer`, {});
+  const s55Setup = await s33("POST", `/api/savings-goals/${s55Goal.id}/monthly-transfer`, {});
+  const s55Again = await s33("POST", `/api/savings-goals/${s55Goal.id}/monthly-transfer`, {});
+  const s55Transfer = await Transaction.findByPk(s55Setup.body.id);
+  const s55G2 = await s55Get();
+  const s55WithTransfer = await s54Forecast(60);
+  const s55TodayItems = s54ItemsOn(s55WithTransfer, s55Today);
+  assert(
+    s55NoLinkSetup.status === 409 && s55Setup.status === 201 && s55Again.status === 409 &&
+      s55Transfer.type === "TRANSFER" && s55Transfer.recurrence === "monthly" && s55Transfer.fromAccountId === s54Checking.id &&
+      s55Transfer.toAccountId === s55Goal.id && parseFloat(s55Transfer.amount) === s55Expect.monthly &&
+      s55Transfer.date === s55Today && !s55Transfer.isCleared,
+    `"Set up monthly transfer" creates a monthly $${s55Expect.monthly} transfer from Checking to the goal, starting today; ` +
+      `a second tap or a goal with no bill is refused (got ${s55NoLinkSetup.status}/${s55Setup.status}/${s55Again.status})`
+  );
+  assert(
+    s55G2.sinkingFund.monthlyTransfer?.amount === s55Expect.monthly &&
+      !s55WithTransfer.days.some((d) => d.items.some((it) => it.planned)) &&
+      s55TodayItems.some((it) => it.title === "Contribution to Suite55 Fund" && it.amount === -s55Expect.monthly) &&
+      Math.abs(s55WithTransfer.safeToSpend - s55WithFund.safeToSpend) < 0.005,
+    `With the transfer set up the forecast projects the transfer instead of the planned amount: Safe to Spend is unchanged ` +
+      `(got ${s55WithTransfer.safeToSpend} vs ${s55WithFund.safeToSpend})`
+  );
+  await s54Checking.reload();
+  await s54Checking.update({ initialBalance: parseFloat(s54Checking.initialBalance) - 100000 });
+  await Transaction.destroy({
+    where: { [Op.or]: [{ toAccountId: { [Op.in]: [s55Goal.id, s55NoLink.body.id] } }, { title: { [Op.like]: "Suite55 %" } }] },
+    force: true,
+  });
+  await Account.destroy({ where: { id: { [Op.in]: [s55Goal.id, s55NoLink.body.id] } } });
+
+  console.log("\n--- Suite 56: Price-change alerts (nightly job and digest, once per change) ---");
+  const { runDailySweep: s56Sweep } = require("../services/dailySweepService");
+  const { buildMorningDigest: s56Digest } = require("../services/notificationService");
+  const s56Today = getTorontoToday();
+  const s56Series = async (title, oldAmount, newAmount, newDaysAgo) => {
+    const first = await Transaction.create({
+      title, amount: oldAmount, date: getTorontoOffsetDate(newDaysAgo - 30), type: "EXPENSE", category: "Subscriptions",
+      isCleared: true, recurrence: "monthly",
+    });
+    const second = await Transaction.create({
+      title, amount: newAmount, date: getTorontoOffsetDate(newDaysAgo), type: "EXPENSE", category: "Subscriptions",
+      isCleared: true, recurrence: "monthly", recurringGroupId: first.recurringGroupId,
+    });
+    return { first, second, groupId: first.recurringGroupId };
+  };
+  const s56Netflix = await s56Series("Suite56 Netflix", 16.49, 18.99, -3);
+  await s56Series("Suite56 Hydro", 100, 104, -3); // 4%: not an alert
+  await s56Series("Suite56 Old Gym", 40, 60, -50); // changed 50 days ago: history, not news
+  await Setting.destroy({ where: { key: "price_alerts_pending" } });
+  const s56Run1 = await s56Sweep({ todayStr: s56Today });
+  const s56Pending = JSON.parse((await Setting.findByPk("price_alerts_pending"))?.value || "[]");
+  assert(
+    s56Run1.priceAlerts === 1 && s56Pending.length === 1 && s56Pending[0].title === "Suite56 Netflix" &&
+      s56Pending[0].from === 16.49 && s56Pending[0].to === 18.99,
+    `The nightly job finds Netflix $16.49 -> $18.99 (+15%), not a 4% change or one from 50 days ago (got ${JSON.stringify(s56Pending)})`
+  );
+  const s56D1 = await s56Digest(null, { todayStr: s56Today });
+  const s56D2 = await s56Digest(null, { todayStr: s56Today });
+  assert(
+    s56D1?.message.includes("Suite56 Netflix $16.49 → $18.99") && !s56D1.message.includes("Hydro") &&
+      !(s56D2?.message || "").includes("Suite56 Netflix"),
+    `The digest (sent to ntfy) says "Suite56 Netflix $16.49 → $18.99" once (got ${JSON.stringify(s56D1?.message)})`
+  );
+  const s56Run2 = await s56Sweep({ todayStr: s56Today });
+  const s56D3 = await s56Digest(null, { todayStr: s56Today });
+  assert(
+    s56Run2.priceAlerts === 0 && !(s56D3?.message || "").includes("Suite56 Netflix"),
+    `The next night the same change is not alerted again (got ${s56Run2.priceAlerts})`
+  );
+  // The next charge at the new price is not a change; a later rise is a new alert
+  await Transaction.create({
+    title: "Suite56 Netflix", amount: 18.99, date: getTorontoOffsetDate(-1), type: "EXPENSE", category: "Subscriptions",
+    isCleared: true, recurrence: "monthly", recurringGroupId: s56Netflix.groupId,
+  });
+  const s56Run3 = await s56Sweep({ todayStr: s56Today });
+  await Transaction.create({
+    title: "Suite56 Netflix", amount: 20.99, date: s56Today, type: "EXPENSE", category: "Subscriptions",
+    isCleared: true, recurrence: "monthly", recurringGroupId: s56Netflix.groupId,
+  });
+  const s56Run4 = await s56Sweep({ todayStr: s56Today });
+  const s56D4 = await s56Digest(null, { todayStr: s56Today });
+  assert(
+    s56Run3.priceAlerts === 0 && s56Run4.priceAlerts === 1 && s56D4?.message.includes("Suite56 Netflix $18.99 → $20.99"),
+    `Same price again: no alert; a new rise ($18.99 -> $20.99) alerts once more (got ${s56Run3.priceAlerts}/${s56Run4.priceAlerts})`
+  );
+  await Transaction.destroy({ where: { title: { [Op.like]: "Suite56 %" } }, force: true });
+  await Setting.destroy({ where: { key: { [Op.or]: [{ [Op.like]: "price_alert:%" }, "price_alerts_pending"] } } });
+
+  console.log("\n--- Suite 57: \"Make this a subscription?\" suggestions (accept, dismiss) ---");
+  const s57Add = (title, amount, daysAgo, extra = {}) =>
+    Transaction.create({
+      title, amount, date: getTorontoOffsetDate(-daysAgo), type: "EXPENSE", category: "Subscriptions", isCleared: true, ...extra,
+    });
+  const s57Spotify = [await s57Add("Spotify 10/22", 11.99, 5), await s57Add("SPOTIFY 09/22", 11.99, 35), await s57Add("Spotify", 12.3, 65)];
+  await s57Add("Suite57 Gym", 50, 3); await s57Add("Suite57 Gym", 50, 33); await s57Add("Suite57 Gym", 80, 63); // amount differs
+  await s57Add("Suite57 Coffee", 5, 2); await s57Add("Suite57 Coffee", 5, 7); await s57Add("Suite57 Coffee", 5, 12); // weekly-ish
+  await s57Add("Suite57 Old", 9, 70); await s57Add("Suite57 Old", 9, 100); await s57Add("Suite57 Old", 9, 130); // stopped
+  const s57Cloud = [await s57Add("Suite57 Cloud", 2.99, 1), await s57Add("Suite57 Cloud", 2.99, 31), await s57Add("Suite57 Cloud", 2.99, 61)];
+  const s57Get = async () => (await s33("GET", "/api/alerts/subscription-suggestions")).body.suggestions || [];
+  const s57L1 = await s57Get();
+  const s57Sp = s57L1.find((s) => s.key === "spotify");
+  assert(
+    s57Sp && s57Sp.id === s57Spotify[0].id && s57Sp.dates.length === 3 && s57Sp.amount === 11.99 &&
+      s57L1.some((s) => s.key === "suite57 cloud") && s57L1.length === 2,
+    `Three monthly charges with the same title (dates removed) and amount within 5% are suggested; a different amount, ` +
+      `weekly charges and a pattern that stopped are not (got ${JSON.stringify(s57L1.map((s) => s.key))})`
+  );
+  const s57Dismiss = await s33("POST", `/api/alerts/subscription-suggestions/${s57Cloud[0].id}/dismiss`, {});
+  await s57Add("Suite57 Cloud", 2.99, 0);
+  const s57L2 = await s57Get();
+  const s57Dismissed = JSON.parse((await Setting.findByPk("subscription_suggestions_dismissed"))?.value || "[]");
+  const s57Dismiss2 = await s33("POST", `/api/alerts/subscription-suggestions/${s57Cloud[0].id}/dismiss`, {});
+  assert(
+    s57Dismiss.status === 204 && s57Dismissed.includes("suite57 cloud") && !s57L2.some((s) => s.key === "suite57 cloud") &&
+      s57Dismiss2.status === 404,
+    `Dismiss is remembered in a Setting, also after a new charge (got ${s57Dismiss.status}, ${JSON.stringify(s57Dismissed)})`
+  );
+  const s57Accept = await s33("POST", `/api/alerts/subscription-suggestions/${s57Spotify[0].id}/accept`, {});
+  const s57Rows = await Transaction.findAll({ where: { recurringGroupId: s57Accept.body.recurringGroupId }, order: [["date", "ASC"]] });
+  const s57Next = getNextOccurrenceDate(s57Spotify[0].date, "monthly", 1);
+  assert(
+    s57Accept.status === 201 && s57Rows.length === 4 &&
+      s57Rows.filter((r) => r.recurrence === "monthly").map((r) => r.date).join() === [s57Spotify[0].date, s57Next].join() &&
+      s57Rows.slice(0, 2).every((r) => r.recurrence === "none") && s57Rows[3].date === s57Next && !s57Rows[3].isCleared &&
+      parseFloat(s57Rows[3].amount) === 11.99,
+    `Accept makes the newest charge a monthly series (older charges join it as history) and the next charge is ` +
+      `generated for ${s57Next} (got ${s57Rows.map((r) => `${r.date}/${r.recurrence}`)})`
+  );
+  const s57L3 = await s57Get();
+  const s57Again = await s33("POST", `/api/alerts/subscription-suggestions/${s57Spotify[0].id}/accept`, {});
+  assert(
+    !s57L3.some((s) => s.key === "spotify") && s57Again.status === 404,
+    "An accepted suggestion is gone and can't be accepted twice"
+  );
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "Suite57 %" } }, { title: { [Op.like]: "spotify%" } }] }, force: true });
+  await Setting.destroy({ where: { key: { [Op.or]: ["subscription_suggestions_dismissed", { [Op.like]: "recurring_restart_from:%" }] } } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

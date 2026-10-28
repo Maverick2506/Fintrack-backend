@@ -3,16 +3,18 @@ const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { addCalendarDays, getForecast } = require("./forecastService");
 const { toZonedTime } = require("date-fns-tz");
+const { takePendingPriceAlerts, formatPriceAlert } = require("./alertService");
 
 /**
  * Builds the morning notification digest for ntfy.
  * Returns { title, message, priority, tags } or null if nothing to report.
  *
  * @param {import("sequelize").Transaction|null} [dbTx=null]
+ * @param {{ todayStr?: string }} [options] todayStr overrides "today" (America/Toronto) for tests
  * @returns {Promise<{ title: string, message: string, priority: string, tags: string } | null>}
  */
-const buildMorningDigest = async (dbTx = null) => {
-  const todayStr = getTodayString();
+const buildMorningDigest = async (dbTx = null, options = {}) => {
+  const todayStr = options.todayStr || getTodayString();
   const threeDaysAhead = addCalendarDays(todayStr, 3);
   const fiveDaysAhead = addCalendarDays(todayStr, 5);
 
@@ -83,9 +85,22 @@ const buildMorningDigest = async (dbTx = null) => {
     }
   }
 
+  // 3b. Price changes the nightly job found since the last digest; each is sent once
+  const priceAlerts = await takePendingPriceAlerts(dbTx);
+  if (priceAlerts.length > 0) {
+    sections.push(`💸 Price Changes:`);
+    for (const alert of priceAlerts) {
+      sections.push(
+        showAmounts
+          ? `  • ${formatPriceAlert(alert)}`
+          : `  • ${alert.title} price went ${alert.to > alert.from ? "up" : "down"}`
+      );
+    }
+  }
+
   // 4. Forecast & Low-Balance Alert
   try {
-    const forecast = await getForecast(60, dbTx);
+    const forecast = await getForecast(60, dbTx, [], { todayStr });
     const lowest = forecast.lowestPoint;
     const isBelowBuffer = lowest && lowest.balance < forecast.buffer;
     const isSafeToSpendZero = forecast.safeToSpend <= 0;

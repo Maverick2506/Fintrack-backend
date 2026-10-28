@@ -7,6 +7,7 @@ const { validateBody, validateIdParam, schemas } = require("../middleware/valida
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
 const { setBalanceAnchor } = require("../services/balanceAnchorService");
+const { getCardStatement } = require("../services/statementService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -25,10 +26,15 @@ router.get(
       where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
-    const formatted = cards.map((c) => ({
-      ...c.toJSON(),
-      currentBalance: c.initialBalance,
-    }));
+    const todayStr = getTodayString();
+    const formatted = await Promise.all(
+      cards.map(async (c) => ({
+        ...c.toJSON(),
+        currentBalance: c.initialBalance,
+        // { statementDate, dueDate, statementBalance, newCharges, ... } when a statement day is set
+        statement: await getCardStatement(c, todayStr),
+      }))
+    );
     res.json(formatted);
   })
 );
@@ -37,7 +43,7 @@ router.post(
   "/credit-cards",
   validateBody(schemas.createCreditCard),
   asyncHandler(async (req, res) => {
-    const { name, creditLimit, currentBalance, initialBalance, dueDate } =
+    const { name, creditLimit, currentBalance, initialBalance, dueDate, statementDay } =
       req.body;
 
     const newCard = await Account.create({
@@ -46,12 +52,15 @@ router.post(
       initialBalance: currentBalance ?? initialBalance ?? 0.0,
       creditLimit: parseFloat(creditLimit),
       dueDate: dueDate || null,
+      statementDay: statementDay ?? null,
       isActive: true,
     });
 
-    res
-      .status(201)
-      .json({ ...newCard.toJSON(), currentBalance: newCard.initialBalance });
+    res.status(201).json({
+      ...newCard.toJSON(),
+      currentBalance: newCard.initialBalance,
+      statement: await getCardStatement(newCard, getTodayString()),
+    });
   })
 );
 
@@ -137,9 +146,10 @@ router.put(
   asyncHandler(async (req, res) => {
     const card = await Account.findByPk(req.params.id);
     if (card && card.type === "CREDIT_CARD") {
-      const { name, creditLimit, currentBalance, initialBalance, dueDate } =
+      const { name, creditLimit, currentBalance, initialBalance, dueDate, statementDay } =
         req.body;
       await card.update({
+        statementDay: statementDay !== undefined ? statementDay : card.statementDay,
         name: name !== undefined ? name : card.name,
         creditLimit:
           creditLimit !== undefined
@@ -157,7 +167,11 @@ router.put(
       if (currentBalance !== undefined || initialBalance !== undefined) {
         await setBalanceAnchor(card.id, getTodayString());
       }
-      res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
+      res.json({
+        ...card.toJSON(),
+        currentBalance: card.initialBalance,
+        statement: await getCardStatement(card, getTodayString()),
+      });
     } else {
       res.status(404).json({ error: "Credit Card not found" });
     }

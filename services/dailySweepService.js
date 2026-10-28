@@ -13,6 +13,7 @@ const {
 } = require("./debtInterestService");
 const { getBalancesSummary } = require("./netWorthService");
 const { purgeDeletedTransactions } = require("./trashService");
+const { recordPriceChanges } = require("./alertService");
 
 const TIMEZONE = "America/Toronto";
 // Arbitrary constant shared by every instance so only one sweep runs at a time across processes
@@ -370,6 +371,16 @@ const runDailySweep = async (options = {}) => {
     }
 
     await dbTx.commit();
+
+    // 6. Price changes in recurring bills, queued for the morning digest (alertService). After the
+    //    commit and on its own: a failure here must not undo the sweep.
+    let priceAlerts = [];
+    try {
+      priceAlerts = await recordPriceChanges(todayString);
+    } catch (err) {
+      console.error("Price-change check failed:", err);
+    }
+
     console.log(
       `Daily sweep complete: ${clearedExpenseCount} expenses cleared, ${clearedIncomeCount} incomes cleared, ${autoPayCount} auto-pays processed. Net worth snapshot recorded (${balances.netWorth}).`
     );
@@ -379,6 +390,7 @@ const runDailySweep = async (options = {}) => {
       autoPayProcessed: autoPayCount,
       interestRecorded: interestCount,
       purgedFromTrash: purgedCount,
+      priceAlerts: priceAlerts.length,
       date: todayString,
       netWorth: balances.netWorth,
     };

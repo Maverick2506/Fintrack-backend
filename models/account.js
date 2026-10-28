@@ -43,6 +43,17 @@ const Account = sequelize.define(
       type: DataTypes.INTEGER,
       allowNull: true,
     },
+    // Credit cards: day of month the statement closes (1-31; a short month closes on its last day).
+    // Splits the balance into the statement balance and new charges since.
+    statementDay: {
+      type: DataTypes.INTEGER,
+      allowNull: true,
+    },
+    // Savings goals: the bill (recurringGroupId of an expense series) this goal saves up for
+    linkedRecurringGroupId: {
+      type: DataTypes.UUID,
+      allowNull: true,
+    },
     minimumPayment: {
       type: DataTypes.DECIMAL(10, 2),
       allowNull: true,

@@ -44,10 +44,11 @@ const getComparableAmount = (t) => {
 
 /**
  * Active recurring expense series (subscriptions and bills) with monthly and yearly cost, next
- * unpaid date and price changes. Shared by GET /api/subscriptions and Ask FinTrack's getSubscriptions.
+ * unpaid date and price changes. Shared by GET /api/subscriptions, Ask FinTrack's getSubscriptions and
+ * the nightly price-change alert (alertService).
  * todayStr is Toronto today.
  */
-const getSubscriptionsSummary = async (todayStr) => {
+const getSubscriptionsSummary = async (todayStr, dbTx = null) => {
   // 1. Fetch expense transactions that are part of a recurring series
   const recurringTrxs = await Transaction.findAll({
     where: {
@@ -65,6 +66,7 @@ const getSubscriptionsSummary = async (todayStr) => {
       ["date", "ASC"],
       ["createdAt", "ASC"],
     ],
+    transaction: dbTx,
   });
 
   // 2. Group by recurringGroupId; a row without one is on its own (see getSeriesKey)
@@ -149,6 +151,7 @@ const getSubscriptionsSummary = async (todayStr) => {
           difference: diff,
           percent,
           date: latestCleared.date,
+          rowId: latestCleared.id,
         };
       }
     }

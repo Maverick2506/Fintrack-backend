@@ -57,6 +57,18 @@ const optionalDate = z.preprocess(
   z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").nullable().optional()
 );
 
+// Card statement day: 1-31, or empty/null to clear
+const optionalStatementDay = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.coerce.number().int().min(1, "Statement day is 1-31").max(31, "Statement day is 1-31").nullable().optional()
+);
+
+// A goal's linked bill: a series id, or empty/null to unlink
+const optionalSeriesId = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.string().uuid("Invalid bill").nullable().optional()
+);
+
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { DATE_FORMATS, MAX_IMPORT_ROWS } = require("../utils/csvImport");
 
@@ -156,6 +168,7 @@ const schemas = {
     currentBalance: z.coerce.number().optional().default(0),
     initialBalance: z.coerce.number().optional(),
     dueDate: optionalDate,
+    statementDay: optionalStatementDay,
   }),
 
   updateCreditCard: z.object({
@@ -164,6 +177,7 @@ const schemas = {
     currentBalance: z.coerce.number().optional(),
     initialBalance: z.coerce.number().optional(),
     dueDate: optionalDate,
+    statementDay: optionalStatementDay,
   }),
 
   createDebt: z.object({
@@ -221,6 +235,7 @@ const schemas = {
       ),
     contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
+    linkedRecurringGroupId: optionalSeriesId,
   }),
 
   updateSavingsGoal: z.object({
@@ -238,6 +253,7 @@ const schemas = {
       ),
     contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
+    linkedRecurringGroupId: optionalSeriesId,
   }),
 
   // DELETE /credit-cards|debts|savings-goals/:id. An empty body archives and ends the account's series.
@@ -340,6 +356,9 @@ const schemas = {
     .object({ dryRun: z.boolean().optional() })
     .optional()
     .default({}),
+
+  // POST /savings-goals/:id/monthly-transfer and the subscription suggestion actions take no fields
+  noFields: z.object({}).strict().optional().default({}),
 
   // PUT /expenses/:id?dryRun=1 previews the change (e.g. ending a series) and saves nothing
   dryRunQuery: z.object({

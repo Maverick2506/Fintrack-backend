@@ -16,6 +16,8 @@ const {
   isDebtInterestEnabled,
   projectDebtSchedule,
 } = require("./debtInterestService");
+const { getCardStatement } = require("./statementService");
+const { getSinkingFunds } = require("./sinkingFundService");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
 const addCalendarDays = (baseDateStr, daysToAdd) => {
@@ -199,6 +201,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
             title: `[Overdue] ${trx.title}`,
             amount: -amt,
             type: "transfer",
+            toAccountId: trx.toAccountId,
           });
         }
       }
@@ -248,6 +251,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           title: trx.title,
           amount: -amt,
           type: "transfer",
+          toAccountId: trx.toAccountId,
         });
       }
     }
@@ -324,6 +328,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
               amount: -amt,
               type: "transfer",
               virtual: true,
+              toAccountId: latest.toAccountId,
             });
           }
         }
@@ -333,6 +338,68 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
   // 3b. Estimated paycheques: fill future paydays when income isn't set up as a recurring series
   const estimatedIncome = await estimatePaycheques({ daysMap, todayStr, endDateStr, checkingId, dbTx });
+
+  // 3c. Cards with a statement day: the next payment is what is left of the last statement, not the
+  //     whole balance (new charges go on the next statement). It replaces the scheduled payments to the
+  //     card up to that statement's due date (an overdue statement is paid today), on the first of
+  //     those dates, or on the due date when none is scheduled. Payments after the due date stay.
+  const statementCards = await Account.findAll({
+    where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false }, statementDay: { [Op.ne]: null } },
+    order: [["createdAt", "ASC"]],
+    transaction: dbTx,
+  });
+  const cardPayments = [];
+  for (const card of statementCards) {
+    const statement = await getCardStatement(card, todayStr, dbTx);
+    if (!statement || !statement.dueDate) continue;
+    const payBy = statement.dueDate < todayStr ? todayStr : statement.dueDate;
+    let firstScheduled = null;
+    for (let i = 0; i < horizonDays; i++) {
+      const dStr = addCalendarDays(todayStr, i);
+      if (dStr > payBy) break;
+      const bucket = daysMap[dStr];
+      const kept = bucket.items.filter((it) => it.toAccountId !== card.id);
+      if (kept.length !== bucket.items.length) {
+        firstScheduled = firstScheduled || dStr;
+        bucket.items = kept;
+      }
+    }
+    const paymentDate = firstScheduled || payBy;
+    if (statement.statementBalance > 0 && daysMap[paymentDate]) {
+      daysMap[paymentDate].items.push({
+        title: `Statement balance – ${card.name}`,
+        amount: -statement.statementBalance,
+        type: "card",
+        toAccountId: card.id,
+      });
+    }
+    cardPayments.push({
+      id: card.id,
+      name: card.name,
+      statementDate: statement.statementDate,
+      dueDate: statement.dueDate,
+      statementBalance: statement.statementBalance,
+      newCharges: statement.newCharges,
+      paymentDate: statement.statementBalance > 0 ? paymentDate : null,
+    });
+  }
+
+  // 3d. Sinking funds: a goal saving for a bill sets its monthly amount aside on each contribution date
+  //     (sinkingFundService), unless a recurring transfer to the goal already does (projected in step 3)
+  const sinkingFunds = [];
+  for (const [goalId, fund] of await getSinkingFunds(todayStr, dbTx)) {
+    if (fund.monthlyTransfer || !fund.monthly) continue;
+    const plannedDates = fund.dates.filter((d) => daysMap[d]);
+    for (const d of plannedDates) {
+      daysMap[d].items.push({
+        title: `Set aside for ${fund.name}`,
+        amount: -fund.monthly,
+        type: "planned",
+        planned: true,
+      });
+    }
+    sinkingFunds.push({ id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates });
+  }
 
   // 4. Debts: interest on each due date, then auto-pay, projected exactly as the daily sweep runs them
   //    (debtInterestService.projectDebtSchedule). Only auto-pay leaves Checking; interest changes how
@@ -435,6 +502,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         title: it.title,
         amount: Math.round(it.amount * 100) / 100,
         ...(it.estimated ? { estimated: true } : {}),
+        ...(it.planned ? { planned: true } : {}),
+        ...(it.type === "card" ? { statement: true } : {}),
       })),
     };
     days.push(dayObj);
@@ -474,6 +543,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     days,
     estimatedIncome,
     debts: debtProjections,
+    cardPayments,
+    sinkingFunds,
   };
 };
 
