@@ -561,6 +561,17 @@ async function runGeminiUnitTests() {
     assert(/at most 3 short lines/i.test(prompt) && /Use only the numbers above/.test(prompt));
   });
 
+  test("Numbers written as words are checked too, and fractions or multiples drop the line (re-review)", () => {
+    const facts = { year: 2026, overBudgetCount: 2, goals: [{ name: "Trip", saved: 400, target: 1000, percent: 40 }] };
+    const kept = sanitizeCommentary(["Two budgets went over in 2026.", "One goal is at 40%."], facts);
+    assert.deepStrictEqual(kept, ["Two budgets went over in 2026.", "One goal is at 40%."]);
+    const dropped = sanitizeCommentary(
+      ["Two thirds of the way to Trip.", "Spending doubled.", "You saved half of it.", "Three budgets went over.", "A few hundred left."],
+      facts
+    );
+    assert.deepStrictEqual(dropped, []);
+  });
+
   test("The digest's month close writes thousands with a comma", () => {
     const lines = digestLines(
       {

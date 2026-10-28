@@ -297,7 +297,7 @@ ${JSON.stringify(facts)}
 
 Write at most ${COMMENTARY_LINES} short lines (each under 20 words) about what stands out: a category that rose or fell, a budget that was missed or kept, a price rise, goal progress or the net worth change.
 Rules:
-- Use only the numbers above, exactly as given (dollars like $123.45, percents like 12.5%). Never calculate a difference, a remainder or any other new number, and never round differently or estimate.
+- Use only the numbers above, exactly as given (dollars like $123.45, percents like 12.5%). Write every number in digits. Never calculate a difference, a remainder, a fraction ("half", "two thirds") or any other new number, and never round differently or estimate.
 - No advice lists, no greetings, no markdown, no emoji.
 - If the month is not over yet (monthIsOver false), say "so far" where it matters.`;
 
@@ -326,6 +326,21 @@ const numbersIn = (text) =>
     return m[2] ? n * 1000 : n;
   });
 
+// Numbers written as words count as numbers too ("two budgets" is fine when 2 is a fact). "One" is
+// left alone because it is mostly not a count. Fractions and multiples ("half", "twice") are always
+// a calculation, and so are "hundred"/"thousand" amounts, so they drop the line.
+const NUMBER_WORDS = {
+  two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+  seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40,
+  fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
+};
+const CALCULATED_WORDS =
+  /\b(?:half|halves|halved|thirds?|quarters?|double[ds]?|doubling|twice|triple[ds]?|tripling|quadruple[ds]?|hundreds?|thousands?|millions?)\b/i;
+
+const wordNumbersIn = (text) =>
+  [...text.toLowerCase().matchAll(/\b[a-z]+\b/g)].map((m) => NUMBER_WORDS[m[0]]).filter((n) => n !== undefined);
+
 /**
  * The model's lines, cleaned: at most three, bullets and markdown stripped, each cut to a sensible
  * length, and any line with a number that isn't one of the facts' numbers dropped ("$600 to go",
@@ -347,6 +362,8 @@ const sanitizeCommentary = (lines, facts) => {
     let figuresText = line;
     for (const name of names) figuresText = figuresText.split(name).join(" ");
     if (numbersIn(figuresText).some((n) => !quotesKnownNumber(n, numbers))) continue;
+    if (CALCULATED_WORDS.test(figuresText)) continue;
+    if (wordNumbersIn(figuresText).some((n) => !quotesKnownNumber(n, numbers))) continue;
     out.push(line);
   }
   return out;

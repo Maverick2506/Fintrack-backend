@@ -83,6 +83,8 @@ const corsOptions = {
   },
   methods: "GET,POST,PUT,DELETE,OPTIONS",
   allowedHeaders: "Content-Type,Authorization",
+  // Lets the app read the CSV download's file name
+  exposedHeaders: "Content-Disposition",
   credentials: true,
 };
 

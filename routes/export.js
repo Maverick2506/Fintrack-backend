@@ -12,6 +12,7 @@ const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { usesArchivedAccount } = require("../services/accountArchiveService");
 const { feedLimiter } = require("../middleware/rateLimit");
 const { tagsOf } = require("../utils/transactionTags");
+const { neutralizeFormula } = require("../utils/ledgerExport");
 
 // Helper: Timing-safe token comparison
 const constantTimeCompare = (a, b) => {
@@ -369,10 +370,11 @@ const getFinancialData = async () => {
   };
 };
 
-// Helper: Escape CSV fields safely
+// Helper: Escape CSV fields safely. The feed is loaded into Sheets with IMPORTDATA, so a title or
+// name that starts like a formula ("=HYPERLINK(...)", "@SUM") is turned into text first.
 const csvEscape = (val) => {
   if (val === null || val === undefined) return "";
-  const str = String(val);
+  const str = neutralizeFormula(val);
   if (str.includes(",") || str.includes('"') || str.includes("\n")) {
     return `"${str.replace(/"/g, '""')}"`;
   }

@@ -84,9 +84,12 @@ const filterLedgerRows = (rows, filters = {}) => {
 };
 
 // A text cell a spreadsheet would run as a formula (= + - @, or a tab/CR first) gets a leading '
+// A plain amount like "-12.50" or "+$2,100" stays a number in a spreadsheet; any other text that
+// starts like a formula gets a leading ' so Sheets/Excel show it as text instead of running it
+const PLAIN_NUMBER = /^[+-]?\$?\d[\d,]*(?:\.\d+)?%?$/;
 const neutralizeFormula = (value) => {
   const str = String(value ?? "");
-  return /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+  return /^[=+\-@\t\r]/.test(str) && !PLAIN_NUMBER.test(str) ? `'${str}` : str;
 };
 
 const csvCell = (value) => {

@@ -9815,6 +9815,31 @@ async function runTestSuite() {
     `Feed TAGS and NOTES, the note cut to 100 characters in CSV and Markdown (got ${s64FeedGas?.[8]?.length} chars)`
   );
 
+  // --- Suite 65: the Gem feed CSV is formula-safe too (it is loaded into Sheets with IMPORTDATA) ---
+  console.log("\n--- Suite 65: Gem feed CSV is formula-safe ---");
+  const s65Link = s64Feed.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4].includes("Suite64 click"));
+  const s65Lunch = s64Feed.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] === "Suite64 Work lunch");
+  assert(
+    s65Link?.[4].startsWith("'=HYPERLINK(") && s65Lunch?.[8].startsWith("'+1 for Sam"),
+    `A feed title starting with = and a note starting with + become text (got ${s65Link?.[4]}, ${s65Lunch?.[8]})`
+  );
+  const s65Raw = s64Feed.flat().filter((c) => /^[=+@\t\r]/.test(c) || (/^-/.test(c) && !/^-\$?\d[\d,]*(?:\.\d+)?%?$/.test(c)));
+  assert(s65Raw.length === 0, `No feed cell starts like a formula (got ${JSON.stringify(s65Raw.slice(0, 3))})`);
+  const s65Amounts = s64Feed.filter((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] !== "TITLE").map((r) => r[5]);
+  assert(
+    s65Amounts.length > 0 && s65Amounts.every((a) => /^-?\d+\.\d{2}$/.test(a)),
+    `Feed amounts, negative ones included, stay plain numbers (got ${s65Amounts.slice(0, 4).join(", ")})`
+  );
+  const s65Quoted = s64Feed.flat().filter((c) => c.startsWith("'") && !/Suite64/.test(c) && !c.startsWith("'+1 for Sam"));
+  assert(s65Quoted.length === 0, `Only formula-like cells get the leading ' (also got ${JSON.stringify(s65Quoted.slice(0, 3))})`);
+  const s65Cors = await s33("GET", "/api/expenses/export.csv?tag=s64", null, { ...authHeaders, Origin: "http://localhost:5173" });
+  assert(
+    /content-disposition/i.test(s65Cors.headers["access-control-expose-headers"] || ""),
+    `The app can read the download's file name across origins (got ${s65Cors.headers["access-control-expose-headers"]})`
+  );
+  const s65Md = s64Md.split("\n").find((l) => l.includes("Suite64 click")) || "";
+  assert(s65Md.includes("=HYPERLINK("), "The Markdown feed is not a spreadsheet, so it shows the title as written");
+
   await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "%Suite64%" } }, { fromAccountId: s64Card.id }] }, force: true });
   await s64Card.destroy();
 
