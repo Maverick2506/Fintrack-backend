@@ -421,6 +421,9 @@ router.put(
         const rawTarget = req.body.target_amount ?? req.body.goal_amount;
         if (rawTarget !== null && rawTarget !== undefined) {
           updates.targetAmount = parseFloat(rawTarget);
+        } else if (rawTarget === null) {
+          // Cleared: the goal follows its bill's amount (checked below once the link is known)
+          updates.targetAmount = 0;
         }
       }
       if (
@@ -455,6 +458,10 @@ router.put(
       const link = await resolveLinkedBill(req.body);
       if (link.error) return res.status(400).json({ error: link.error });
       if (link.linked !== undefined) updates.linkedRecurringGroupId = link.linked;
+      const linkedAfter = updates.linkedRecurringGroupId !== undefined ? updates.linkedRecurringGroupId : goal.linkedRecurringGroupId;
+      if (updates.targetAmount === 0 && !linkedAfter) {
+        return res.status(400).json({ error: "A goal needs a target amount unless it saves for a bill." });
+      }
 
       await goal.update(updates);
       res.json({

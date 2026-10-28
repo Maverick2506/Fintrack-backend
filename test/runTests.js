@@ -9422,6 +9422,25 @@ async function runTestSuite() {
       `(got Checking ${s61A0} -> ${s61A1}, fund ${s61HomeGoal.initialBalance})`
   );
 
+  // Editing a goal with its target cleared (null): a goal saving for a bill follows the bill's amount;
+  // a goal without a bill still needs a target
+  await s61HomeGoal.update({ isActive: true, targetAmount: 900 });
+  const s61Clear = await s33("PUT", `/api/savings-goals/${s61HomeGoal.id}`, { name: "Suite61 Home Fund", goal_amount: null });
+  await s61HomeGoal.reload();
+  const s61Fund = (await s33("GET", "/api/savings-goals")).body.find((g) => g.id === s61HomeGoal.id);
+  const s61Plain = await Account.create({ name: "Suite61 Plain Goal", type: "SAVINGS_GOAL", initialBalance: 0, targetAmount: 300, isActive: true });
+  const s61PlainClear = await s33("PUT", `/api/savings-goals/${s61Plain.id}`, { goal_amount: null });
+  const s61PlainKeep = await s33("PUT", `/api/savings-goals/${s61Plain.id}`, { name: "Suite61 Plain Goal", goal_amount: "" });
+  await s61Plain.reload();
+  assert(
+    s61Clear.status === 200 && parseFloat(s61HomeGoal.targetAmount || 0) === 0 && s61Fund?.sinkingFund?.targetAmount === 400 &&
+      s61PlainClear.status === 400 && s61PlainKeep.status === 200 && parseFloat(s61Plain.targetAmount) === 300,
+    `Clearing a linked goal's target makes it follow the $400 bill; an unlinked goal can't clear it, and "" leaves it ` +
+      `(got ${s61Clear.status} ${s61HomeGoal.targetAmount} -> ${s61Fund?.sinkingFund?.targetAmount}, unlinked ${s61PlainClear.status}, ` +
+      `"" ${s61PlainKeep.status} ${s61Plain.targetAmount})`
+  );
+  await s61Plain.destroy();
+
   await s61Checking.reload();
   await s61Checking.update({ initialBalance: parseFloat(s61Checking.initialBalance) - 100000 });
   const s61GoalIds = [s61Goal.id, s61HomeGoal.id];

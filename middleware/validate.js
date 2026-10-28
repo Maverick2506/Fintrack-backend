@@ -263,8 +263,9 @@ const schemas = {
 
   updateSavingsGoal: z.object({
     name: z.string().trim().min(1).max(255).optional(),
-    target_amount: optionalNumber(z.coerce.number().positive()),
-    goal_amount: optionalNumber(z.coerce.number().positive()),
+    // null clears the goal's own target, so a goal saving for a bill follows the bill's amount
+    target_amount: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().positive().nullable().optional()),
+    goal_amount: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().positive().nullable().optional()),
     current_amount: optionalNumber(z.coerce.number().nonnegative()),
     initialBalance: optionalNumber(z.coerce.number().nonnegative()),
     target_date: optionalDate,
