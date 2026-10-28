@@ -9340,6 +9340,106 @@ async function runTestSuite() {
   await Account.destroy({ where: { id: { [Op.in]: [...s60GoalIds, s60Card.id] } } });
   await Setting.destroy({ where: { key: { [Op.or]: [{ [Op.like]: "fund_paid:%" }, { [Op.like]: "fund_paid_by:%" }] } } });
 
+  console.log("\n--- Suite 61: Restoring a deleted fund-paid bill or card payment pays from the fund again ---");
+  const s61Checking = await s45GetChecking();
+  const s61CheckingBal = async () => (await getBalancesSummary()).checking;
+  await s61Checking.update({ initialBalance: parseFloat(s61Checking.initialBalance) + 100000 });
+  const s61Restore = (id) => s33("POST", "/api/expenses/restore", { ids: [id] });
+  const s61Moved = (goalId) => Transaction.count({ where: { fromAccountId: goalId } });
+
+  // A card payment of $1,300 the fund paid $1,200 of: delete, then restore
+  const s61Card = await Account.create({ name: "Suite61 Visa", type: "CREDIT_CARD", initialBalance: 1700, creditLimit: 5000, isActive: true });
+  const s61Charge = await Transaction.create({
+    title: "Suite61 Car insurance", amount: 1200, date: getTorontoOffsetDate(-1), type: "EXPENSE", category: "Insurance",
+    isCleared: true, balanceApplied: true, recurrence: "yearly", fromAccountId: s61Card.id,
+  });
+  const s61Goal = await Account.create({
+    name: "Suite61 Car Fund", type: "SAVINGS_GOAL", initialBalance: 1200, targetAmount: 1200, dueDate: s61Charge.date,
+    linkedRecurringGroupId: s61Charge.recurringGroupId, isActive: true,
+  });
+  const s61Pay = await s33("POST", `/api/credit-cards/${s61Card.id}/pay`, {
+    amount: 1300, fundBills: [{ billId: s61Charge.id, useFund: true }],
+  });
+  await s61Goal.reload();
+  const s61PaidDue = s61Goal.dueDate;
+  const s61C0 = await s61CheckingBal();
+  await s33("DELETE", `/api/expenses/${s61Pay.body.paymentId}`);
+  const s61Res = await s61Restore(s61Pay.body.paymentId);
+  const s61C1 = await s61CheckingBal();
+  await s61Goal.reload();
+  await s61Card.reload();
+  assert(
+    s61Pay.body.cardFunds?.[0]?.amount === 1200 && s61Res.status === 200 && s61Res.body.restoredCount === 1 &&
+      Math.abs(s61C1 - s61C0) < 0.005 && parseFloat(s61Goal.initialBalance) === 0 && s61Goal.dueDate === s61PaidDue &&
+      s61PaidDue !== s61Charge.date && (await s61Moved(s61Goal.id)) === 1 && parseFloat(s61Card.initialBalance) === 400,
+    `Restoring the deleted $1,300 card payment pays $1,200 from the fund again: Checking ends where it was before the delete ` +
+      `(got Checking ${s61C0} -> ${s61C1}, fund ${s61Goal.initialBalance}, due ${s61Goal.dueDate}, card ${s61Card.initialBalance})`
+  );
+  // Deleting it again still puts the money back (the redo was recorded like the first payment)
+  await s33("DELETE", `/api/expenses/${s61Pay.body.paymentId}`);
+  await s61Goal.reload();
+  assert(
+    parseFloat(s61Goal.initialBalance) === 1200 && s61Goal.dueDate === s61Charge.date && (await s61Moved(s61Goal.id)) === 0,
+    `Deleting the restored payment puts the $1,200 back again (got ${s61Goal.initialBalance}, due ${s61Goal.dueDate})`
+  );
+
+  // A Checking bill paid from its fund: delete, then restore
+  const s61Bill = await Transaction.create({
+    title: "Suite61 Home insurance", amount: 400, date: getTorontoOffsetDate(-2), type: "EXPENSE", category: "Insurance",
+    isCleared: false, recurrence: "yearly", fromAccountId: s61Checking.id,
+  });
+  const s61HomeGoal = await Account.create({
+    name: "Suite61 Home Fund", type: "SAVINGS_GOAL", initialBalance: 400, targetAmount: 400, dueDate: s61Bill.date,
+    linkedRecurringGroupId: s61Bill.recurringGroupId, isActive: true,
+  });
+  await s33("PUT", `/api/expenses/${s61Bill.id}`, { is_paid: true, payFromGoalId: s61HomeGoal.id });
+  await s61HomeGoal.reload();
+  const s61HomeDue = s61HomeGoal.dueDate;
+  const s61H0 = await s61CheckingBal();
+  await s33("DELETE", `/api/expenses/${s61Bill.id}`);
+  await s61Restore(s61Bill.id);
+  const s61H1 = await s61CheckingBal();
+  await s61HomeGoal.reload();
+  assert(
+    Math.abs(s61H1 - s61H0) < 0.005 && parseFloat(s61HomeGoal.initialBalance) === 0 && s61HomeGoal.dueDate === s61HomeDue &&
+      s61HomeDue !== s61Bill.date && (await s61Moved(s61HomeGoal.id)) === 1,
+    `Restoring a bill paid from its fund pays it from the fund again and rolls the goal over ` +
+      `(got Checking ${s61H0} -> ${s61H1}, fund ${s61HomeGoal.initialBalance}, due ${s61HomeGoal.dueDate})`
+  );
+
+  // The goal was archived while the bill was in the Trash: restoring pays from Checking, and the fund is left alone
+  await s33("DELETE", `/api/expenses/${s61Bill.id}`);
+  await s61HomeGoal.reload();
+  await s61HomeGoal.update({ isActive: false });
+  const s61A0 = await s61CheckingBal();
+  await s61Restore(s61Bill.id);
+  const s61A1 = await s61CheckingBal();
+  await s61HomeGoal.reload();
+  assert(
+    Math.abs(s61A0 - s61A1 - 400) < 0.005 && parseFloat(s61HomeGoal.initialBalance) === 400 && (await s61Moved(s61HomeGoal.id)) === 0 &&
+      (await Setting.count({ where: { key: `fund_undone:${s61Bill.id}` } })) === 0,
+    `Restoring after its goal was archived: Checking pays the $400 and the archived fund keeps its money ` +
+      `(got Checking ${s61A0} -> ${s61A1}, fund ${s61HomeGoal.initialBalance})`
+  );
+
+  await s61Checking.reload();
+  await s61Checking.update({ initialBalance: parseFloat(s61Checking.initialBalance) - 100000 });
+  const s61GoalIds = [s61Goal.id, s61HomeGoal.id];
+  await Transaction.destroy({
+    where: {
+      [Op.or]: [
+        { title: { [Op.like]: "Suite61 %" } },
+        { fromAccountId: { [Op.in]: [...s61GoalIds, s61Card.id] } },
+        { toAccountId: s61Card.id },
+      ],
+    },
+    force: true,
+  });
+  await Account.destroy({ where: { id: { [Op.in]: [...s61GoalIds, s61Card.id] } } });
+  await Setting.destroy({
+    where: { key: { [Op.or]: [{ [Op.like]: "fund_paid:%" }, { [Op.like]: "fund_paid_by:%" }, { [Op.like]: "fund_undone:%" }] } },
+  });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

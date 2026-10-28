@@ -1,6 +1,6 @@
 const { Op } = require("sequelize");
 const { Transaction, Account } = require("../models");
-const { adjustAccountForTransaction } = require("./accountBalanceService");
+const { adjustAccountForTransaction, getTodayString } = require("./accountBalanceService");
 const {
   snapshotArchivedBalances,
   assertArchivedBalancesUnchanged,
@@ -21,15 +21,12 @@ const round2 = (n) => Math.round(n * 100) / 100;
 // A row on an archived account whose balance would change is refused with 409 (the caller rolls back).
 const softDeleteTransactions = async (rows, dbTx) => {
   // Loaded here: sinkingFundService loads the recurring routes, which load this service
-  const { reverseFundPayment, reverseCardFundPayments } = require("./sinkingFundService");
+  const { undoFundPaymentsOnDelete } = require("./sinkingFundService");
   const archivedBefore = await snapshotArchivedBalances(dbTx);
   for (const trx of rows) {
     // A paid bill (or card payment) a fund paid for: the fund gets its money back and its goal returns
-    // to the charge, as when it is un-marked
-    if (trx.isCleared) {
-      await reverseFundPayment(trx.id, dbTx);
-      await reverseCardFundPayments(trx.id, dbTx);
-    }
+    // to the charge, as when it is un-marked. Restoring the row pays from the fund again.
+    if (trx.isCleared) await undoFundPaymentsOnDelete(trx, dbTx);
     const wasApplied = Boolean(trx.balanceApplied);
     await adjustAccountForTransaction(trx, -1, dbTx);
     trx.balanceReversedOnDelete = wasApplied;
@@ -78,6 +75,8 @@ const refusalMessage = (trx, plan) =>
 // could be restored because of that.
 // Returns { restored, moved: [{ id, title, archivedAccount }], refused: [{ id, title, archivedAccount, message }] }.
 const restoreTransactions = async (ids, dbTx) => {
+  const { redoFundPaymentsOnRestore } = require("./sinkingFundService");
+  const todayStr = getTodayString();
   const rows = await Transaction.findAll({
     where: { id: { [Op.in]: ids }, deletedAt: { [Op.ne]: null } },
     include: [
@@ -114,6 +113,8 @@ const restoreTransactions = async (ids, dbTx) => {
       // forceApply: the row was applied before its delete, whatever its date
       await adjustAccountForTransaction(trx, 1, dbTx, true);
     }
+    // After the row's own balance, so a card payment's bill window and the fund amounts are as before
+    if (plan.action === "restore") await redoFundPaymentsOnRestore(trx, todayStr, dbTx);
     trx.balanceReversedOnDelete = false;
     await trx.save({ fields: ["balanceReversedOnDelete"], transaction: dbTx });
     restored.push(trx);
@@ -222,6 +223,8 @@ const purgeDeletedTransactions = async ({ now = new Date(), dbTx = null } = {}) 
     .filter((t) => !isSeriesPlaceholder(t, liveByGroup))
     .map((t) => t.id);
   if (purgeIds.length === 0) return 0;
+  const { forgetUndoneFundPayments } = require("./sinkingFundService");
+  await forgetUndoneFundPayments(purgeIds, dbTx);
   return Transaction.destroy({
     where: { id: { [Op.in]: purgeIds }, deletedAt: { [Op.ne]: null } },
     force: true,

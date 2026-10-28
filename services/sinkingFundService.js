@@ -656,6 +656,60 @@ const reverseCardFundPayments = async (paymentId, dbTx = null) => {
   return round2(amount);
 };
 
+// A deleted row whose fund payment was undone: Setting fund_undone:<trxId> says what to redo if the row
+// is restored from the Trash. { goalId } for a bill paid from Checking, { fundBills } for a card payment.
+const FUND_UNDONE_PREFIX = "fund_undone:";
+
+/**
+ * Deleting a paid bill or card payment: undoes what its funds did (as un-marking it does) and records it,
+ * so restoring the row from the Trash pays from the same funds again (redoFundPaymentsOnRestore).
+ */
+const undoFundPaymentsOnDelete = async (trx, dbTx = null) => {
+  const billRecord = await readJson(`${FUND_PAID_PREFIX}${trx.id}`, dbTx);
+  const paidBills = await readJson(`${FUND_PAID_BY_PREFIX}${trx.id}`, dbTx);
+  let undone = null;
+  if (billRecord && !billRecord.paymentId) {
+    undone = { goalId: billRecord.transferId ? billRecord.goalId : null };
+  }
+  if (Array.isArray(paidBills) && paidBills.length > 0) {
+    const records = await Promise.all(paidBills.map((billId) => readJson(`${FUND_PAID_PREFIX}${billId}`, dbTx)));
+    undone = { fundBills: paidBills.map((billId, i) => ({ billId, useFund: Boolean(records[i]?.transferId) })) };
+  }
+  await reverseFundPayment(trx.id, dbTx);
+  await reverseCardFundPayments(trx.id, dbTx);
+  if (undone) await writeJson(`${FUND_UNDONE_PREFIX}${trx.id}`, undone, dbTx);
+};
+
+/**
+ * A row restored from the Trash, paid again: its funds pay again, as when it was deleted. A goal that
+ * was archived or unlinked since, or a card bill another payment's fund has paid since, is skipped (the
+ * bill is then paid from Checking or the card, as without a fund). Fund money is what the goal holds now.
+ */
+const redoFundPaymentsOnRestore = async (trx, todayStr, dbTx = null) => {
+  const key = `${FUND_UNDONE_PREFIX}${trx.id}`;
+  const undone = await readJson(key, dbTx);
+  await Setting.destroy({ where: { key }, transaction: dbTx });
+  if (!undone || !trx.isCleared) return;
+  if (Array.isArray(undone.fundBills)) {
+    const card = trx.toAccountId ? await Account.findByPk(trx.toAccountId, { transaction: dbTx }) : null;
+    if (!card || card.type !== "CREDIT_CARD" || card.isActive === false) return;
+    const offered = new Set((await getCardFundBills(card, todayStr, dbTx, trx.id)).map((b) => b.billId));
+    await settleCardFundBills(card, trx, undone.fundBills.filter((fb) => offered.has(fb.billId)), todayStr, dbTx);
+    return;
+  }
+  let payFromGoalId = null;
+  if (undone.goalId) {
+    const goal = await Account.findByPk(undone.goalId, { transaction: dbTx });
+    const stillSaving = goal && goal.isActive !== false && goal.linkedRecurringGroupId === trx.recurringGroupId;
+    if (stillSaving) payFromGoalId = goal.id;
+  }
+  await payLinkedBill(trx, { payFromGoalId }, todayStr, dbTx);
+};
+
+// Purged rows can't be restored, so what their delete undid is forgotten
+const forgetUndoneFundPayments = (ids, dbTx = null) =>
+  Setting.destroy({ where: { key: { [Op.in]: ids.map((id) => `${FUND_UNDONE_PREFIX}${id}`) } }, transaction: dbTx });
+
 module.exports = {
   computeSinkingFund,
   getLinkedBill,
@@ -671,4 +725,7 @@ module.exports = {
   settleCardFundBillsByDefault,
   reverseFundPayment,
   reverseCardFundPayments,
+  undoFundPaymentsOnDelete,
+  redoFundPaymentsOnRestore,
+  forgetUndoneFundPayments,
 };
