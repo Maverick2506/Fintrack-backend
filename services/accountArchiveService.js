@@ -5,6 +5,7 @@ const {
   getTodayString,
 } = require("./accountBalanceService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
+const { setBalanceAnchor } = require("./balanceAnchorService");
 const { endSeries, seriesOf } = require("./seriesService");
 const { HttpError } = require("../middleware/errorHandler");
 const {
@@ -302,6 +303,8 @@ const adjustBalanceToZero = async (account, reason, dbTx) => {
     { transaction: dbTx }
   );
   await adjustAccountForTransaction(trx, 1, dbTx);
+  // The balance is now set to $0 as of today
+  await setBalanceAnchor(account.id, trx.date, dbTx);
   return trx;
 };
 

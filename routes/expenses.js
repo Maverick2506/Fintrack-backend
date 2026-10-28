@@ -14,6 +14,7 @@ const {
 } = require("./recurring");
 const { endSeries, findSeriesRows, findCurrentOccurrence, seriesOf } = require("../services/seriesService");
 const { isClientRefConflict } = require("../services/clientRefService");
+const { loadRules, applyRules } = require("../services/ruleService");
 const {
   snapshotArchivedBalances,
   assertArchivedBalancesUnchanged,
@@ -225,6 +226,8 @@ router.get(
       baseAmount:
         t.baseAmount !== null && t.baseAmount !== undefined ? parseFloat(t.baseAmount) : null,
       taxApplied: Boolean(t.taxApplied),
+      // Imported from a bank CSV and not yet confirmed in the "Review new" inbox
+      needsReview: Boolean(t.needsReview),
       creditCardId:
         t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
           ? t.fromAccount.id
@@ -264,7 +267,19 @@ router.post(
 
       const todayStr = getTodayString();
       const expenseDate = due_date || todayStr;
-      const finalCategory = category || "Other";
+
+      // Rules fill in what the client left out: the category, and the card when no account was sent
+      const accountSent =
+        creditCardId !== undefined || targetAccountId !== undefined || toAccountId !== undefined;
+      const ruled = !category || !accountSent ? applyRules(await loadRules(dbTx), name) : {};
+      const finalCategory = category || ruled.category || "Other";
+      let ruleCardId = null;
+      if (!accountSent && ruled.accountId) {
+        const ruleAccount = await Account.findByPk(ruled.accountId, { transaction: dbTx });
+        if (ruleAccount && ruleAccount.type === "CREDIT_CARD" && ruleAccount.isActive !== false) {
+          ruleCardId = ruleAccount.id;
+        }
+      }
 
       let [fromAccount] = await Account.findOrCreate({
         where: { name: "Primary Checking" },
@@ -295,8 +310,9 @@ router.post(
         });
       }
 
-      if (creditCardId && !resolvedToAccountId) {
-        const cardAccount = await Account.findByPk(creditCardId, {
+      const cardId = creditCardId || ruleCardId;
+      if (cardId && !resolvedToAccountId) {
+        const cardAccount = await Account.findByPk(cardId, {
           transaction: dbTx,
         });
         if (cardAccount) fromAccount = cardAccount;
@@ -434,7 +450,10 @@ router.put(
       const fromDebt =
         trx.fromAccountId &&
         (await Account.findByPk(trx.fromAccountId, { transaction: dbTx }))?.type === "DEBT";
-      if (req.body.creditCardId !== undefined && !(fromDebt && !req.body.creditCardId)) {
+      // A row with no from-account (a card payment or refund from a card statement import, a statement-sync
+      // Adjustment) keeps none too: an empty card in the form means "not a card", not "from Checking".
+      const keepFrom = fromDebt || !trx.fromAccountId;
+      if (req.body.creditCardId !== undefined && !(keepFrom && !req.body.creditCardId)) {
         if (req.body.creditCardId) {
           fromAccountId = req.body.creditCardId;
         } else {
@@ -584,6 +603,12 @@ router.put(
             : parseFloat(trx.amount);
         nextBaseAmount = null;
         nextTaxApplied = false;
+      }
+
+      // A refund is negative spending (bank import): the form edits its size, and it stays negative
+      // while it is still an expense
+      if (parseFloat(trx.amount) < 0) {
+        nextAmount = nextType === "EXPENSE" ? -Math.abs(nextAmount) : Math.abs(nextAmount);
       }
 
       const nextRecurrence =

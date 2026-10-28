@@ -171,8 +171,63 @@ const adjustAccountForTransaction = async (
   }
 };
 
+// How much one cleared row moves Checking's balance, which is computed from its rows
+// (the same sums as checkingService.getCheckingActivity)
+const checkingEffect = (trx, checkingId) => {
+  const amount = parseFloat(trx.amount) || 0;
+  if (!trx.isCleared || !checkingId) return 0;
+  if (trx.type === "INCOME") return trx.toAccountId === checkingId || !trx.toAccountId ? amount : 0;
+  let effect = 0;
+  if ((trx.type === "EXPENSE" || trx.type === "TRANSFER") && trx.fromAccountId === checkingId) effect -= amount;
+  if (trx.type === "TRANSFER" && trx.toAccountId === checkingId) effect += amount;
+  return effect;
+};
+
+// Records a cleared imported row against balances one side at a time. A row can touch two accounts
+// (a card payment leaves Checking and reaches the card), and each side is history when its own
+// account's balance was set or synced on or after the row's date (balanceAnchorService):
+// - the stored side (card, debt, savings goal) is applied through adjustAccountForTransaction, or,
+//   when it's history, only marked applied so editing or deleting the row later works like any other;
+// - Checking is computed from its rows, so when its side is history its opening balance takes the
+//   opposite of what the row adds. previousCheckingEffect is the row's Checking effect before this
+//   change (a card payment the card statement recorded, that now comes out of Checking).
+// A row already marked applied (the other statement recorded it) keeps its stored side as it is.
+const applyImportedRow = async (
+  trx,
+  checkingId,
+  { checkingHistory = false, storedHistory = false } = {},
+  dbTx = null,
+  previousCheckingEffect = 0
+) => {
+  if (!trx.isCleared) return;
+  if (!trx.balanceApplied) {
+    if (!storedHistory) await adjustAccountForTransaction(trx, 1, dbTx, true);
+    if ((storedHistory || checkingHistory) && !trx.balanceApplied) {
+      trx.balanceApplied = true;
+      await trx.save({ fields: ["balanceApplied"], transaction: dbTx });
+    }
+  }
+  if (checkingHistory) {
+    await offsetCheckingHistory(checkingId, checkingEffect(trx, checkingId) - previousCheckingEffect, dbTx);
+  }
+};
+
+// Checking's balance is computed from its rows: when a row its balance already includes (history)
+// moves Checking by `change`, the opening balance takes the opposite so the balance stays put
+const offsetCheckingHistory = async (checkingId, change, dbTx = null) => {
+  if (!change) return;
+  await Account.increment("initialBalance", {
+    by: -change,
+    where: { id: checkingId },
+    transaction: dbTx,
+  });
+};
+
 module.exports = {
   adjustAccountForTransaction,
+  checkingEffect,
+  applyImportedRow,
+  offsetCheckingHistory,
   getTodayString,
   TIMEZONE,
 };

@@ -57,6 +57,39 @@ const optionalDate = z.preprocess(
   z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").nullable().optional()
 );
 
+const { EXPENSE_CATEGORIES } = require("../constants/categories");
+const { DATE_FORMATS, MAX_IMPORT_ROWS } = require("../utils/csvImport");
+
+const ruleCategory = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.enum(EXPENSE_CATEGORIES, { message: "Pick one of the expense categories" }).nullable().optional()
+);
+
+const columnIndex = z.coerce.number().int().min(0).max(49);
+
+// How the columns of a bank CSV map to a transaction. Either one signed amount column (outflow says
+// whether money out is negative, the usual, or positive) or separate debit and credit columns.
+const importMapping = z
+  .object({
+    hasHeader: z.boolean(),
+    date: columnIndex,
+    description: z.preprocess(
+      (v) => (Array.isArray(v) ? v : [v]),
+      z.array(columnIndex).min(1).max(3)
+    ),
+    amount: columnIndex.nullable().optional(),
+    debit: columnIndex.nullable().optional(),
+    credit: columnIndex.nullable().optional(),
+    dateFormat: z.enum(DATE_FORMATS),
+    outflow: z.enum(["negative", "positive"]).optional().default("negative"),
+  })
+  .refine(
+    (m) =>
+      (m.amount !== undefined && m.amount !== null) ||
+      (m.debit !== undefined && m.debit !== null && m.credit !== undefined && m.credit !== null),
+    { message: "Map an amount column, or both a debit and a credit column", path: ["amount"] }
+  );
+
 const schemas = {
   createExpense: z.object({
     name: z.string().trim().min(1, "Name is required").max(255),
@@ -337,6 +370,66 @@ const schemas = {
     month: z.coerce.number().int().min(1).max(12),
     sortBy: z.string().optional(),
     sortOrder: z.string().optional(),
+  }),
+
+  createRule: z
+    .object({
+      match: z.string().trim().min(1, "Enter the text to match").max(100),
+      category: ruleCategory,
+      accountId: optionalAccountId,
+      priority: z.coerce.number().int().min(0).max(10000).optional().default(100),
+    })
+    .refine((r) => r.category || r.accountId, {
+      message: "A rule needs a category, an account, or both",
+      path: ["category"],
+    }),
+
+  updateRule: z.object({
+    match: z.string().trim().min(1, "Enter the text to match").max(100).optional(),
+    category: ruleCategory,
+    accountId: optionalAccountId,
+    priority: z.coerce.number().int().min(0).max(10000).optional(),
+  }),
+
+  // POST /import/preview sends these as multipart fields, so mapping arrives as a JSON string
+  importPreview: z.object({
+    accountId: z.string().uuid("Pick an account"),
+    mapping: z
+      .preprocess((v) => {
+        if (v === undefined || v === "") return undefined;
+        if (typeof v !== "string") return v;
+        try {
+          return JSON.parse(v);
+        } catch {
+          return v;
+        }
+      }, importMapping.optional()),
+  }),
+
+  importCommit: z.object({
+    accountId: z.string().uuid("Pick an account"),
+    mapping: importMapping.optional(),
+    rows: z
+      .array(
+        z.object({
+          date: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)"),
+          description: z.string().trim().min(1).max(255),
+          amount: z.coerce.number().positive().max(10000000),
+          direction: z.enum(["out", "in"]),
+          occurrence: z.coerce.number().int().min(1).max(MAX_IMPORT_ROWS).optional().default(1),
+          category: z.string().trim().max(100).nullable().optional(),
+          matchId: z.string().uuid().nullable().optional(),
+          // "Same" on a possible match: the app row this bank row is
+          linkId: z.string().uuid().nullable().optional(),
+          skip: z.boolean().optional().default(false),
+        })
+      )
+      .min(1, "Nothing to import")
+      .max(MAX_IMPORT_ROWS),
+  }),
+
+  confirmReview: z.object({
+    ids: z.array(z.string().uuid("Invalid transaction id")).min(1, "No transaction IDs provided.").max(MAX_IMPORT_ROWS),
   }),
 
   financialAdvice: z.object({
