@@ -30,6 +30,28 @@ const checkLinkedBill = async (recurringGroupId) => {
   return null;
 };
 
+// "Saving for" a one-time bill (an unpaid expense row): the row gets a series id of its own, so the
+// goal links to it like any bill. Returns { recurringGroupId } or { error }.
+const linkOneOffBill = async (billId) => {
+  const row = await Transaction.findByPk(billId);
+  if (!row || row.type !== "EXPENSE") return { error: "That bill was not found." };
+  if (row.isCleared) return { error: "That bill is already paid." };
+  if (!row.recurringGroupId) await row.update({ recurringGroupId: crypto.randomUUID() });
+  return { recurringGroupId: row.recurringGroupId };
+};
+
+// Resolves the bill a create or update links: linkedBillId (a one-time bill) wins over
+// linkedRecurringGroupId (a series). Returns { linked } (undefined = unchanged) or { error }.
+const resolveLinkedBill = async (body) => {
+  if (body.linkedBillId) {
+    const { recurringGroupId, error } = await linkOneOffBill(body.linkedBillId);
+    return error ? { error } : { linked: recurringGroupId };
+  }
+  if (body.linkedRecurringGroupId === undefined) return { linked: undefined };
+  const error = await checkLinkedBill(body.linkedRecurringGroupId);
+  return error ? { error } : { linked: body.linkedRecurringGroupId || null };
+};
+
 // Sinking fund fields for the goal card, or null for a goal with no linked bill
 const formatSinkingFund = (fund) =>
   fund
@@ -45,6 +67,10 @@ const formatSinkingFund = (fund) =>
         overdue: fund.overdue,
         monthlyTransfer: fund.monthlyTransfer,
         billInForecast: fund.billInForecast,
+        saved: fund.saved,
+        // A one-time bill (or an ended series) that was paid: the goal is Done
+        done: Boolean(fund.done),
+        paidOn: fund.paidOn || null,
       }
     : null;
 
@@ -192,6 +218,49 @@ router.get(
   })
 );
 
+// One-time bills a goal can save for: unpaid expenses, not part of a series, due from today on
+router.get(
+  "/savings-goals/one-off-bills",
+  asyncHandler(async (req, res) => {
+    const todayStr = getTodayString();
+    const rows = await Transaction.findAll({
+      where: {
+        type: "EXPENSE",
+        isCleared: false,
+        recurrence: "none",
+        date: { [Op.gte]: todayStr },
+        amount: { [Op.gt]: 0 },
+      },
+      order: [["date", "ASC"]],
+      limit: 200,
+    });
+    // A row whose series id is shared with other rows is a series occurrence, not a one-time bill
+    const groupIds = rows.map((r) => r.recurringGroupId).filter(Boolean);
+    const shared = new Set();
+    if (groupIds.length > 0) {
+      const counts = await Transaction.findAll({
+        attributes: ["recurringGroupId", [sequelize.fn("COUNT", sequelize.col("id")), "n"]],
+        where: { recurringGroupId: { [Op.in]: groupIds } },
+        group: ["recurringGroupId"],
+        raw: true,
+      });
+      for (const c of counts) if (parseInt(c.n, 10) > 1) shared.add(c.recurringGroupId);
+    }
+    res.json(
+      rows
+        .filter((r) => !r.recurringGroupId || !shared.has(r.recurringGroupId))
+        .slice(0, 50)
+        .map((r) => ({
+          id: r.id,
+          title: r.title,
+          amount: Math.round((parseFloat(r.amount) || 0) * 100) / 100,
+          date: r.date,
+          recurringGroupId: r.recurringGroupId || null,
+        }))
+    );
+  })
+);
+
 router.post(
   "/savings-goals",
   validateBody(schemas.createSavingsGoal),
@@ -220,11 +289,11 @@ router.post(
       ? new Date().getFullYear()
       : null;
 
-    const linkError = await checkLinkedBill(req.body.linkedRecurringGroupId);
-    if (linkError) return res.status(400).json({ error: linkError });
+    const link = await resolveLinkedBill(req.body);
+    if (link.error) return res.status(400).json({ error: link.error });
 
     const newGoal = await Account.create({
-      linkedRecurringGroupId: req.body.linkedRecurringGroupId || null,
+      linkedRecurringGroupId: link.linked || null,
       name: req.body.name,
       type: "SAVINGS_GOAL",
       targetAmount: parseFloat(targetAmount),
@@ -383,11 +452,9 @@ router.put(
           ? parseInt(req.body.roomYear, 10)
           : null;
       }
-      if (req.body.linkedRecurringGroupId !== undefined) {
-        const linkError = await checkLinkedBill(req.body.linkedRecurringGroupId);
-        if (linkError) return res.status(400).json({ error: linkError });
-        updates.linkedRecurringGroupId = req.body.linkedRecurringGroupId || null;
-      }
+      const link = await resolveLinkedBill(req.body);
+      if (link.error) return res.status(400).json({ error: link.error });
+      if (link.linked !== undefined) updates.linkedRecurringGroupId = link.linked;
 
       await goal.update(updates);
       res.json({
@@ -425,6 +492,8 @@ router.post(
       const fund = (await getSinkingFunds(todayStr, dbTx, [goal])).get(goal.id);
       const refusal = !fund
         ? "Link a bill to this goal first."
+        : fund.done
+        ? "This bill is paid, so the goal is done."
         : fund.monthlyTransfer
         ? "This goal already has a monthly transfer."
         : !fund.monthly

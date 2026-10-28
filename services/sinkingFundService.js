@@ -1,5 +1,7 @@
 const { Op } = require("sequelize");
 const { Account, Transaction } = require("../models");
+const { HttpError } = require("../middleware/errorHandler");
+const { adjustAccountForTransaction } = require("./accountBalanceService");
 const {
   getNextOccurrenceDate,
   getSeriesTemplate,
@@ -73,7 +75,22 @@ const getLinkedBill = (rowsNewestFirst, todayStr) => {
     recurringGroupId: newest.recurringGroupId,
     title: (series ? series.template : newest).title,
   };
-  if (!series) return { ...base, ended: true, recurrence: "none", amount: null, nextDate: null };
+  if (!series) {
+    // A one-off bill (or a series that was ended): its next charge is its earliest unpaid row, if any
+    const unpaid = rowsNewestFirst
+      .filter((r) => !r.isCleared)
+      .sort((a, b) => a.date.localeCompare(b.date))[0];
+    return {
+      ...base,
+      title: (unpaid || newest).title,
+      ended: !unpaid,
+      oneOff: true,
+      recurrence: "none",
+      amount: unpaid ? round2(parseFloat(unpaid.amount) || 0) : null,
+      nextDate: unpaid ? unpaid.date : null,
+      fromChecking: unpaid ? !unpaid.fromAccount || unpaid.fromAccount.type === "CHECKING" : false,
+    };
+  }
 
   const { template, newestDate, anchorDay } = series;
   const unpaid = rowsNewestFirst
@@ -95,6 +112,7 @@ const getLinkedBill = (rowsNewestFirst, todayStr) => {
   return {
     ...base,
     ended: false,
+    oneOff: false,
     recurrence: template.recurrence,
     amount: round2(amount || 0),
     nextDate,
@@ -142,15 +160,17 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
     }),
   ]);
 
+  const billRowsBySeries = new Map();
+  for (const r of billRows) {
+    if (!billRowsBySeries.has(r.recurringGroupId)) billRowsBySeries.set(r.recurringGroupId, []);
+    billRowsBySeries.get(r.recurringGroupId).push(r);
+  }
   const monthStart = `${todayStr.slice(0, 7)}-01`;
   const monthEnd = `${todayStr.slice(0, 7)}-31`;
   const goalSeries = groupSeries(goalRows.filter((r) => r.recurringGroupId || ACTIVE_RECURRENCES.includes(r.recurrence)));
 
   for (const goal of linkedGoals) {
-    const bill = getLinkedBill(
-      billRows.filter((r) => r.recurringGroupId === goal.linkedRecurringGroupId),
-      todayStr
-    );
+    const bill = getLinkedBill(billRowsBySeries.get(goal.linkedRecurringGroupId) || [], todayStr);
     const ownTarget = parseFloat(goal.targetAmount) || 0;
     const target = ownTarget > 0 ? ownTarget : bill?.amount || 0;
     const dueDate = goal.dueDate || bill?.nextDate || null;
@@ -172,6 +192,31 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
       .filter((r) => r.toAccountId === goal.id && !r.isCleared && r.date >= monthStart)
       .sort((a, b) => a.date.localeCompare(b.date));
 
+    // A bill that ends with its last payment (a one-off, or a series that was ended) and has been paid:
+    // the fund is done. A recurring bill rolls the fund on to its next charge instead (paySinkingFundBill).
+    const seriesRows = billRowsBySeries.get(goal.linkedRecurringGroupId) || [];
+    const lastPaid = seriesRows.find((r) => r.isCleared);
+    const done = Boolean(bill && lastPaid && (bill.ended || !bill.nextDate) && !seriesRows.some((r) => !r.isCleared));
+    if (done) {
+      result.set(goal.id, {
+        name: goal.name,
+        linkedBill: bill,
+        saved: round2(parseFloat(goal.initialBalance) || 0),
+        target,
+        dueDate: goal.dueDate || lastPaid.date,
+        remaining: 0,
+        monthly: 0,
+        dates: [],
+        ready: false,
+        overdue: false,
+        done: true,
+        paidOn: lastPaid.date,
+        billInForecast: false,
+        monthlyTransfer: null,
+      });
+      continue;
+    }
+
     const fund = computeSinkingFund({
       current: (parseFloat(goal.initialBalance) || 0) + scheduledThisMonth,
       target,
@@ -182,6 +227,9 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
     result.set(goal.id, {
       name: goal.name,
       linkedBill: bill,
+      saved: round2(parseFloat(goal.initialBalance) || 0),
+      done: false,
+      paidOn: null,
       ...(fund || { target, dueDate, remaining: null, monthly: null, dates: [], ready: false, overdue: false }),
       // The bill's next charge is already in Safe to Spend's window, so nothing more is set aside for it
       billInForecast: Boolean(
@@ -210,4 +258,100 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
   return result;
 };
 
-module.exports = { computeSinkingFund, getLinkedBill, getSinkingFunds };
+const loadBill = async (recurringGroupId, todayStr, dbTx = null) =>
+  getLinkedBill(
+    await Transaction.findAll({
+      where: { recurringGroupId },
+      include: [{ model: Account, as: "fromAccount" }],
+      order: [["date", "DESC"], ["createdAt", "DESC"]],
+      transaction: dbTx,
+    }),
+    todayStr
+  );
+
+/**
+ * After a linked bill is paid, each goal saving for a recurring bill rolls over to its next charge:
+ * a goal's own due date becomes the bill's next date and its own target the next bill's amount (a
+ * goal without its own keeps following the bill). What is left in the goal stays; the monthly amount
+ * is worked out again from it. A bill with no next charge leaves the goal Done (getSinkingFunds).
+ * Returns [{ goalId, dueDate, targetAmount }] for the goals that rolled over.
+ */
+const rollOverLinkedFunds = async (recurringGroupId, todayStr, dbTx = null) => {
+  if (!recurringGroupId) return [];
+  const goals = await Account.findAll({
+    where: { type: "SAVINGS_GOAL", isActive: { [Op.ne]: false }, linkedRecurringGroupId: recurringGroupId },
+    transaction: dbTx,
+  });
+  if (goals.length === 0) return [];
+  const bill = await loadBill(recurringGroupId, todayStr, dbTx);
+  if (!bill || bill.ended || bill.oneOff || !bill.nextDate) return [];
+  const rolled = [];
+  for (const goal of goals) {
+    const updates = {};
+    if (goal.dueDate) updates.dueDate = bill.nextDate;
+    if (parseFloat(goal.targetAmount) > 0) updates.targetAmount = bill.amount;
+    if (Object.keys(updates).length > 0) await goal.update(updates, { transaction: dbTx });
+    rolled.push({ goalId: goal.id, dueDate: bill.nextDate, targetAmount: bill.amount });
+  }
+  return rolled;
+};
+
+/**
+ * A bill linked to a sinking fund was just marked paid. With payFromGoalId (the "Pay from <fund>"
+ * box), the fund pays what it can: one cleared TRANSFER fund -> Checking for min(saved, bill),
+ * dated with the bill, so Checking ends where it was when the fund covers the bill; any shortfall is
+ * paid by Checking. Then the funds roll over (rollOverLinkedFunds).
+ * Returns { paidFromFund: { goalId, goalName, amount, shortfall, transferId } | null, rolledOver }.
+ */
+const payLinkedBill = async (bill, { payFromGoalId = null } = {}, todayStr, dbTx = null) => {
+  let paidFromFund = null;
+  if (payFromGoalId) {
+    const goal = await Account.findByPk(payFromGoalId, { transaction: dbTx });
+    if (
+      !goal ||
+      goal.type !== "SAVINGS_GOAL" ||
+      goal.isActive === false ||
+      !bill.recurringGroupId ||
+      goal.linkedRecurringGroupId !== bill.recurringGroupId
+    ) {
+      throw new HttpError(400, "That goal isn't saving for this bill.");
+    }
+    const billAmount = round2(parseFloat(bill.amount) || 0);
+    const amount = round2(Math.max(0, Math.min(parseFloat(goal.initialBalance) || 0, billAmount)));
+    let transfer = null;
+    if (amount > 0) {
+      const [checking] = await Account.findOrCreate({
+        where: { name: "Primary Checking" },
+        defaults: { type: "CHECKING", initialBalance: 0.0 },
+        transaction: dbTx,
+      });
+      transfer = await Transaction.create(
+        {
+          title: `${bill.title} paid from ${goal.name}`,
+          amount,
+          date: bill.date,
+          type: "TRANSFER",
+          category: "Savings Transfer",
+          isCleared: true,
+          balanceApplied: false,
+          recurrence: "none",
+          fromAccountId: goal.id,
+          toAccountId: checking.id,
+        },
+        { transaction: dbTx }
+      );
+      await adjustAccountForTransaction(transfer, 1, dbTx, true);
+    }
+    paidFromFund = {
+      goalId: goal.id,
+      goalName: goal.name,
+      amount,
+      shortfall: round2(billAmount - amount),
+      transferId: transfer ? transfer.id : null,
+    };
+  }
+  const rolledOver = await rollOverLinkedFunds(bill.recurringGroupId, todayStr, dbTx);
+  return { paidFromFund, rolledOver };
+};
+
+module.exports = { computeSinkingFund, getLinkedBill, getSinkingFunds, rollOverLinkedFunds, payLinkedBill };

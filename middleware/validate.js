@@ -145,6 +145,8 @@ const schemas = {
     taxApplied: z.boolean().optional(),
     recurringGroupId: z.string().uuid().nullable().optional(),
     clientRef: z.string().uuid().nullable().optional(),
+    // "Pay from <fund>" when marking a bill paid: the savings goal saving for this bill
+    payFromGoalId: z.string().uuid().nullable().optional(),
   }),
 
   createPaycheque: z.object({
@@ -169,6 +171,12 @@ const schemas = {
     initialBalance: z.coerce.number().optional(),
     dueDate: optionalDate,
     statementDay: optionalStatementDay,
+  }),
+
+  // POST /credit-cards/:id/scheduled-payment: "Pay statement balance" / "Pay full balance"
+  setScheduledCardPayment: z.object({
+    transactionId: z.string().uuid(),
+    pay: z.enum(["statement", "full"]),
   }),
 
   updateCreditCard: z.object({
@@ -236,6 +244,8 @@ const schemas = {
     contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
     linkedRecurringGroupId: optionalSeriesId,
+    // A one-time bill to save for (a transaction id); it becomes the goal's linked bill
+    linkedBillId: z.string().uuid().optional(),
   }),
 
   updateSavingsGoal: z.object({
@@ -254,6 +264,8 @@ const schemas = {
     contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
     linkedRecurringGroupId: optionalSeriesId,
+    // A one-time bill to save for (a transaction id); it becomes the goal's linked bill
+    linkedBillId: z.string().uuid().optional(),
   }),
 
   // DELETE /credit-cards|debts|savings-goals/:id. An empty body archives and ends the account's series.

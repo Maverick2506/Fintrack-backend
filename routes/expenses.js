@@ -14,6 +14,7 @@ const {
 } = require("./recurring");
 const { endSeries, findSeriesRows, findCurrentOccurrence, seriesOf } = require("../services/seriesService");
 const { isClientRefConflict } = require("../services/clientRefService");
+const { payLinkedBill } = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
 const {
   snapshotArchivedBalances,
@@ -732,9 +733,25 @@ router.put(
         dbTx,
         wasBalanceApplied || (!wasCleared && nextIsCleared)
       );
+
+      // A bill a savings goal saves for, just marked paid: pay it from the goal when asked
+      // ("Pay from <fund>"), then roll recurring funds on to the next charge
+      let sinkingFund = null;
+      const billJustPaid = !wasCleared && nextIsCleared && trx.type === "EXPENSE";
+      if (req.body.payFromGoalId && !billJustPaid) {
+        throw new HttpError(400, "A savings goal can only pay a bill as it is marked paid.");
+      }
+      if (billJustPaid && trx.recurringGroupId) {
+        sinkingFund = await payLinkedBill(
+          trx,
+          { payFromGoalId: req.body.payFromGoalId || null },
+          getTodayString(),
+          dbTx
+        );
+      }
       await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
 
-      updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount, removedUpcomingTotal };
+      updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount, removedUpcomingTotal, sinkingFund };
       if (dryRun) {
         await dbTx.rollback();
         return res.json({ ...updated, dryRun: true });

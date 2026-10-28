@@ -41,6 +41,87 @@ const getStatementDueDate = (statementDate, dueDay) => {
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
+// Charges not on the card's balance yet (unpaid rows from the card: scheduled purchases, pending
+// charges) dated on or before dateStr. Refunds count negative.
+const getPendingCardCharges = async (cardId, dateStr, dbTx = null) => {
+  const sum = await Transaction.sum("amount", {
+    where: {
+      fromAccountId: cardId,
+      toAccountId: null,
+      type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
+      isCleared: false,
+      date: { [Op.lte]: dateStr },
+    },
+    transaction: dbTx,
+  });
+  return round2(parseFloat(sum) || 0);
+};
+
+/**
+ * The card's full balance projected for dateStr: today's balance, plus unpaid charges dated by then,
+ * minus other unpaid payments to the card dated before it (or the same day, entered earlier).
+ * excludeId leaves one payment out (the one being checked).
+ */
+const getProjectedCardBalance = async (card, dateStr, dbTx = null, excludeId = null) => {
+  const balance = parseFloat(card.initialBalance) || 0;
+  const charges = await getPendingCardCharges(card.id, dateStr, dbTx);
+  const payments = await Transaction.sum("amount", {
+    where: {
+      toAccountId: card.id,
+      type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
+      isCleared: false,
+      date: { [Op.lt]: dateStr },
+      ...(excludeId ? { id: { [Op.ne]: excludeId } } : {}),
+    },
+    transaction: dbTx,
+  });
+  return round2(balance + charges - (parseFloat(payments) || 0));
+};
+
+// The date a payment for this statement is checked against: its due date, today when it is overdue
+// and unpaid, or the next statement's due date once it is paid
+const getPaymentWindowEnd = (statement, todayStr) => {
+  if (!statement.dueDate) return null;
+  if (statement.dueDate >= todayStr) return statement.dueDate;
+  return statement.statementBalance > 0 ? todayStr : statement.nextDueDate;
+};
+
+/**
+ * The next unpaid payment scheduled to the card, up to the payment window's end, compared with the
+ * statement: { id, title, date, amount, recurrence, projectedBalance, toNewCharges, excess }.
+ * - toNewCharges: what the payment pays beyond the statement balance (up to the full balance)
+ * - excess: what it pays beyond the full balance projected for its date ("more than you owe")
+ * The scheduled amount is never changed here. null when nothing is scheduled.
+ */
+const getScheduledCardPayment = async (card, statement, todayStr, dbTx = null) => {
+  const windowEnd = getPaymentWindowEnd(statement, todayStr);
+  if (!windowEnd) return null;
+  const row = await Transaction.findOne({
+    where: {
+      toAccountId: card.id,
+      type: { [Op.in]: ["EXPENSE", "TRANSFER"] },
+      isCleared: false,
+      date: { [Op.lte]: windowEnd },
+    },
+    order: [["date", "ASC"], ["createdAt", "ASC"]],
+    transaction: dbTx,
+  });
+  if (!row) return null;
+  const amount = round2(parseFloat(row.amount) || 0);
+  const projectedBalance = await getProjectedCardBalance(card, row.date < todayStr ? todayStr : row.date, dbTx, row.id);
+  const owed = Math.max(0, projectedBalance);
+  return {
+    id: row.id,
+    title: row.title,
+    date: row.date,
+    amount,
+    recurrence: row.recurrence,
+    projectedBalance: round2(owed),
+    toNewCharges: round2(Math.max(0, Math.min(amount, owed) - statement.statementBalance)),
+    excess: round2(Math.max(0, amount - owed)),
+  };
+};
+
 /**
  * Splits a card's balance around its last statement date.
  * - newCharges: cleared rows that raised the card after the statement date, up to today (purchases,
@@ -73,7 +154,7 @@ const getCardStatement = async (card, todayStr, dbTx = null) => {
   const statementBalance = round2(Math.min(Math.max(0, balance), Math.max(0, balance - newCharges)));
 
   const nextStatementDate = getNextStatementDate(statementDate, statementDay);
-  return {
+  const statement = {
     statementDay,
     statementDate,
     nextStatementDate,
@@ -83,6 +164,8 @@ const getCardStatement = async (card, todayStr, dbTx = null) => {
     statementBalance,
     newCharges,
   };
+  statement.scheduledPayment = await getScheduledCardPayment(card, statement, todayStr, dbTx);
+  return statement;
 };
 
 module.exports = {
@@ -90,4 +173,8 @@ module.exports = {
   getNextStatementDate,
   getStatementDueDate,
   getCardStatement,
+  getPendingCardCharges,
+  getProjectedCardBalance,
+  getScheduledCardPayment,
+  getPaymentWindowEnd,
 };
