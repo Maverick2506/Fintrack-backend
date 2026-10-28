@@ -20,8 +20,16 @@ const round2 = (n) => Math.round(n * 100) / 100;
 // Reverses each row's balance (when it was applied) and soft-deletes it. Must run inside dbTx.
 // A row on an archived account whose balance would change is refused with 409 (the caller rolls back).
 const softDeleteTransactions = async (rows, dbTx) => {
+  // Loaded here: sinkingFundService loads the recurring routes, which load this service
+  const { reverseFundPayment, reverseCardFundPayments } = require("./sinkingFundService");
   const archivedBefore = await snapshotArchivedBalances(dbTx);
   for (const trx of rows) {
+    // A paid bill (or card payment) a fund paid for: the fund gets its money back and its goal returns
+    // to the charge, as when it is un-marked
+    if (trx.isCleared) {
+      await reverseFundPayment(trx.id, dbTx);
+      await reverseCardFundPayments(trx.id, dbTx);
+    }
     const wasApplied = Boolean(trx.balanceApplied);
     await adjustAccountForTransaction(trx, -1, dbTx);
     trx.balanceReversedOnDelete = wasApplied;

@@ -8820,8 +8820,8 @@ async function runTestSuite() {
       s58Paid.body.sinkingFund.paidFromFund.shortfall === 0 && Math.abs(s58After - s58Before) < 0.005 &&
       parseFloat(s58FullGoal.initialBalance) === 0 && s58FromFund.length === 1 &&
       s58FromFund[0].type === "TRANSFER" && s58FromFund[0].toAccountId === s58Checking.id && s58FromFund[0].isCleared &&
-      s58FromFund[0].date === s58Full.date,
-    `Paying the $600 bill from its fund moves $600 fund -> Checking in one transfer: Checking is unchanged ` +
+      s58FromFund[0].date === s58Today,
+    `Paying the $600 bill (due in 5 days) from its fund moves $600 fund -> Checking in one transfer dated today: Checking is unchanged ` +
       `(got ${s58Before} -> ${s58After}, fund ${s58FullGoal.initialBalance}, ${JSON.stringify(s58Paid.body.sinkingFund)})`
   );
   // The yearly bill rolls the fund on to next year, with a new pace
@@ -8893,7 +8893,7 @@ async function runTestSuite() {
       s58OnceBefore.sinkingFund.linkedBill.oneOff && s58OnceBefore.sinkingFund.targetAmount === 250 &&
       s58OnceBefore.sinkingFund.dueDate === s58Once.date &&
       s58OncePaid.body.sinkingFund.paidFromFund.amount === 250 && s58Done.sinkingFund.done === true &&
-      s58Done.sinkingFund.paidOn === s58Once.date && parseFloat(s58Done.current_amount) === 0 && s58DoneSetup.status === 409,
+      s58Done.sinkingFund.paidOn === s58Today && parseFloat(s58Done.current_amount) === 0 && s58DoneSetup.status === 409,
     `A one-time bill can be saved for; once paid from the fund the goal is Done ` +
       `(got ${JSON.stringify(s58Done.sinkingFund)}, setup ${s58DoneSetup.status})`
   );
@@ -9202,6 +9202,142 @@ async function runTestSuite() {
     force: true,
   });
   await Account.destroy({ where: { id: { [Op.in]: [...s59GoalIds, s59Amex.id] } } });
+  await Setting.destroy({ where: { key: { [Op.or]: [{ [Op.like]: "fund_paid:%" }, { [Op.like]: "fund_paid_by:%" }] } } });
+
+  console.log("\n--- Suite 60: Review fixes: a fund never moves more than the card payment; delete undoes a fund payment; early payment dated today ---");
+  const { runDailySweep: s60Sweep } = require("../services/dailySweepService");
+  const s60Today = getTorontoToday();
+  const s60Checking = await s45GetChecking();
+  const s60CheckingBal = async () => (await getBalancesSummary()).checking;
+  await s60Checking.update({ initialBalance: parseFloat(s60Checking.initialBalance) + 100000 });
+  // The card owes $1,700: a $1,200 insurance charge its fund saves for, and $500 of other spending
+  const s60Card = await Account.create({ name: "Suite60 Visa", type: "CREDIT_CARD", initialBalance: 1700, creditLimit: 5000, isActive: true });
+  const s60Charge = await Transaction.create({
+    title: "Suite60 Car insurance", amount: 1200, date: getTorontoOffsetDate(-1), type: "EXPENSE", category: "Insurance",
+    isCleared: true, balanceApplied: true, recurrence: "yearly", fromAccountId: s60Card.id,
+  });
+  const s60Goal = await Account.create({
+    name: "Suite60 Car Fund", type: "SAVINGS_GOAL", initialBalance: 1200, targetAmount: 1200, dueDate: s60Charge.date,
+    linkedRecurringGroupId: s60Charge.recurringGroupId, isActive: true,
+  });
+  const s60FundBills = async () => (await s33("GET", "/api/credit-cards")).body.find((c) => c.id === s60Card.id).fundBills;
+
+  // Forecast: a $100 payment can't pay the $1,200 bill, so the fund covers the later $1,200 payment
+  const s60Small = await Transaction.create({
+    title: "Suite60 small payment", amount: 100, date: getTorontoOffsetDate(3), type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, fromAccountId: s60Checking.id, toAccountId: s60Card.id,
+  });
+  const s60Big = await Transaction.create({
+    title: "Suite60 big payment", amount: 1200, date: getTorontoOffsetDate(10), type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, fromAccountId: s60Checking.id, toAccountId: s60Card.id,
+  });
+  const s60F = await s54Forecast(60);
+  const s60SmallLine = s54ItemsOn(s60F, s60Small.date).find((it) => it.title.startsWith("Suite60 small payment"));
+  const s60BigLine = s54ItemsOn(s60F, s60Big.date).find((it) => it.title.startsWith("Suite60 big payment"));
+  assert(
+    s60SmallLine?.amount === -100 && !s60SmallLine.fundCovers && s60BigLine?.amount === 0 && s60BigLine.fundCovers === 1200,
+    `The forecast puts the fund on the payment that covers the $1,200 bill, not the $100 one ` +
+      `(got ${JSON.stringify(s60SmallLine)}, ${JSON.stringify(s60BigLine)})`
+  );
+  await Transaction.destroy({ where: { id: [s60Small.id, s60Big.id] }, force: true });
+
+  // Paying $100 with the box checked moves nothing; Checking pays the $100 and the bill stays offered
+  const s60B0 = await s60CheckingBal();
+  const s60Pay100 = await s33("POST", `/api/credit-cards/${s60Card.id}/pay`, {
+    amount: 100, fundBills: [{ billId: s60Charge.id, useFund: true }],
+  });
+  const s60B1 = await s60CheckingBal();
+  await s60Goal.reload();
+  assert(
+    s60Pay100.status === 200 && s60Pay100.body.cardFunds.length === 0 && Math.abs(s60B0 - s60B1 - 100) < 0.005 &&
+      parseFloat(s60Goal.initialBalance) === 1200 && s60Goal.dueDate === s60Charge.date &&
+      (await s60FundBills()).some((b) => b.billId === s60Charge.id),
+    `A $100 payment with "Use fund" checked moves nothing from the $1,200 fund: Checking pays $100 ` +
+      `(got ${s60B0} -> ${s60B1}, fund ${s60Goal.initialBalance}, ${JSON.stringify(s60Pay100.body.cardFunds)})`
+  );
+  // The sweep clearing a $50 scheduled payment leaves the fund alone too
+  await Transaction.create({
+    title: "Suite60 sweep payment", amount: 50, date: s60Today, type: "TRANSFER", category: "Credit Card Payment",
+    isCleared: false, fromAccountId: s60Checking.id, toAccountId: s60Card.id,
+  });
+  const s60S0 = await s60CheckingBal();
+  await s60Sweep({ todayStr: s60Today });
+  const s60S1 = await s60CheckingBal();
+  await s60Goal.reload();
+  assert(
+    Math.abs(s60S0 - s60S1 - 50) < 0.005 && parseFloat(s60Goal.initialBalance) === 1200 &&
+      (await Transaction.count({ where: { fromAccountId: s60Goal.id } })) === 0,
+    `The sweep clears a $50 card payment without touching the $1,200 fund (Checking ${s60S0} -> ${s60S1}, fund ${s60Goal.initialBalance})`
+  );
+  // A payment that covers the bill uses the fund; deleting that payment puts it all back
+  const s60Pay = await s33("POST", `/api/credit-cards/${s60Card.id}/pay`, {
+    amount: 1300, fundBills: [{ billId: s60Charge.id, useFund: true }],
+  });
+  await s60Goal.reload();
+  const s60Paid = parseFloat(s60Goal.initialBalance);
+  const s60D0 = await s60CheckingBal();
+  const s60Del = await s33("DELETE", `/api/expenses/${s60Pay.body.paymentId}`);
+  const s60D1 = await s60CheckingBal();
+  await s60Goal.reload();
+  assert(
+    s60Pay.body.cardFunds?.[0]?.amount === 1200 && s60Paid === 0 && s60Del.status === 204 &&
+      Math.abs(s60D1 - s60D0 - 100) < 0.005 && parseFloat(s60Goal.initialBalance) === 1200 && s60Goal.dueDate === s60Charge.date &&
+      (await Transaction.count({ where: { fromAccountId: s60Goal.id } })) === 0 &&
+      (await s60FundBills()).some((b) => b.billId === s60Charge.id),
+    `Deleting the $1,300 card payment the fund paid $1,200 of puts $1,200 back in the fund and its due date back; Checking gets back only its own $100 ` +
+      `(got Checking ${s60D0} -> ${s60D1}, fund ${s60Goal.initialBalance}, due ${s60Goal.dueDate})`
+  );
+
+  // Deleting a Checking bill paid from its fund reverses it as well
+  const s60Bill = await Transaction.create({
+    title: "Suite60 Home insurance", amount: 400, date: getTorontoOffsetDate(-2), type: "EXPENSE", category: "Insurance",
+    isCleared: false, recurrence: "yearly", fromAccountId: s60Checking.id,
+  });
+  const s60HomeGoal = await Account.create({
+    name: "Suite60 Home Fund", type: "SAVINGS_GOAL", initialBalance: 400, targetAmount: 400, dueDate: s60Bill.date,
+    linkedRecurringGroupId: s60Bill.recurringGroupId, isActive: true,
+  });
+  await s33("PUT", `/api/expenses/${s60Bill.id}`, { is_paid: true, payFromGoalId: s60HomeGoal.id });
+  const s60HomeDel = await s33("DELETE", `/api/expenses/${s60Bill.id}`);
+  await s60HomeGoal.reload();
+  assert(
+    s60HomeDel.status === 204 && parseFloat(s60HomeGoal.initialBalance) === 400 && s60HomeGoal.dueDate === s60Bill.date &&
+      (await Transaction.count({ where: { fromAccountId: s60HomeGoal.id } })) === 0,
+    `Deleting a bill paid from its fund puts $400 back and the goal back on ${s60Bill.date} ` +
+      `(got ${s60HomeGoal.initialBalance}, due ${s60HomeGoal.dueDate})`
+  );
+
+  // A one-time bill paid early from its fund: the transfer and "paid on" are today, not the bill's date
+  const s60Repair = await Transaction.create({
+    title: "Suite60 Laptop repair", amount: 250, date: getTorontoOffsetDate(10), type: "EXPENSE", category: "Shopping",
+    isCleared: false, recurrence: "none", fromAccountId: s60Checking.id,
+  });
+  const s60RepairGoalRes = await s33("POST", "/api/savings-goals", { name: "Suite60 Repair Fund", linkedBillId: s60Repair.id });
+  const s60RepairGoal = await Account.findByPk(s60RepairGoalRes.body.id);
+  await s60RepairGoal.update({ initialBalance: 250 });
+  await s33("PUT", `/api/expenses/${s60Repair.id}`, { is_paid: true, payFromGoalId: s60RepairGoal.id });
+  const s60RepairMoved = await Transaction.findOne({ where: { fromAccountId: s60RepairGoal.id } });
+  const s60RepairFund = (await s33("GET", "/api/savings-goals")).body.find((g) => g.id === s60RepairGoal.id);
+  assert(
+    s60RepairMoved?.date === s60Today && s60RepairFund.sinkingFund?.done === true && s60RepairFund.sinkingFund.paidOn === s60Today,
+    `A bill due ${s60Repair.date} paid today from its fund: the transfer and "paid" date are today ` +
+      `(got ${s60RepairMoved?.date}, ${JSON.stringify(s60RepairFund.sinkingFund?.paidOn)})`
+  );
+
+  await s60Checking.reload();
+  await s60Checking.update({ initialBalance: parseFloat(s60Checking.initialBalance) - 100000 });
+  const s60GoalIds = [s60Goal.id, s60HomeGoal.id, s60RepairGoal.id];
+  await Transaction.destroy({
+    where: {
+      [Op.or]: [
+        { title: { [Op.like]: "Suite60 %" } },
+        { fromAccountId: { [Op.in]: [...s60GoalIds, s60Card.id] } },
+        { toAccountId: s60Card.id },
+      ],
+    },
+    force: true,
+  });
+  await Account.destroy({ where: { id: { [Op.in]: [...s60GoalIds, s60Card.id] } } });
   await Setting.destroy({ where: { key: { [Op.or]: [{ [Op.like]: "fund_paid:%" }, { [Op.like]: "fund_paid_by:%" }] } } });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");

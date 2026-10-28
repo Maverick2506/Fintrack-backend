@@ -476,13 +476,16 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         : statementDay >= 1 && statementDay <= 31
         ? getChargeStatementDate(charge.date, statementDay)
         : charge.date;
+      // The first payment to the card after the charge is billed that covers the whole charge (what is
+      // left of it after the bills counted before), as the card payment pays a fund's bill (settleCardFundBills)
+      const room = (it) => (it.billAmount ?? -it.amount) - (it.billsTaken || 0);
+      const fits = (it) => it.toAccountId === card.id && (it.billAmount ?? -it.amount) > 0 && room(it) >= charge.amount - 0.005;
       const payDay = billedOn
-        ? Object.values(daysMap).find(
-            (day) => day.date >= billedOn && day.items.some((it) => it.toAccountId === card.id && it.amount < 0)
-          )
+        ? Object.values(daysMap).find((day) => day.date >= billedOn && day.items.some(fits))
         : null;
       if (payDay) {
-        const payItem = payDay.items.find((it) => it.toAccountId === card.id && it.amount < 0);
+        const payItem = payDay.items.find(fits);
+        payItem.billsTaken = (payItem.billsTaken || 0) + charge.amount;
         const fundCovers =
           Math.round(
             Math.max(0, Math.min(charge.amount, fund.saved + contributedBefore(goalId, payDay.date), -payItem.amount)) * 100

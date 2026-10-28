@@ -203,6 +203,9 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
     const lastPaid = seriesRows.find((r) => r.isCleared);
     const done = Boolean(bill && lastPaid && (bill.ended || !bill.nextDate) && !seriesRows.some((r) => !r.isCleared));
     if (done) {
+      // Paid before its date: the day it was paid (recorded by payLinkedBill), not the bill's date
+      const record = await readJson(`${FUND_PAID_PREFIX}${lastPaid.id}`, dbTx);
+      const paidOn = record?.paidOn || (lastPaid.date > todayStr ? todayStr : lastPaid.date);
       result.set(goal.id, {
         name: goal.name,
         linkedBill: bill,
@@ -215,7 +218,7 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
         ready: false,
         overdue: false,
         done: true,
-        paidOn: lastPaid.date,
+        paidOn,
         billInForecast: false,
         monthlyTransfer: null,
       });
@@ -377,7 +380,9 @@ const payLinkedBill = async (bill, { payFromGoalId = null } = {}, todayStr, dbTx
       throw new HttpError(400, "That goal isn't saving for this bill.");
     }
     const billAmount = round2(parseFloat(bill.amount) || 0);
-    const { amount, transfer } = await moveFromFund(goal.id, billAmount, bill.title, bill.date, checking, dbTx);
+    // A bill paid before its date is paid today
+    const paidOn = bill.date > todayStr ? todayStr : bill.date;
+    const { amount, transfer } = await moveFromFund(goal.id, billAmount, bill.title, paidOn, checking, dbTx);
     paidFromFund = {
       goalId: goal.id,
       goalName: goal.name,
@@ -395,6 +400,7 @@ const payLinkedBill = async (bill, { payFromGoalId = null } = {}, todayStr, dbTx
         transferId: paidFromFund?.transferId || null,
         amount: paidFromFund?.amount || 0,
         paymentId: null,
+        paidOn: bill.date > todayStr ? todayStr : bill.date,
         rolledOver,
       },
       dbTx
@@ -536,8 +542,11 @@ const getCardFundBills = async (card, todayStr, dbTx = null, excludePaymentId = 
  * A card payment was made (or a scheduled one marked paid). For each bill in fundBills
  * ([{ billId, useFund }], from getCardFundBills): useFund moves min(saved, bill) from its goal to
  * Checking, dated with the payment; either way the goal rolls over to the bill's next charge.
- * Records what was done (fund_paid:<billId>, fund_paid_by:<paymentId>) so un-marking the payment
- * undoes it. Returns [{ billId, title, goalId, goalName, amount, transferId }].
+ * Only bills the payment covers in full are paid (in fundBills order, each taking its amount out of the
+ * payment), so a fund never moves more than the payment: a bill a smaller payment doesn't cover stays
+ * offered for the next payment. Records what was done (fund_paid:<billId>, fund_paid_by:<paymentId>)
+ * so un-marking the payment undoes it. Returns [{ billId, title, goalId, goalName, amount, transferId }]
+ * for the bills it paid.
  */
 const settleCardFundBills = async (card, payment, fundBills, todayStr, dbTx = null) => {
   if (!Array.isArray(fundBills) || fundBills.length === 0) return [];
@@ -551,8 +560,11 @@ const settleCardFundBills = async (card, payment, fundBills, todayStr, dbTx = nu
   }
   const checking = await getPrimaryCheckingAccount(dbTx);
   const results = [];
+  let paymentLeft = round2(parseFloat(payment.amount) || 0);
   for (const fb of fundBills) {
     const bill = eligible.get(fb.billId);
+    if (bill.amount > paymentLeft + 0.005) continue;
+    paymentLeft = round2(paymentLeft - bill.amount);
     let moved = { amount: 0, transfer: null, goal: null };
     if (fb.useFund) moved = await moveFromFund(bill.goalId, bill.amount, bill.title, payment.date, checking, dbTx);
     const rolledOver = await rollOverLinkedFunds(bill.recurringGroupId, todayStr, dbTx);
@@ -576,6 +588,7 @@ const settleCardFundBills = async (card, payment, fundBills, todayStr, dbTx = nu
       transferId: moved.transfer ? moved.transfer.id : null,
     });
   }
+  if (results.length === 0) return results;
   const key = `${FUND_PAID_BY_PREFIX}${payment.id}`;
   const before = (await readJson(key, dbTx)) || [];
   await writeJson(key, [...before, ...results.map((r) => r.billId)], dbTx);
@@ -609,8 +622,12 @@ const reverseFundPayment = async (billId, dbTx = null, { byPayment = false } = {
   if (!record || (record.paymentId && !byPayment)) return null;
   let amount = 0;
   if (record.transferId) {
-    const transfer = await Transaction.findByPk(record.transferId, { transaction: dbTx });
-    if (transfer) {
+    const transfer = await Transaction.findByPk(record.transferId, {
+      include: [{ model: Account, as: "fromAccount" }],
+      transaction: dbTx,
+    });
+    // An archived goal keeps its history (its balance can't change)
+    if (transfer && transfer.fromAccount?.isActive !== false) {
       await adjustAccountForTransaction(transfer, -1, dbTx, true);
       await transfer.destroy({ transaction: dbTx, force: true });
       amount = round2(parseFloat(transfer.amount) || 0);
