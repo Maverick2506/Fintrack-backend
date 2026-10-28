@@ -14,7 +14,7 @@ const {
 const { getBalancesSummary } = require("./netWorthService");
 const { purgeDeletedTransactions } = require("./trashService");
 const { recordPriceChanges } = require("./alertService");
-const { payLinkedBillByDefault } = require("./sinkingFundService");
+const { payLinkedBillByDefault, settleCardFundBillsByDefault } = require("./sinkingFundService");
 
 const TIMEZONE = "America/Toronto";
 // Arbitrary constant shared by every instance so only one sweep runs at a time across processes
@@ -206,8 +206,15 @@ const runDailySweep = async (options = {}) => {
         clearedExpenseCount++;
         // A bill a savings goal saves for is paid from it (the default when marking it paid), and the
         // goal rolls on to the bill's next charge
+        // (a bill charged to a card waits: its fund pays when the card is paid)
         const fundResult = await payLinkedBillByDefault(bill, todayString, dbTx);
         if (fundResult?.paidFromFund) paidFromFunds.push({ billId: bill.id, ...fundResult.paidFromFund });
+        // A scheduled card payment: the bills on it that savings goals save for are paid from them
+        if (bill.toAccount?.type === "CREDIT_CARD") {
+          for (const paid of await settleCardFundBillsByDefault(bill, todayString, dbTx)) {
+            if (paid.transferId) paidFromFunds.push({ paymentId: bill.id, ...paid });
+          }
+        }
       }
     }
 

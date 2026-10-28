@@ -102,6 +102,12 @@ const importMapping = z
     { message: "Map an amount column, or both a debit and a credit column", path: ["amount"] }
   );
 
+// Card payments: each bill on the payment that a savings goal saves for, and whether its fund pays
+const fundBillsSchema = z
+  .array(z.object({ billId: z.string().uuid(), useFund: z.boolean() }))
+  .max(50)
+  .optional();
+
 const schemas = {
   createExpense: z.object({
     name: z.string().trim().min(1, "Name is required").max(255),
@@ -147,6 +153,8 @@ const schemas = {
     clientRef: z.string().uuid().nullable().optional(),
     // "Pay from <fund>" when marking a bill paid: the savings goal saving for this bill
     payFromGoalId: z.string().uuid().nullable().optional(),
+    // "Use $X from <fund>" when marking a card payment paid: the bills on it that funds save for
+    fundBills: fundBillsSchema,
   }),
 
   createPaycheque: z.object({
@@ -162,6 +170,11 @@ const schemas = {
 
   paymentAmount: z.object({
     amount: z.coerce.number().positive("Payment amount must be greater than 0"),
+  }),
+
+  cardPayment: z.object({
+    amount: z.coerce.number().positive("Payment amount must be greater than 0"),
+    fundBills: fundBillsSchema,
   }),
 
   createCreditCard: z.object({

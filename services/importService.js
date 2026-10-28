@@ -15,7 +15,7 @@ const {
   assertArchivedBalancesUnchanged,
 } = require("./accountArchiveService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
-const { rollOverLinkedFunds } = require("./sinkingFundService");
+const { rollOverForPaidBill } = require("./sinkingFundService");
 const { loadRules, applyRules } = require("./ruleService");
 const { HttpError } = require("../middleware/errorHandler");
 const { normalizeMerchantName } = require("../utils/merchantNormalizer");
@@ -632,10 +632,8 @@ const commitImport = async ({ accountId, rows, mapping }) => {
         await bill.update(changes, { transaction: dbTx });
         await applyImportedRow(bill, checking.id, await sidesFor(bill, row.date), dbTx);
         // A bill a savings goal saves for rolls the goal on to its next charge (the bank paid it, so
-        // nothing moves out of the goal)
-        if (bill.type === "EXPENSE" && bill.recurringGroupId) {
-          await rollOverLinkedFunds(bill.recurringGroupId, getTodayString(), dbTx);
-        }
+        // nothing moves out of the goal). A card charge waits for the card to be paid.
+        await rollOverForPaidBill(bill, getTodayString(), dbTx);
         await ImportRef.create(
           { ref: row.clientRef, transactionId: bill.id, accountId: account.id },
           { transaction: dbTx }

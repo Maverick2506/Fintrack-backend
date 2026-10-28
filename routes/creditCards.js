@@ -9,6 +9,8 @@ const { retireAccount } = require("../services/accountArchiveService");
 const { setBalanceAnchor } = require("../services/balanceAnchorService");
 const crypto = require("crypto");
 const { getCardStatement } = require("../services/statementService");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
+const { getCardFundBills, settleCardFundBills } = require("../services/sinkingFundService");
 const { getNextOccurrenceDate, getSeriesTemplate } = require("./recurring");
 const router = express.Router();
 router.param("id", validateIdParam);
@@ -35,6 +37,9 @@ router.get(
         currentBalance: c.initialBalance,
         // { statementDate, dueDate, statementBalance, newCharges, ... } when a statement day is set
         statement: await getCardStatement(c, todayStr),
+        // Bills on this card that savings goals save for, which the next payment pays from them
+        // ("Use $X from <fund>" in the Pay dialog)
+        fundBills: await getCardFundBills(c, todayStr),
       }))
     );
     res.json(formatted);
@@ -68,16 +73,12 @@ router.post(
 
 router.post(
   "/credit-cards/:id/pay",
-  validateBody(schemas.paymentAmount),
+  validateBody(schemas.cardPayment),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     try {
       const card = await Account.findByPk(req.params.id, { transaction: dbTx });
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
 
       if (!card || card.type !== "CREDIT_CARD") {
         await dbTx.rollback();
@@ -94,7 +95,7 @@ router.post(
       await card.reload({ transaction: dbTx });
 
       // Record as TRANSFER (not EXPENSE) to prevent double-counting card spending
-      await Transaction.create(
+      const payment = await Transaction.create(
         {
           title: `Payment for ${card.name}`,
           amount: paymentAmount,
@@ -108,9 +109,11 @@ router.post(
         },
         { transaction: dbTx }
       );
+      // The bills on this payment that savings goals save for: each checked fund pays min(saved, bill)
+      const cardFunds = await settleCardFundBills(card, payment, req.body.fundBills, getTodayString(), dbTx);
 
       await dbTx.commit();
-      res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
+      res.json({ ...card.toJSON(), currentBalance: card.initialBalance, paymentId: payment.id, cardFunds });
     } catch (error) {
       await dbTx.rollback();
       throw error;
