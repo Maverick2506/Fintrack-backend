@@ -8273,6 +8273,26 @@ async function runTestSuite() {
     `With the transfer set up the forecast projects the transfer instead of the planned amount: Safe to Spend is unchanged ` +
       `(got ${s55WithTransfer.safeToSpend} vs ${s55WithFund.safeToSpend})`
   );
+  // This month's scheduled transfer counts as saved: the monthly amount stays the same once it's set up
+  const { getSinkingFunds: s55Funds } = require("../services/sinkingFundService");
+  const s55Jan = await Account.create({
+    name: "Suite55 Jan Fund", type: "SAVINGS_GOAL", initialBalance: 0, targetAmount: 1050, dueDate: "2027-01-30",
+    linkedRecurringGroupId: s55Bill.recurringGroupId,
+  });
+  const s55Before = (await s55Funds("2026-10-28", null, [s55Jan])).get(s55Jan.id);
+  await Transaction.create({
+    title: "Contribution to Suite55 Jan Fund", amount: 262.5, date: "2026-10-28", type: "TRANSFER", category: "Savings Transfer",
+    isCleared: false, recurrence: "monthly", fromAccountId: s54Checking.id, toAccountId: s55Jan.id,
+  });
+  const s55After = (await s55Funds("2026-10-28", null, [s55Jan])).get(s55Jan.id);
+  assert(
+    s55Before.monthly === 262.5 && s55Before.dates.length === 4 && s55After.monthly === 262.5 &&
+      s55After.dates.join() === "2026-11-01,2026-12-01,2027-01-01" && s55After.monthlyTransfer?.amount === 262.5,
+    `$1,050 by Jan 30 from Oct 28 is $262.50 x 4; with Oct's $262.50 scheduled it stays $262.50 for Nov-Jan ` +
+      `(got ${s55Before.monthly} -> ${s55After.monthly}, ${s55After.dates})`
+  );
+  await Transaction.destroy({ where: { toAccountId: s55Jan.id }, force: true });
+  await Account.destroy({ where: { id: s55Jan.id } });
   await s54Checking.reload();
   await s54Checking.update({ initialBalance: parseFloat(s54Checking.initialBalance) - 100000 });
   await Transaction.destroy({

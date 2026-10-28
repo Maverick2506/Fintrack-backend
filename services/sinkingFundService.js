@@ -143,17 +143,22 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
     const ownTarget = parseFloat(goal.targetAmount) || 0;
     const target = ownTarget > 0 ? ownTarget : bill?.amount || 0;
     const dueDate = goal.dueDate || bill?.nextDate || null;
-    // Any contribution dated this month, paid or scheduled
-    const contributedThisMonth = goalRows.some(
+    // Any contribution dated this month, paid or scheduled. A scheduled one counts as saved, so the
+    // monthly amount doesn't jump when this month's transfer is set up but not yet made.
+    const thisMonth = goalRows.filter(
       (r) => r.toAccountId === goal.id && r.date >= monthStart && r.date <= monthEnd
     );
+    const contributedThisMonth = thisMonth.length > 0;
+    const scheduledThisMonth = thisMonth
+      .filter((r) => !r.isCleared)
+      .reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0);
     const running = Object.values(goalSeries.seriesTemplates)
       .map((s) => s.template)
       .filter((t) => t.toAccountId === goal.id)
       .sort((a, b) => b.date.localeCompare(a.date))[0];
 
     const fund = computeSinkingFund({
-      current: goal.initialBalance,
+      current: (parseFloat(goal.initialBalance) || 0) + scheduledThisMonth,
       target,
       dueDate,
       todayStr,

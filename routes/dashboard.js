@@ -28,6 +28,7 @@ const {
 const { usesArchivedAccount } = require("../services/accountArchiveService");
 const { setBalanceAnchor } = require("../services/balanceAnchorService");
 const { getClearedMonthTotals } = require("../services/trendsService");
+const { getSinkingFunds } = require("../services/sinkingFundService");
 
 router.get(
   "/dashboard",
@@ -165,13 +166,17 @@ router.get(
       }
     }
 
+    // A sinking fund with no target of its own shows its bill's amount and next date
+    const sinkingFunds = await getSinkingFunds(todayStr, null, savingsSummaryRaw || []);
     const savingsSummary = (savingsSummaryRaw || []).map((g) => ({
       ...g.toJSON(),
       current_amount: g.initialBalance,
-      goal_amount: g.targetAmount,
-      target_date: g.dueDate,
+      goal_amount: parseFloat(g.targetAmount) > 0 ? g.targetAmount : sinkingFunds.get(g.id)?.target || g.targetAmount,
+      target_date: g.dueDate || sinkingFunds.get(g.id)?.dueDate || null,
       contributedLast90Days:
         Math.round((goalContributionMap[g.id] || 0) * 100) / 100,
+      // The sinking fund's monthly amount (the one Safe to Spend plans), or null for a plain goal
+      sinkingMonthly: sinkingFunds.get(g.id)?.monthly ?? null,
     }));
 
     const checkingCurrentBalance = balancesSummary.checking;
