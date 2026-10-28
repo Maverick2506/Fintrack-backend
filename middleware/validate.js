@@ -343,6 +343,13 @@ const schemas = {
     ]),
   }),
 
+  setWidgetSettings: z.object({
+    hideAmounts: z.union([
+      z.boolean(),
+      z.enum(["true", "false"]).transform((v) => v === "true"),
+    ]),
+  }),
+
   updateChecking: z.object({
     balance: z.coerce.number(),
   }),

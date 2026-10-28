@@ -159,7 +159,8 @@ async function runTestSuite() {
     /^\/api\/cron/,
     /^\/api\/digest/,
     /^\/api\/daily-check/,
-    /^\/api\/export/,
+    // Only the key-protected feeds; the rest of /api/export (config, regenerate, settings) needs a login
+    /^\/api\/export\/(financial-feed\.csv|financial-feed\.md|widget\.json)$/,
   ];
   for (const { prefix, r } of routeAuthRouters) {
     const stack = r.stack || [];
@@ -10298,6 +10299,132 @@ async function runTestSuite() {
   s68Gemini.setAiClientForTests(null);
   await s68AiUsage.destroy({ where: { date: s68Today } });
   await new Promise((resolve) => s68Server.close(resolve));
+
+  // --- Suite 70: the home-screen widget feed (KWGT) ---
+  console.log("\n--- Suite 70: Widget feed: its own key, same Safe to Spend as the forecast, hide amounts, no history ---");
+  const s70Get = (path, headers = {}) => request({ hostname: "localhost", port: 8000, path, method: "GET", headers });
+  const s70Send = (method, path, body) => request({ hostname: "localhost", port: 8000, path, method, headers: authHeaders }, body);
+  const s70Missing = await s70Get("/api/export/widget.json");
+  assert(s70Missing.status === 401, `Widget feed without a key is 401 (got ${s70Missing.status})`);
+  const s70Wrong = await s70Get("/api/export/widget.json?key=ft_wdg_not-the-key");
+  assert(s70Wrong.status === 401, `Widget feed with a wrong key is 401 (got ${s70Wrong.status})`);
+  const s70NoLogin = await s70Get("/api/export/widget-config");
+  assert(s70NoLogin.status === 401, `Widget settings need a login (got ${s70NoLogin.status})`);
+
+  const s70Config = await s70Send("GET", "/api/export/widget-config");
+  const s70Key = s70Config.body?.widgetKey;
+  assert(
+    s70Config.status === 200 && /^ft_wdg_[0-9a-f]{32}$/.test(s70Key || "") && s70Config.body.widgetUrl.endsWith(`/api/export/widget.json?key=${s70Key}`) && s70Config.body.hideAmounts === false,
+    `GET /export/widget-config returns an ft_wdg_ key, its URL and hideAmounts false (got ${JSON.stringify(s70Config.body)})`
+  );
+  const s70GemKey = (await s70Send("GET", "/api/export/gemini-config")).body?.feedKey;
+  const s70GemKeyOnWidget = await s70Get(`/api/export/widget.json?key=${s70GemKey}`);
+  const s70WidgetKeyOnGem = await s70Get(`/api/export/financial-feed.csv?key=${s70Key}`);
+  assert(
+    s70GemKeyOnWidget.status === 401 && s70WidgetKeyOnGem.status === 401,
+    `The Gem key and the widget key don't open each other's feed (got ${s70GemKeyOnWidget.status}, ${s70WidgetKeyOnGem.status})`
+  );
+
+  // Paid history and five unpaid bills; only the first three bills may appear
+  const s70Today = getTorontoToday();
+  const s70Made = [];
+  for (let i = 0; i < 4; i++) {
+    s70Made.push(await Transaction.create({ title: `Suite70 Paid History ${i}`, amount: 11 + i, date: getTorontoOffsetDate(-3 - i), type: "EXPENSE", category: "Shopping", isCleared: true, balanceApplied: true }));
+  }
+  const s70Earlier = await Transaction.count({ where: { type: { [Op.in]: ["EXPENSE", "TRANSFER"] }, isCleared: false } });
+  for (let i = 0; i < 5; i++) {
+    s70Made.push(await Transaction.create({ title: `Suite70 Bill ${i}`, amount: 20 + i, date: getTorontoOffsetDate(i === 0 ? -1 : i === 1 ? 0 : 400 + i), type: "EXPENSE", category: "Bills & Utilities", isCleared: false }));
+  }
+  const s70Feed = await s70Get(`/api/export/widget.json?key=${s70Key}`);
+  const s70Forecast = (await s70Send("GET", "/api/forecast?days=60")).body;
+  const f70 = s70Feed.body || {};
+  assert(
+    s70Feed.status === 200 && /application\/json/.test(s70Feed.headers["content-type"]) && /no-store/.test(s70Feed.headers["cache-control"] || ""),
+    `Widget feed is JSON with no-cache headers (got ${s70Feed.status}, ${s70Feed.headers["cache-control"]})`
+  );
+  assert(
+    f70.safe_to_spend_raw === s70Forecast.safeToSpend && f70.safe_to_spend === `${s70Forecast.safeToSpend < 0 ? "-" : ""}$${Math.abs(Math.round(s70Forecast.safeToSpend)).toLocaleString("en-US")}`,
+    `safe_to_spend matches GET /forecast (feed ${f70.safe_to_spend} / ${f70.safe_to_spend_raw}, forecast ${s70Forecast.safeToSpend})`
+  );
+  assert(
+    f70.below_buffer === (s70Forecast.lowestPoint.balance < s70Forecast.buffer) && ["On track", "Low", "No income"].includes(f70.status),
+    `below_buffer and status follow the forecast (got ${f70.below_buffer}, ${f70.status})`
+  );
+  const s70Values = Object.values(f70);
+  const s70Text = JSON.stringify(f70);
+  assert(
+    s70Values.every((v) => v === null || ["string", "number", "boolean"].includes(typeof v)),
+    "Widget feed is flat: no arrays or objects"
+  );
+  assert(
+    !/Suite70 Paid History/.test(s70Text) && !Object.keys(f70).some((k) => /^bill[4-9]/.test(k)),
+    "Widget feed has no paid transaction history and no more than 3 bills"
+  );
+  if (s70Earlier === 0) {
+    assert(
+      f70.bill1_title === "Suite70 Bill 0" && f70.bill1_flag === "overdue" && f70.bill2_title === "Suite70 Bill 1" && f70.bill2_flag === "today" && f70.bill3_title === "Suite70 Bill 2" && f70.bill3_flag === "" && !/Suite70 Bill [34]/.test(s70Text),
+      `Bills: overdue first, then today, then upcoming; only 3 (got ${f70.bill1_title}/${f70.bill1_flag}, ${f70.bill2_title}/${f70.bill2_flag}, ${f70.bill3_title}/${f70.bill3_flag})`
+    );
+    assert(f70.bill1_amount === "$20" && f70.bill1_amount_raw === 20 && f70.bill1_date !== "", `Bill amount is "$20" with raw 20 (got ${f70.bill1_amount}, ${f70.bill1_amount_raw})`);
+  } else {
+    assert([f70.bill1_title, f70.bill2_title, f70.bill3_title].filter((t) => /Suite70 Bill/.test(t)).length <= 3, "At most 3 bills listed");
+  }
+  assert(/^[A-Z][a-z]{2} \d{1,2}, \d{1,2}:\d{2} (am|pm)$/.test(f70.as_of || ""), `as_of reads like "Oct 28, 9:14 am" (got ${f70.as_of})`);
+
+  // Hide amounts: every amount string becomes a word, and no dollar numbers are sent
+  const s70BadSetting = await s70Send("PUT", "/api/export/widget-settings", { hideAmounts: "maybe" });
+  assert(s70BadSetting.status === 400, `Hide amounts must be true or false (got ${s70BadSetting.status})`);
+  const s70Hide = await s70Send("PUT", "/api/export/widget-settings", { hideAmounts: true });
+  const s70Hidden = (await s70Get(`/api/export/widget.json?key=${s70Key}`)).body || {};
+  const s70HiddenText = JSON.stringify(s70Hidden);
+  const s70RawKeys = Object.keys(s70Hidden).filter((k) => k.endsWith("_raw"));
+  assert(
+    s70Hide.status === 200 && s70Hide.body.hideAmounts === true && s70Hidden.hide_amounts === true &&
+      !/\$/.test(s70HiddenText) && s70RawKeys.length > 0 && s70RawKeys.every((k) => s70Hidden[k] === null) &&
+      s70Hidden.safe_to_spend === s70Hidden.status,
+    `Hide amounts: no $ values, raw amounts null, Safe to Spend shows the status (got ${s70HiddenText.slice(0, 300)})`
+  );
+  if (s70Earlier === 0) {
+    assert(s70Hidden.bill1_amount === "Overdue" && s70Hidden.bill2_amount === "Due today", `Hidden bill amounts are status words (got ${s70Hidden.bill1_amount}, ${s70Hidden.bill2_amount})`);
+  }
+  await s70Send("PUT", "/api/export/widget-settings", { hideAmounts: false });
+
+  // Regenerate: the old key stops working at once, the new one works
+  const s70Regen = await s70Send("POST", "/api/export/regenerate-widget-key");
+  const s70OldKey = await s70Get(`/api/export/widget.json?key=${s70Key}`);
+  const s70NewKey = await s70Get(`/api/export/widget.json?key=${s70Regen.body?.widgetKey}`);
+  assert(
+    s70Regen.status === 200 && s70Regen.body.widgetKey !== s70Key && /^ft_wdg_/.test(s70Regen.body.widgetKey) && s70OldKey.status === 401 && s70NewKey.status === 200,
+    `Regenerating the widget key revokes the old one (old ${s70OldKey.status}, new ${s70NewKey.status})`
+  );
+  const s70GemStill = await s70Get(`/api/export/financial-feed.csv?key=${s70GemKey}`);
+  assert(s70GemStill.status === 200, `Regenerating the widget key leaves the Gem feed key alone (got ${s70GemStill.status})`);
+  for (const t of s70Made) await t.destroy({ force: true });
+
+  // Pure payload: hide-amounts words and empty slots (no database)
+  const { buildWidgetPayload } = require("../services/widgetFeedService");
+  const s70Facts = {
+    forecast: { today: "2026-10-28", safeToSpend: 412.37, buffer: 200, nextPayday: "2026-11-06", lowestPoint: { date: "2026-11-05", balance: 612.37 }, incomeSource: "recurring", days: [] },
+    bills: [{ title: "Rent", date: "2026-11-01", amount: 1500 }],
+    month: { spent: 950, budget: 1000, topCategory: "Food & Dining" },
+    cards: [{ name: "Visa", balance: 1234.5, limit: 5000, due: "2026-11-10" }],
+    goals: [{ name: "Trip", saved: 300, target: 1200 }],
+    todayStr: "2026-10-28",
+    asOf: "Oct 28, 9:14 am",
+  };
+  const s70Shown = buildWidgetPayload(s70Facts);
+  const s70Words = buildWidgetPayload(s70Facts, { hideAmounts: true });
+  assert(
+    s70Shown.safe_to_spend === "$412" && s70Shown.safe_until === "Nov 6" && s70Shown.status === "On track" && s70Shown.month_pct === 95 &&
+      s70Shown.card1_balance === "$1,235" && s70Shown.card1_pct === 25 && s70Shown.card1_due === "Nov 10" && s70Shown.goal1_pct === 25 &&
+      s70Shown.bill2_title === "" && s70Shown.bill2_amount_raw === 0 && s70Shown.card3_name === "",
+    `Widget payload formats amounts, dates and percentages (got ${JSON.stringify(s70Shown).slice(0, 400)})`
+  );
+  assert(
+    s70Words.safe_to_spend === "On track" && s70Words.month_spent === "Near budget" && s70Words.card1_balance === "Owing" &&
+      s70Words.goal1_saved === "Saving" && s70Words.bill1_amount === "Upcoming" && s70Words.month_pct === 95 && !/\$|\d{3}/.test(JSON.stringify(s70Words).replace(/"as_of":"[^"]*"/, "")),
+    `Hidden payload uses words and keeps percentages (got ${JSON.stringify(s70Words).slice(0, 400)})`
+  );
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
