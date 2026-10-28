@@ -7,6 +7,17 @@ const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, schemas } = require("../middleware/validate");
 const { getForecast } = require("../services/forecastService");
+
+// One line on the forecast's income for the AI context (forecastService owns the numbers)
+const describeForecastIncome = (f) => {
+  const money = (n) => `$${(Math.round(n * 100) / 100).toFixed(2)}`;
+  if (f.incomeSource === "none") return "none (no paycheques logged and no Expected pay set; Safe to Spend counts bills only)";
+  if (f.incomeSource === "estimated" || f.incomeSource === "expected-pay") {
+    const typical = f.typicalAmount !== f.planningAmount ? `, typical ${money(f.typicalAmount)}` : "";
+    return `${f.incomeSource}, planning with a cautious ${money(f.planningAmount)} per paycheque${typical} (pay varies; already in Safe to Spend)`;
+  }
+  return `${f.incomeSource}${f.planningAmount ? `, ${money(f.planningAmount)} on the next payday` : ""}`;
+};
 const { getBalancesSummary } = require("../services/netWorthService");
 const { getCalculatedCheckingBalance } = require("../services/checkingService");
 const { getRegisteredAccountsSummary } = require("../services/registeredAccountService");
@@ -366,6 +377,7 @@ Primary Checking Balance: $${balancesSummary.checking.toFixed(2)}
 Forecast Safe to Spend (Authoritative Float): $${computedFloat.toFixed(2)}
 Forecast 60-Day Lowest Point: $${lowestBalance.toFixed(2)} on ${forecast.lowestPoint?.date || "N/A"} (Safety buffer: $${buffer.toFixed(2)})
 Next Expected Payday: ${forecast.nextPayday || "None projected in horizon"}
+Forecast Income: ${describeForecastIncome(forecast)}
 Month Cleared Income: $${clearedIncome.toFixed(2)}
 Month Cleared Spending: $${clearedSpending.toFixed(2)}
 Net Cash Flow: $${netCashFlow.toFixed(2)}
@@ -1350,6 +1362,7 @@ Checking Balance: $${checkingBalance.toFixed(2)}
 Authoritative Safe to Spend: $${forecast.safeToSpend.toFixed(2)}
 Forecast Lowest Point: $${forecast.lowestPoint?.balance.toFixed(2) || "0.00"} on ${forecast.lowestPoint?.date || "N/A"} (Buffer: $${forecast.buffer.toFixed(2)})
 Next Payday: ${forecast.nextPayday || "None projected"}
+Forecast Income: ${describeForecastIncome(forecast)}
 Month Cleared Income: $${(parseFloat(monthIncome) || 0).toFixed(2)}
 Month Cleared Spending: $${(parseFloat(monthExpenses) || 0).toFixed(2)}
 Credit Cards:

@@ -5,6 +5,42 @@ const { addCalendarDays, getForecast } = require("./forecastService");
 const { toZonedTime } = require("date-fns-tz");
 const { takePendingPriceAlerts, formatPriceAlert } = require("./alertService");
 
+const LOW_BALANCE_WINDOW_DAYS = 14;
+const NO_INCOME_NOTE = "No income in your forecast — log your paycheques or set Expected pay";
+// Last pay_title value the digest has mentioned as ignored, so each override is mentioned once
+const PAY_OVERRIDE_NOTIFIED_KEY = "pay_title_ignored_notified";
+
+// The no-income note, naming an ignored pay choice when there is one
+const noIncomeNote = (forecast) => {
+  const ignored = forecast.payOverrideIgnored;
+  if (!ignored) return NO_INCOME_NOTE;
+  return `No income in your forecast — '${ignored.label}' doesn't look like regular pay (${ignored.reason}). Log your paycheques or set Expected pay`;
+};
+
+// One line on a pay choice that's ignored while it isn't a regular series
+const payOverrideLine = (forecast) => {
+  const ignored = forecast.payOverrideIgnored;
+  const using = forecast.paySeries ? `using '${forecast.paySeries.label}' instead` : "it's ignored for now";
+  return `ℹ️ Your chosen pay '${ignored.label}' doesn't look like regular pay (${ignored.reason}) — ${using}.`;
+};
+
+/**
+ * The lowest day below the buffer within the alert window (the next LOW_BALANCE_WINDOW_DAYS days,
+ * or the days before the next projected payday if sooner), or null when there's no such dip.
+ */
+const lowBalanceDip = (forecast) => {
+  const windowEnd = addCalendarDays(forecast.today, LOW_BALANCE_WINDOW_DAYS);
+  let lowest = null;
+  for (const day of forecast.days) {
+    if (day.date > windowEnd) break;
+    if (forecast.nextPayday && day.date >= forecast.nextPayday) break;
+    if (day.balance < forecast.buffer && (!lowest || day.balance < lowest.balance)) {
+      lowest = { date: day.date, balance: day.balance };
+    }
+  }
+  return lowest;
+};
+
 /**
  * Builds the morning notification digest for ntfy.
  * Returns { title, message, priority, tags } or null if nothing to report.
@@ -14,6 +50,7 @@ const { takePendingPriceAlerts, formatPriceAlert } = require("./alertService");
  * @returns {Promise<{ title: string, message: string, priority: string, tags: string } | null>}
  */
 const buildMorningDigest = async (dbTx = null, options = {}) => {
+  // options.todayStr overrides "today" (America/Toronto) so tests can use fixed dates
   const todayStr = options.todayStr || getTodayString();
   const threeDaysAhead = addCalendarDays(todayStr, 3);
   const fiveDaysAhead = addCalendarDays(todayStr, 5);
@@ -99,22 +136,34 @@ const buildMorningDigest = async (dbTx = null, options = {}) => {
   }
 
   // 4. Forecast & Low-Balance Alert
+  //    With no income in the forecast, every bill looks like a dip, so say that instead.
+  //    Otherwise only a dip soon matters: within LOW_BALANCE_WINDOW_DAYS, or before the next
+  //    projected payday if that comes first.
   try {
-    const forecast = await getForecast(60, dbTx, [], { todayStr });
-    const lowest = forecast.lowestPoint;
-    const isBelowBuffer = lowest && lowest.balance < forecast.buffer;
-    const isSafeToSpendZero = forecast.safeToSpend <= 0;
-
-    if (isBelowBuffer || isSafeToSpendZero) {
-      isHighPriority = true;
-      if (showAmounts) {
-        sections.push(
-          `⚠️ Low Balance Alert: Safe to spend is $${forecast.safeToSpend.toFixed(2)}. Lowest projected balance is $${lowest.balance.toFixed(2)} on ${lowest.date} (below $${forecast.buffer.toFixed(2)} buffer).`
-        );
-      } else {
-        sections.push(
-          `⚠️ Low Balance Alert: Projected checking balance dips below buffer on ${lowest.date}.`
-        );
+    const forecast = await getForecast(60, dbTx, [], options.todayStr ? { todayStr: options.todayStr } : {});
+    if (forecast.incomeSource === "none") {
+      sections.push(noIncomeNote(forecast));
+    } else {
+      const ignored = forecast.payOverrideIgnored;
+      if (ignored) {
+        const notified = await Setting.findByPk(PAY_OVERRIDE_NOTIFIED_KEY, { transaction: dbTx });
+        if (!notified || notified.value !== ignored.title) {
+          sections.push(payOverrideLine(forecast));
+          await Setting.upsert({ key: PAY_OVERRIDE_NOTIFIED_KEY, value: ignored.title }, { transaction: dbTx });
+        }
+      }
+      const lowest = lowBalanceDip(forecast);
+      if (lowest) {
+        isHighPriority = true;
+        if (showAmounts) {
+          sections.push(
+            `⚠️ Low Balance Alert: Lowest projected balance is $${lowest.balance.toFixed(2)} on ${lowest.date} (below $${forecast.buffer.toFixed(2)} buffer). Safe to spend is $${forecast.safeToSpend.toFixed(2)}.`
+          );
+        } else {
+          sections.push(
+            `⚠️ Low Balance Alert: Projected checking balance dips below buffer on ${lowest.date}.`
+          );
+        }
       }
     }
   } catch (err) {
@@ -229,5 +278,10 @@ Provide a 2-sentence encouraging weekly wrap-up highlighting their top focus for
 };
 
 module.exports = {
+  LOW_BALANCE_WINDOW_DAYS,
+  NO_INCOME_NOTE,
+  PAY_OVERRIDE_NOTIFIED_KEY,
+  noIncomeNote,
+  lowBalanceDip,
   buildMorningDigest,
 };

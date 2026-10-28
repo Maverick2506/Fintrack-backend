@@ -3521,23 +3521,24 @@ async function runTestSuite() {
   }, { enabled: "invalid" });
   assert(badEstSettingRes.status === 400, "PUT /api/settings/forecast-estimate-income rejects invalid body with HTTP 400");
 
-  // 3. Test 1: Three one-off bi-weekly paycheques (-28, -14, +2 days) -> estimated items at +16, +30, +44, +58
+  // 3. Test 1: Three paid one-off bi-weekly paycheques (-28, -14, today) -> estimated items at +14, +28, +42, +56
+  //    The pay series is found by name, so all three share one; only paid rows dated today or earlier count.
   const p1Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Paycheque -28",
+    name: "Paycheque",
     amount: 2100,
     payment_date: getOffsetDate(-28),
   });
   const p2Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Paycheque -14",
+    name: "Paycheque",
     amount: 2100,
     payment_date: getOffsetDate(-14),
   });
   const p3Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Paycheque +2",
+    name: "Paycheque",
     amount: 2100,
-    payment_date: getOffsetDate(2),
+    payment_date: getOffsetDate(0),
   });
-  assert(p1Res.status === 201 && p2Res.status === 201 && p3Res.status === 201, "Creates 3 one-off paycheques at -28, -14, and +2 days");
+  assert(p1Res.status === 201 && p2Res.status === 201 && p3Res.status === 201, "Creates 3 one-off paycheques at -28, -14, and today");
 
   const forecastEst1Res = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
   const f1 = forecastEst1Res.body;
@@ -3546,16 +3547,16 @@ async function runTestSuite() {
   assert(f1.estimatedIncome?.amount === 2100, "estimatedIncome amount is $2100");
   assert(f1.estimatedIncome?.basedOn === 3, "estimatedIncome basedOn is 3");
 
-  const expDates = [getOffsetDate(16), getOffsetDate(30), getOffsetDate(44), getOffsetDate(58)];
+  const expDates = [getOffsetDate(14), getOffsetDate(28), getOffsetDate(42), getOffsetDate(56)];
   assert(
     expDates.every((d) => f1.estimatedIncome?.dates?.includes(d)),
-    "estimatedIncome dates include +16, +30, +44, and +58 days"
+    "estimatedIncome dates include +14, +28, +42, and +56 days"
   );
 
-  const day16 = f1.days.find((d) => d.date === getOffsetDate(16));
+  const day16 = f1.days.find((d) => d.date === getOffsetDate(14));
   assert(
     day16 && day16.items.some((it) => it.title === "Estimated paycheque" && it.estimated === true && it.amount === 2100),
-    "Day +16 contains Estimated paycheque item with estimated: true"
+    "Day +14 contains Estimated paycheque item with estimated: true"
   );
 
   // 4. Test 2: A recurring bi-weekly series -> estimatedIncome === null, no estimated items
@@ -3573,12 +3574,12 @@ async function runTestSuite() {
 
   // 5. Test 3: A real one-off paycheque 2 days after a projected date -> that date is skipped (±3-day rule)
   const realP18Res = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Real Paycheque +18",
+    name: "Real Paycheque +16",
     amount: 2100,
-    payment_date: getOffsetDate(18),
+    payment_date: getOffsetDate(16),
   });
   const forecastSkipRes = await request({ hostname: "localhost", port: 8000, path: "/api/forecast?days=60", method: "GET", headers: authHeaders });
-  assert(!forecastSkipRes.body.estimatedIncome?.dates?.includes(getOffsetDate(16)), "+16 is skipped when real paycheque exists at +18");
+  assert(!forecastSkipRes.body.estimatedIncome?.dates?.includes(getOffsetDate(14)), "+14 is skipped when real paycheque exists at +16");
   await request({ hostname: "localhost", port: 8000, path: "/api/paycheques/" + realP18Res.body.id, method: "DELETE", headers: authHeaders });
 
   // 6. Test 4: forecast_estimate_income = "false" -> estimatedIncome === null
@@ -3596,22 +3597,22 @@ async function runTestSuite() {
 
   // 7. Test 5: Irregular incomes (gaps of 5, 20 and 40 days) -> no estimates
   const irr1 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Irr 1",
+    name: "Irr",
     amount: 1500,
     payment_date: getOffsetDate(-65),
   });
   const irr2 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Irr 2",
+    name: "Irr",
     amount: 1500,
     payment_date: getOffsetDate(-25),
   });
   const irr3 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Irr 3",
+    name: "Irr",
     amount: 1500,
     payment_date: getOffsetDate(-5),
   });
   const irr4 = await request({ hostname: "localhost", port: 8000, path: "/api/paycheques", method: "POST", headers: authHeaders }, {
-    name: "Irr 4",
+    name: "Irr",
     amount: 1500,
     payment_date: getOffsetDate(0),
   });
@@ -3740,6 +3741,8 @@ async function runTestSuite() {
     method: "PUT",
     headers: authHeaders,
   }, { balance: 50 });
+  // A dip only alerts when the forecast has income (otherwise the digest says no income is logged)
+  await Setting.upsert({ key: "expected_pay", value: JSON.stringify({ nextDate: getOffsetDate(20), cadence: "bi-weekly", amount: 1000 }) });
 
   const lowBalDigestRes = await request({
     hostname: "localhost",
@@ -3750,6 +3753,7 @@ async function runTestSuite() {
   });
   assert(lowBalDigestRes.status === 200 && lowBalDigestRes.body.priority === "high", "Low-balance alert escalates digest to priority: high");
   assert(lowBalDigestRes.body.message.includes("Low Balance Alert"), "Digest contains explicit Low Balance Alert text");
+  await Setting.destroy({ where: { key: "expected_pay" } });
 
   // 5. Privacy setting NOTIFY_DETAIL: "counts" suppresses dollar amounts
   await Setting.upsert({ key: "NOTIFY_DETAIL", value: "counts" });
@@ -7268,6 +7272,240 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { title: { [Op.like]: "Suite44 %" } }, force: true });
   await s44Card.destroy();
 
+  // 46. Variable (hourly) pay in the forecast
+  console.log("\n--- Suite 46: Variable-pay forecast ---");
+  const s46Checking = await Account.findOne({ where: { type: "CHECKING", name: "Primary Checking" } });
+  const s46OrigBalance = s46Checking.initialBalance;
+  const s46OrigBuffer = await Setting.findByPk("forecast_buffer");
+  await Setting.upsert({ key: "forecast_buffer", value: "200" });
+  await Setting.destroy({ where: { key: ["pay_title", "expected_pay", "forecast_estimate_income"] } });
+  // Earlier suites leave income behind (Suite 25.1's recurring paycheque rows); park it as TRANSFER so this
+  // suite starts with no income at all, and put it back in Cleanup
+  const s46Parked = await Transaction.findAll({ where: { type: "INCOME" } });
+  await Transaction.update({ type: "TRANSFER" }, { where: { id: s46Parked.map((t) => t.id) } });
+  const s46Forecast = async () => (await s33("GET", "/api/forecast?days=60")).body;
+  const s46Income = (title, amount, offset) =>
+    Transaction.create({ title, amount, date: getTorontoOffsetDate(offset), type: "INCOME", category: "Income", isCleared: true, toAccountId: s46Checking.id });
+  const s46Clear = () => Transaction.destroy({ where: { title: { [Op.like]: "Suite46 %" } }, force: true });
+
+  // 46.1 Bi-weekly pay with varying amounts (8 rows): cadence bi-weekly, planning = 25th percentile
+  // Sorted 1200 1300 1400 1450 1550 1650 1700 1800 -> 25th percentile 1300 + 0.75 x 100 = 1375, median 1500
+  const s46Amounts = [1400, 1650, 1200, 1800, 1550, 1300, 1700, 1450];
+  for (let i = 0; i < s46Amounts.length; i++) await s46Income(`Suite46 Acme Payroll ${["Oct 24", "10/10", "Sep 26", "", "", "", "", ""][i]}`.trim(), s46Amounts[i], -14 * i);
+  const s46F1 = await s46Forecast();
+  assert(
+    s46F1.incomeSource === "estimated" && s46F1.estimatedIncome?.cadence === "bi-weekly" && s46F1.paySeries?.title === "suite46 acme payroll" && s46F1.estimatedIncome?.basedOn === 8,
+    `Bi-weekly pay with dates in the titles is one pay series (got ${s46F1.incomeSource}, ${s46F1.estimatedIncome?.cadence}, ${s46F1.paySeries?.title}, ${s46F1.estimatedIncome?.basedOn})`
+  );
+  assert(
+    s46F1.planningAmount === 1375 && s46F1.typicalAmount === 1500 && s46F1.payRange?.min === 1200 && s46F1.payRange?.max === 1800,
+    `Planning amount is the 25th percentile ($1375), typical the median ($1500), range $1200-$1800 (got ${s46F1.planningAmount}, ${s46F1.typicalAmount}, ${JSON.stringify(s46F1.payRange)})`
+  );
+  const s46Pay14 = s46F1.days.find((d) => d.date === getTorontoOffsetDate(14));
+  assert(
+    s46Pay14?.items.some((it) => it.title === "Estimated paycheque" && it.amount === 1375) && s46F1.nextPayday === getTorontoOffsetDate(14),
+    "Projected paydays follow the newest pay date by the cadence and use the planning amount"
+  );
+
+  // 46.2 A $40 refund and an e-transfer between paydays don't change the cadence or the amount
+  await s46Income("Suite46 Amazon refund", 40, -7);
+  await s46Income("Suite46 E-transfer from Sam", 25, -3);
+  const s46F2 = await s46Forecast();
+  assert(
+    s46F2.estimatedIncome?.cadence === "bi-weekly" && s46F2.planningAmount === 1375 && s46F2.typicalAmount === 1500 &&
+      JSON.stringify(s46F2.estimatedIncome?.dates) === JSON.stringify(s46F1.estimatedIncome?.dates),
+    `Other income never affects the pay cadence, amount or dates (got ${s46F2.estimatedIncome?.cadence}, ${s46F2.planningAmount}, ${s46F2.typicalAmount})`
+  );
+
+  // 46.3 Fewer than 4 paycheques: planning = the lowest
+  await s46Clear();
+  await s46Income("Suite46 Shifts", 1100, -28);
+  await s46Income("Suite46 Shifts", 900, -14);
+  await s46Income("Suite46 Shifts", 1200, 0);
+  const s46F3 = await s46Forecast();
+  assert(
+    s46F3.incomeSource === "estimated" && s46F3.planningAmount === 900 && s46F3.typicalAmount === 1100,
+    `With 3 paycheques the planning amount is the lowest, $900 (got ${s46F3.planningAmount}, typical ${s46F3.typicalAmount})`
+  );
+
+  // 46.4 pay_title override wins over the series with the most rows
+  for (let i = 0; i < 5; i++) await s46Income("Suite46 Acme Payroll", 2000, -7 * i - 1);
+  const s46Auto = await s46Forecast();
+  const s46Override = await s33("PUT", "/api/settings/pay-title", { title: "Suite46 Shifts" });
+  const s46F4 = await s46Forecast();
+  const s46PayInfo = await s33("GET", "/api/settings/pay");
+  assert(
+    s46Auto.paySeries?.title === "suite46 acme payroll" && s46Auto.estimatedIncome?.cadence === "weekly" &&
+      s46Override.status === 200 && s46F4.paySeries?.title === "suite46 shifts" && s46F4.paySeries?.override === true && s46F4.planningAmount === 900,
+    `pay_title picks the pay series (auto ${s46Auto.paySeries?.title}, override ${s46F4.paySeries?.title}, $${s46F4.planningAmount})`
+  );
+  assert(
+    s46PayInfo.body.payTitle === "suite46 shifts" &&
+      ["suite46 shifts", "suite46 acme payroll"].every((t) => s46PayInfo.body.incomeNames.some((n) => n.title === t)),
+    "GET /api/settings/pay lists the income names to choose from and the chosen one"
+  );
+  const s46BadTitle = await s33("PUT", "/api/settings/pay-title", { title: "" });
+  await s33("PUT", "/api/settings/pay-title", { title: null });
+  const s46Cleared = await s33("GET", "/api/settings/pay");
+  assert(s46BadTitle.status === 400 && s46Cleared.body.payTitle === null, "An empty pay title is refused; null goes back to automatic");
+
+  // 46.4b A pay_title that isn't a valid series is ignored for now: automatic detection runs instead
+  await s46Clear();
+  const { buildMorningDigest: s46OvDigest } = require("../services/notificationService");
+  await Setting.destroy({ where: { key: "pay_title_ignored_notified" } });
+  await s46Income("Suite46 Paycheque", 1500, -28);
+  await s46Income("Suite46 Paycheque", 1300, -14);
+  await s46Income("Suite46 Paycheque", 1400, 0);
+  await s46Income("Suite46 Refund", 40, -5);
+  const s46NoOverride = await s46Forecast();
+  const s46BadPick = await s33("PUT", "/api/settings/pay-title", { title: "Suite46 Refund" });
+  const s46OvF = await s46Forecast();
+  assert(
+    s46BadPick.status === 200 && s46OvF.paySeries?.title === "suite46 paycheque" && s46OvF.paySeries?.override === false &&
+      s46OvF.payOverrideIgnored?.title === "suite46 refund" && s46OvF.payOverrideIgnored?.reason === "1 entry" &&
+      s46OvF.payOverrideIgnored?.label === "Suite46 Refund",
+    `An override on a single refund is ignored and the detected Paycheque is used (got ${s46OvF.paySeries?.title}, ${JSON.stringify(s46OvF.payOverrideIgnored)})`
+  );
+  assert(
+    s46OvF.incomeSource === "estimated" && s46OvF.safeToSpend === s46NoOverride.safeToSpend && s46OvF.planningAmount === s46NoOverride.planningAmount &&
+      s46NoOverride.payOverrideIgnored === null,
+    `Safe to Spend is the same as with no override (${s46OvF.safeToSpend} vs ${s46NoOverride.safeToSpend})`
+  );
+  const s46OvSettings = await s33("GET", "/api/settings/pay");
+  assert(
+    s46OvSettings.body.payTitle === "suite46 refund" && s46OvSettings.body.payOverrideIgnored?.reason === "1 entry" &&
+      s46OvSettings.body.incomeNames.map((n) => n.title).join(",") === "suite46 paycheque" &&
+      s46OvSettings.body.incomeNames[0].count === 3 && s46OvSettings.body.incomeNames[0].cadence === "bi-weekly",
+    `The override is kept, and the picker lists only names that form a valid series (got ${JSON.stringify(s46OvSettings.body.incomeNames)})`
+  );
+  const s46OvD1 = await s46OvDigest();
+  const s46OvD2 = await s46OvDigest();
+  const s46OvLine = "Your chosen pay 'Suite46 Refund' doesn't look like regular pay (1 entry) — using 'Suite46 Paycheque' instead.";
+  assert(
+    (s46OvD1?.message || "").includes(s46OvLine) && !(s46OvD2?.message || "").includes("doesn't look like regular pay"),
+    `The digest mentions the ignored override once, not daily (first: ${s46OvD1?.message})`
+  );
+  // The override becomes valid later (a bi-weekly series): it's used again automatically
+  await s46Income("Suite46 Refund", 45, -19);
+  await s46Income("Suite46 Refund", 50, -33);
+  const s46OvValid = await s46Forecast();
+  assert(
+    s46OvValid.paySeries?.title === "suite46 refund" && s46OvValid.paySeries?.override === true && s46OvValid.payOverrideIgnored === null &&
+      s46OvValid.planningAmount === 40,
+    `Once the chosen name forms a series, the saved override is used (got ${s46OvValid.paySeries?.title}, $${s46OvValid.planningAmount})`
+  );
+  // Both invalid: no pay series at all, and the note names the override's problem
+  await s46Clear();
+  await s46Income("Suite46 Paycheque", 1400, -3);
+  await s46Income("Suite46 Refund", 40, -5);
+  const s46OvNone = await s46Forecast();
+  const s46OvD3 = await s46OvDigest();
+  assert(
+    s46OvNone.incomeSource === "none" && s46OvNone.paySeries === null && s46OvNone.payOverrideIgnored?.reason === "1 entry" &&
+      (s46OvD3?.message || "").includes("No income in your forecast — 'Suite46 Refund' doesn't look like regular pay (1 entry). Log your paycheques or set Expected pay"),
+    `With no valid series either, incomeSource is "none" and the note names the reason (got ${s46OvNone.incomeSource}: ${s46OvD3?.message})`
+  );
+  await s33("PUT", "/api/settings/pay-title", { title: null });
+  await Setting.destroy({ where: { key: "pay_title_ignored_notified" } });
+
+  // 46.5 Expected pay: used only with no pay history, ignored after 2 paycheques
+  await s46Clear();
+  const s46BadExpected = await Promise.all([
+    s33("PUT", "/api/settings/expected-pay", { nextDate: "2026-02-30", amount: 1000 }),
+    s33("PUT", "/api/settings/expected-pay", { nextDate: getTorontoOffsetDate(5), amount: 0 }),
+    s33("PUT", "/api/settings/expected-pay", { nextDate: getTorontoOffsetDate(5), amount: 1000, cadence: "daily" }),
+  ]);
+  assert(s46BadExpected.every((r) => r.status === 400), `Expected pay refuses a bad date, a zero amount and an unknown cadence (got ${s46BadExpected.map((r) => r.status)})`);
+  const s46Expected = await s33("PUT", "/api/settings/expected-pay", { nextDate: getTorontoOffsetDate(5), amount: "1000" });
+  const s46F5 = await s46Forecast();
+  const s46ExpDays = s46F5.days.filter((d) => d.items.some((it) => it.title === "Expected pay")).map((d) => d.date);
+  assert(
+    s46Expected.status === 200 && s46Expected.body.expectedPay?.cadence === "bi-weekly" && s46Expected.body.expectedPayActive === true &&
+      s46F5.incomeSource === "expected-pay" && s46F5.planningAmount === 1000 && s46F5.nextPayday === getTorontoOffsetDate(5) &&
+      JSON.stringify(s46ExpDays) === JSON.stringify([5, 19, 33, 47].map(getTorontoOffsetDate)),
+    `With no pay history the forecast uses Expected pay, bi-weekly by default (got ${s46F5.incomeSource}, ${s46ExpDays.join(" ")})`
+  );
+  assert((await Transaction.count({ where: { type: "INCOME" } })) === 0, "Expected pay creates no transactions");
+  await s46Income("Suite46 Payroll", 1300, -24);
+  const s46F6 = await s46Forecast();
+  await s46Income("Suite46 Payroll", 1250, -10);
+  const s46F7 = await s46Forecast();
+  const s46PayAfter = await s33("GET", "/api/settings/pay");
+  assert(
+    s46F6.incomeSource === "expected-pay",
+    `One paycheque isn't a pay series yet, so Expected pay still applies (got ${s46F6.incomeSource})`
+  );
+  assert(
+    s46F7.incomeSource === "estimated" && !s46F7.days.some((d) => d.items.some((it) => it.title === "Expected pay")) &&
+      s46PayAfter.body.expectedPayActive === false && s46PayAfter.body.expectedPay !== null,
+    `After 2 paycheques Expected pay is ignored automatically, but kept (got ${s46F7.incomeSource})`
+  );
+  await s33("DELETE", "/api/settings/expected-pay");
+
+  // 46.6 No income at all: the digest has the note and no low-balance alert
+  await s46Clear();
+  const { buildMorningDigest: s46Digest, NO_INCOME_NOTE: s46Note } = require("../services/notificationService");
+  await s33("PUT", "/api/checking", { balance: 50 });
+  const s46F8 = await s46Forecast();
+  const s46D1 = await s46Digest();
+  assert(
+    s46F8.incomeSource === "none" && s46F8.planningAmount === null && s46D1?.message.includes(s46Note) && !s46D1.message.includes("Low Balance Alert"),
+    `incomeSource "none": the digest says to log paycheques instead of a low-balance alert (got ${s46F8.incomeSource}: ${s46D1?.message})`
+  );
+
+  // 46.7 With income, only a dip soon alerts: one 40 days out doesn't, one in 5 days does
+  await s33("PUT", "/api/settings/expected-pay", { nextDate: getTorontoOffsetDate(10), amount: 100 });
+  const s46Base = await s46Forecast();
+  const s46Deficit = Math.max(0, ...s46Base.days.map((d) => s46Base.startBalance - d.balance));
+  const s46Start = Math.round((200 + s46Deficit + 500) * 100) / 100;
+  await s33("PUT", "/api/checking", { balance: s46Start });
+  const s46Bill = (title, amount, offset) =>
+    Transaction.create({ title, amount, date: getTorontoOffsetDate(offset), type: "EXPENSE", category: "Other", isCleared: false });
+  await s46Bill("Suite46 Far Bill", s46Start + 10000, 40);
+  const s46F9 = await s46Forecast();
+  const s46D2 = await s46Digest();
+  assert(
+    s46F9.lowestPoint.date === getTorontoOffsetDate(40) && s46F9.lowestPoint.balance < 0 && !(s46D2?.message || "").includes("Low Balance Alert"),
+    `A dip 40 days out raises no alert (lowest ${s46F9.lowestPoint.balance} on ${s46F9.lowestPoint.date})`
+  );
+  await s46Bill("Suite46 Near Bill", 600, 5);
+  const s46D3 = await s46Digest();
+  assert(
+    s46D3?.priority === "high" && s46D3.message.includes(`Low Balance Alert: Lowest projected balance is`) && s46D3.message.includes(getTorontoOffsetDate(5)),
+    `A dip in 5 days, before the next payday, raises the alert (got ${s46D3?.message})`
+  );
+  await s46Clear();
+  await s33("DELETE", "/api/settings/expected-pay");
+
+  // 46.8 Gem feed: INCOME_SOURCE, PLANNING_PAY, TYPICAL_PAY, NEXT_PAYDAY match GET /forecast
+  for (let i = 0; i < s46Amounts.length; i++) await s46Income("Suite46 Acme Payroll", s46Amounts[i], -14 * i);
+  const [s46Feed, s46Md, s46Api] = await Promise.all([
+    s36(`/api/export/financial-feed.csv?key=${s36Key}`),
+    s36(`/api/export/financial-feed.md?key=${s36Key}`),
+    s46Forecast(),
+  ]);
+  const s46Rows = Object.fromEntries(s36ParseCsv(s46Feed.raw).filter((r) => r[0] === "FORECAST").map((r) => [r[1], r[2]]));
+  assert(
+    s46Rows.INCOME_SOURCE === "estimated" && s46Api.incomeSource === "estimated" &&
+      parseFloat(s46Rows.PLANNING_PAY) === s46Api.planningAmount && s46Api.planningAmount === 1375 &&
+      parseFloat(s46Rows.TYPICAL_PAY) === s46Api.typicalAmount && s46Rows.NEXT_PAYDAY === s46Api.nextPayday,
+    `CSV FORECAST has INCOME_SOURCE, PLANNING_PAY, TYPICAL_PAY, NEXT_PAYDAY matching GET /forecast (got ${JSON.stringify(s46Rows)})`
+  );
+  assert(
+    s46Md.raw.includes("**INCOME_SOURCE:** estimated") && s46Md.raw.includes("**PLANNING_PAY:** $1375.00") && s46Md.raw.includes("**TYPICAL_PAY:** $1500.00"),
+    "Markdown feed has the same pay fields"
+  );
+  const s46Gem = await s33("GET", "/api/export/gemini-config");
+  const s46GemText = JSON.stringify(s46Gem.body || {});
+  assert(s46GemText.includes("Pay varies; Safe to Spend already uses a cautious paycheque."), "Gem instructions say pay varies and Safe to Spend is already cautious");
+
+  // Cleanup
+  await s46Clear();
+  await Setting.destroy({ where: { key: ["pay_title", "expected_pay", "pay_title_ignored_notified"] } });
+  if (s46OrigBuffer) await Setting.upsert({ key: "forecast_buffer", value: s46OrigBuffer.value });
+  else await Setting.destroy({ where: { key: "forecast_buffer" } });
+  await Account.update({ initialBalance: s46OrigBalance }, { where: { id: s46Checking.id } });
+  await Transaction.update({ type: "INCOME" }, { where: { id: s46Parked.map((t) => t.id) } });
 
   // --- Suites 45, 47-50 (46 is taken by the variable-pay forecast branch): Bank CSV import, rules and the Review inbox (batch 7) ---
   const { Rule, ImportRef } = require("../models");
