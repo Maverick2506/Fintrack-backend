@@ -85,8 +85,8 @@ const buildMorningDigest = async (dbTx = null, options = {}) => {
     }
   }
 
-  // 3b. Price changes the nightly job found since the last digest; each is sent once
-  const priceAlerts = await takePendingPriceAlerts(dbTx);
+  // 3b. Price changes the nightly job found since the last digest; each is sent on one day only
+  const priceAlerts = await takePendingPriceAlerts(todayStr, dbTx);
   if (priceAlerts.length > 0) {
     sections.push(`💸 Price Changes:`);
     for (const alert of priceAlerts) {

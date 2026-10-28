@@ -72,11 +72,14 @@ const getCardStatement = async (card, todayStr, dbTx = null) => {
   const balance = parseFloat(card.initialBalance) || 0;
   const statementBalance = round2(Math.min(Math.max(0, balance), Math.max(0, balance - newCharges)));
 
+  const nextStatementDate = getNextStatementDate(statementDate, statementDay);
   return {
     statementDay,
     statementDate,
-    nextStatementDate: getNextStatementDate(statementDate, statementDay),
+    nextStatementDate,
     dueDate,
+    // The next statement's due date, for when this one's has passed
+    nextDueDate: dueDay ? getStatementDueDate(nextStatementDate, dueDay) : null,
     statementBalance,
     newCharges,
   };

@@ -8249,24 +8249,60 @@ async function runTestSuite() {
       `(got ${s55WithFund.safeToSpend} vs ${s55Unlinked.safeToSpend} unlinked, planned ${JSON.stringify(s55Planned)})`
   );
 
+  // A bill already inside Safe to Spend's window is counted on its date, so nothing is set aside for it too
+  const s55SoonBill = await Transaction.create({
+    title: "Suite55 Registration", amount: 400, date: getTorontoOffsetDate(10), type: "EXPENSE", category: "Transportation",
+    isCleared: false, recurrence: "yearly",
+  });
+  const s55NoSoon = await s54Forecast(60);
+  const s55Soon = await s33("POST", "/api/savings-goals", { name: "Suite55 Soon", linkedRecurringGroupId: s55SoonBill.recurringGroupId });
+  const s55WithSoon = await s54Forecast(60);
+  const s55SoonGoal = (await s33("GET", "/api/savings-goals")).body.find((g) => g.id === s55Soon.body.id);
+  assert(
+    s55Soon.status === 201 && Math.abs(s55WithSoon.safeToSpend - s55NoSoon.safeToSpend) < 0.005 &&
+      !s54ItemsOn(s55WithSoon, s55Today).some((it) => it.title === "Set aside for Suite55 Soon") &&
+      s55WithSoon.sinkingFunds.some((f) => f.id === s55Soon.body.id && f.billInWindow) &&
+      s55SoonGoal.sinkingFund.billInForecast === true && s55G1.sinkingFund.billInForecast === false,
+    `A $400 bill due in 10 days: linking a goal to it leaves Safe to Spend as it was (got ${s55NoSoon.safeToSpend} -> ${s55WithSoon.safeToSpend})`
+  );
+  await Account.destroy({ where: { id: s55Soon.body.id } });
+  await Transaction.destroy({ where: { recurringGroupId: s55SoonBill.recurringGroupId }, force: true });
+
   const s55NoLink = await s33("POST", "/api/savings-goals", { name: "Suite55 Plain", target_amount: 500, target_date: s55Due });
   const s55NoLinkSetup = await s33("POST", `/api/savings-goals/${s55NoLink.body.id}/monthly-transfer`, {});
   const s55Setup = await s33("POST", `/api/savings-goals/${s55Goal.id}/monthly-transfer`, {});
   const s55Again = await s33("POST", `/api/savings-goals/${s55Goal.id}/monthly-transfer`, {});
-  const s55Transfer = await Transaction.findByPk(s55Setup.body.id);
+  const s55Transfers = await Transaction.findAll({ where: { toAccountId: s55Goal.id }, order: [["date", "ASC"]] });
+  const s55Transfer = s55Transfers[0];
   const s55G2 = await s55Get();
   const s55WithTransfer = await s54Forecast(60);
   const s55TodayItems = s54ItemsOn(s55WithTransfer, s55Today);
   assert(
     s55NoLinkSetup.status === 409 && s55Setup.status === 201 && s55Again.status === 409 &&
-      s55Transfer.type === "TRANSFER" && s55Transfer.recurrence === "monthly" && s55Transfer.fromAccountId === s54Checking.id &&
-      s55Transfer.toAccountId === s55Goal.id && parseFloat(s55Transfer.amount) === s55Expect.monthly &&
-      s55Transfer.date === s55Today && !s55Transfer.isCleared,
-    `"Set up monthly transfer" creates a monthly $${s55Expect.monthly} transfer from Checking to the goal, starting today; ` +
-      `a second tap or a goal with no bill is refused (got ${s55NoLinkSetup.status}/${s55Setup.status}/${s55Again.status})`
+      s55Transfers.map((t) => t.date).join() === s55Expect.dates.join() &&
+      s55Transfers.every(
+        (t) => t.type === "TRANSFER" && t.recurrence === "none" && t.recurringGroupId === s55Transfer.recurringGroupId &&
+          t.fromAccountId === s54Checking.id && !t.isCleared
+      ) &&
+      Math.abs(s55Transfers.reduce((sum, t) => sum + parseFloat(t.amount), 0) - 1200) < 0.005 &&
+      parseFloat(s55Transfer.amount) === s55Expect.monthly && s55Transfer.date === s55Today &&
+      s55Setup.body.until === s55Expect.dates[s55Expect.dates.length - 1],
+    `"Set up monthly transfer" schedules a $${s55Expect.monthly} transfer from Checking on each contribution date up to the ` +
+      `due date (${s55Expect.dates.length}, adding up to $1,200); a second tap or a goal with no bill is refused ` +
+      `(got ${s55NoLinkSetup.status}/${s55Setup.status}/${s55Again.status}, ${s55Transfers.map((t) => `${t.date}/${t.amount}/${t.recurrence}`)})`
+  );
+  // The transfers end with the due date: the generator adds none and the forecast shows none after it
+  const { createRecurringExpenses: s55Generate } = require("../routes/recurring");
+  await s55Generate();
+  const s55Long = await s54Forecast(200);
+  assert(
+    (await Transaction.count({ where: { toAccountId: s55Goal.id } })) === s55Expect.dates.length &&
+      !s55Long.days.some((d) => d.date > s55Due && d.items.some((it) => it.title === "Contribution to Suite55 Fund")),
+    "No contribution is generated or projected after the due date"
   );
   assert(
     s55G2.sinkingFund.monthlyTransfer?.amount === s55Expect.monthly &&
+      s55G2.sinkingFund.monthlyTransfer?.until === s55Expect.dates[s55Expect.dates.length - 1] &&
       !s55WithTransfer.days.some((d) => d.items.some((it) => it.planned)) &&
       s55TodayItems.some((it) => it.title === "Contribution to Suite55 Fund" && it.amount === -s55Expect.monthly) &&
       Math.abs(s55WithTransfer.safeToSpend - s55WithFund.safeToSpend) < 0.005,
@@ -8327,15 +8363,19 @@ async function runTestSuite() {
       s56Pending[0].from === 16.49 && s56Pending[0].to === 18.99,
     `The nightly job finds Netflix $16.49 -> $18.99 (+15%), not a 4% change or one from 50 days ago (got ${JSON.stringify(s56Pending)})`
   );
+  const s56Tomorrow = getTorontoOffsetDate(1);
   const s56D1 = await s56Digest(null, { todayStr: s56Today });
   const s56D2 = await s56Digest(null, { todayStr: s56Today });
+  const s56D2b = await s56Digest(null, { todayStr: s56Tomorrow });
   assert(
     s56D1?.message.includes("Suite56 Netflix $16.49 → $18.99") && !s56D1.message.includes("Hydro") &&
-      !(s56D2?.message || "").includes("Suite56 Netflix"),
-    `The digest (sent to ntfy) says "Suite56 Netflix $16.49 → $18.99" once (got ${JSON.stringify(s56D1?.message)})`
+      (s56D2?.message || "").includes("Suite56 Netflix $16.49 → $18.99") &&
+      !(s56D2b?.message || "").includes("Suite56 Netflix"),
+    `The digest (sent to ntfy) says "Suite56 Netflix $16.49 → $18.99" on one day: a retry that day repeats it, ` +
+      `the next day's digest doesn't (got ${JSON.stringify(s56D1?.message)})`
   );
   const s56Run2 = await s56Sweep({ todayStr: s56Today });
-  const s56D3 = await s56Digest(null, { todayStr: s56Today });
+  const s56D3 = await s56Digest(null, { todayStr: s56Tomorrow });
   assert(
     s56Run2.priceAlerts === 0 && !(s56D3?.message || "").includes("Suite56 Netflix"),
     `The next night the same change is not alerted again (got ${s56Run2.priceAlerts})`
@@ -8353,7 +8393,8 @@ async function runTestSuite() {
   const s56Run4 = await s56Sweep({ todayStr: s56Today });
   const s56D4 = await s56Digest(null, { todayStr: s56Today });
   assert(
-    s56Run3.priceAlerts === 0 && s56Run4.priceAlerts === 1 && s56D4?.message.includes("Suite56 Netflix $18.99 → $20.99"),
+    s56Run3.priceAlerts === 0 && s56Run4.priceAlerts === 1 && s56D4?.message.includes("Suite56 Netflix $18.99 → $20.99") &&
+      !s56D4.message.includes("$16.49"),
     `Same price again: no alert; a new rise ($18.99 -> $20.99) alerts once more (got ${s56Run3.priceAlerts}/${s56Run4.priceAlerts})`
   );
   await Transaction.destroy({ where: { title: { [Op.like]: "Suite56 %" } }, force: true });
@@ -8364,6 +8405,16 @@ async function runTestSuite() {
     Transaction.create({
       title, amount, date: getTorontoOffsetDate(-daysAgo), type: "EXPENSE", category: "Subscriptions", isCleared: true, ...extra,
     });
+  const { displayPayeeTitle: s57Display } = require("../utils/payeeNormalizer");
+  const s57Names = [
+    ["Spotify 10/22", "Spotify"], ["NETFLIX.COM 866-579-7172", "NETFLIX.COM"], ["Hydro #4521 Oct 2026", "Hydro"],
+    ["Rogers (416) 555-1234", "Rogers"], ["7-Eleven", "7-Eleven"], ["Apple iCloud+", "Apple iCloud+"], ["10/22", "10/22"],
+  ];
+  assert(
+    s57Names.every(([raw, want]) => s57Display(raw) === want),
+    `Series names drop one charge's date, reference and phone number but keep the rest as typed ` +
+      `(got ${s57Names.map(([raw]) => s57Display(raw))})`
+  );
   const s57Spotify = [await s57Add("Spotify 10/22", 11.99, 5), await s57Add("SPOTIFY 09/22", 11.99, 35), await s57Add("Spotify", 12.3, 65)];
   await s57Add("Suite57 Gym", 50, 3); await s57Add("Suite57 Gym", 50, 33); await s57Add("Suite57 Gym", 80, 63); // amount differs
   await s57Add("Suite57 Coffee", 5, 2); await s57Add("Suite57 Coffee", 5, 7); await s57Add("Suite57 Coffee", 5, 12); // weekly-ish
@@ -8388,16 +8439,19 @@ async function runTestSuite() {
       s57Dismiss2.status === 404,
     `Dismiss is remembered in a Setting, also after a new charge (got ${s57Dismiss.status}, ${JSON.stringify(s57Dismissed)})`
   );
+  const s57BadName = await s33("POST", `/api/alerts/subscription-suggestions/${s57Spotify[0].id}/accept`, { title: "  " });
   const s57Accept = await s33("POST", `/api/alerts/subscription-suggestions/${s57Spotify[0].id}/accept`, {});
   const s57Rows = await Transaction.findAll({ where: { recurringGroupId: s57Accept.body.recurringGroupId }, order: [["date", "ASC"]] });
   const s57Next = getNextOccurrenceDate(s57Spotify[0].date, "monthly", 1);
   assert(
-    s57Accept.status === 201 && s57Rows.length === 4 &&
+    s57BadName.status === 400 && s57Accept.status === 201 && s57Accept.body.title === "Spotify" && s57Sp.title === "Spotify" &&
+      s57Rows.slice(2).every((r) => r.title === "Spotify") && s57Rows[0].title === "Spotify" && s57Rows[1].title === "SPOTIFY 09/22" &&
+      s57Rows.length === 4 &&
       s57Rows.filter((r) => r.recurrence === "monthly").map((r) => r.date).join() === [s57Spotify[0].date, s57Next].join() &&
       s57Rows.slice(0, 2).every((r) => r.recurrence === "none") && s57Rows[3].date === s57Next && !s57Rows[3].isCleared &&
       parseFloat(s57Rows[3].amount) === 11.99,
-    `Accept makes the newest charge a monthly series (older charges join it as history) and the next charge is ` +
-      `generated for ${s57Next} (got ${s57Rows.map((r) => `${r.date}/${r.recurrence}`)})`
+    `Accept makes the newest charge a monthly series named "Spotify" (no date from one charge; older charges join it as ` +
+      `history) and the next "Spotify" charge is generated for ${s57Next} (got ${s57Rows.map((r) => `${r.date}/${r.recurrence}/${r.title}`)})`
   );
   const s57L3 = await s57Get();
   const s57Again = await s33("POST", `/api/alerts/subscription-suggestions/${s57Spotify[0].id}/accept`, {});

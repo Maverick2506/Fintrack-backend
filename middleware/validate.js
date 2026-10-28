@@ -360,6 +360,13 @@ const schemas = {
   // POST /savings-goals/:id/monthly-transfer and the subscription suggestion actions take no fields
   noFields: z.object({}).strict().optional().default({}),
 
+  // Accept a "Make this a subscription?" suggestion, optionally with the series' name
+  acceptSuggestion: z
+    .object({ title: z.string().trim().min(1, "Name the subscription").max(255).optional() })
+    .strict()
+    .optional()
+    .default({}),
+
   // PUT /expenses/:id?dryRun=1 previews the change (e.g. ending a series) and saves nothing
   dryRunQuery: z.object({
     dryRun: z.enum(["0", "1", "true", "false"]).optional(),

@@ -13,6 +13,13 @@ const {
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
+// Safe to Spend's window (the Dashboard forecast is 60 days, today included)
+const FORECAST_WINDOW_DAYS = 60;
+const addDays = (dateStr, days) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days, 12)).toISOString().slice(0, 10);
+};
+
 const firstOfNextMonth = (todayStr) => {
   const [y, m] = todayStr.split("-").map(Number);
   return m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
@@ -91,13 +98,16 @@ const getLinkedBill = (rowsNewestFirst, todayStr) => {
     recurrence: template.recurrence,
     amount: round2(amount || 0),
     nextDate,
+    // Charged to Checking (not a card): the forecast counts it on its date
+    fromChecking: !template.fromAccount || template.fromAccount.type === "CHECKING",
   };
 };
 
 /**
  * Sinking fund details for the given goals (default: every active goal with a linked bill), keyed by
  * goal id: { linkedBill, target, dueDate, remaining, monthly, dates, ready, overdue, monthlyTransfer }.
- * monthlyTransfer is the goal's running contribution series ({ recurringGroupId, amount, recurrence }),
+ * monthlyTransfer is the goal's running contribution series, or the transfers "Set up monthly transfer"
+ * scheduled ({ recurringGroupId, amount, recurrence, until, count }),
  * or null. Safe to Spend plans `monthly` only when there is no such series (the series is projected).
  */
 const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
@@ -121,6 +131,7 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
   const [billRows, goalRows] = await Promise.all([
     Transaction.findAll({
       where: { recurringGroupId: { [Op.in]: groupIds } },
+      include: [{ model: Account, as: "fromAccount" }],
       order: [["date", "DESC"], ["createdAt", "DESC"]],
       transaction: dbTx,
     }),
@@ -156,6 +167,10 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
       .map((s) => s.template)
       .filter((t) => t.toAccountId === goal.id)
       .sort((a, b) => b.date.localeCompare(a.date))[0];
+    // "Set up monthly transfer" schedules one transfer per contribution date (it ends on its own)
+    const scheduled = goalRows
+      .filter((r) => r.toAccountId === goal.id && !r.isCleared && r.date >= monthStart)
+      .sort((a, b) => a.date.localeCompare(b.date));
 
     const fund = computeSinkingFund({
       current: (parseFloat(goal.initialBalance) || 0) + scheduledThisMonth,
@@ -168,11 +183,26 @@ const getSinkingFunds = async (todayStr, dbTx = null, goals = null) => {
       name: goal.name,
       linkedBill: bill,
       ...(fund || { target, dueDate, remaining: null, monthly: null, dates: [], ready: false, overdue: false }),
+      // The bill's next charge is already in Safe to Spend's window, so nothing more is set aside for it
+      billInForecast: Boolean(
+        bill?.nextDate && bill.fromChecking && dueDate && bill.nextDate <= dueDate &&
+          bill.nextDate <= addDays(todayStr, FORECAST_WINDOW_DAYS - 1)
+      ),
       monthlyTransfer: running
         ? {
             recurringGroupId: running.recurringGroupId || running.id,
             amount: round2(parseFloat(running.amount) || 0),
             recurrence: running.recurrence,
+            until: null,
+            count: null,
+          }
+        : scheduled.length > 0
+        ? {
+            recurringGroupId: scheduled[0].recurringGroupId,
+            amount: round2(parseFloat(scheduled[0].amount) || 0),
+            recurrence: "monthly",
+            until: scheduled[scheduled.length - 1].date,
+            count: scheduled.length,
           }
         : null,
     });

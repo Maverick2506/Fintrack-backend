@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
 const { Op } = require("sequelize");
@@ -7,7 +8,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
-const { groupSeries, createRecurringExpenses, ACTIVE_RECURRENCES } = require("./recurring");
+const { groupSeries, ACTIVE_RECURRENCES } = require("./recurring");
 const { getSinkingFunds } = require("../services/sinkingFundService");
 const router = express.Router();
 router.param("id", validateIdParam);
@@ -43,6 +44,7 @@ const formatSinkingFund = (fund) =>
         ready: fund.ready,
         overdue: fund.overdue,
         monthlyTransfer: fund.monthlyTransfer,
+        billInForecast: fund.billInForecast,
       }
     : null;
 
@@ -404,17 +406,16 @@ router.put(
   })
 );
 
-// "Set up monthly transfer" for a sinking fund: a monthly TRANSFER from Checking to the goal for the
-// sinking fund's monthly amount, starting on its first contribution date. Refused when the goal has no
-// linked bill, nothing left to save, or already has a running transfer. Upcoming rows are generated
-// after the commit.
+// "Set up monthly transfer" for a sinking fund: monthly TRANSFERs from Checking to the goal for the
+// sinking fund's monthly amount, on each contribution date up to the due date. Refused when the goal
+// has no linked bill, nothing left to save, or already has a running or scheduled transfer.
 router.post(
   "/savings-goals/:id/monthly-transfer",
   validateBody(schemas.noFields),
   asyncHandler(async (req, res) => {
     const todayStr = getTodayString();
     const dbTx = await sequelize.transaction();
-    let row;
+    let rows;
     try {
       const goal = await Account.findByPk(req.params.id, { transaction: dbTx });
       if (!goal || goal.type !== "SAVINGS_GOAL" || goal.isActive === false) {
@@ -440,37 +441,43 @@ router.post(
         defaults: { type: "CHECKING", initialBalance: 0.0 },
         transaction: dbTx,
       });
-      row = await Transaction.create(
-        {
-          title: `Contribution to ${goal.name}`,
-          amount: fund.monthly,
-          date: fund.dates[0],
-          type: "TRANSFER",
-          category: "Savings Transfer",
-          isCleared: false,
-          balanceApplied: false,
-          recurrence: "monthly",
-          fromAccountId: checking.id,
-          toAccountId: goal.id,
-        },
-        { transaction: dbTx }
-      );
+      // One scheduled transfer per contribution date up to the due date, so the transfers stop once
+      // the bill is covered. They share a group id (one "series" in the Ledger) but none recurs, so
+      // the generator never adds more. The last one is what's left, so they add up to the target.
+      const recurringGroupId = crypto.randomUUID();
+      const count = fund.dates.length;
+      const lastAmount = Math.round((fund.remaining - fund.monthly * (count - 1)) * 100) / 100;
+      rows = [];
+      for (const [i, date] of fund.dates.entries()) {
+        const row = await Transaction.create(
+          {
+            title: `Contribution to ${goal.name}`,
+            amount: i === count - 1 && lastAmount > 0 ? lastAmount : fund.monthly,
+            date,
+            type: "TRANSFER",
+            category: "Savings Transfer",
+            isCleared: false,
+            balanceApplied: false,
+            recurrence: "none",
+            recurringGroupId,
+            fromAccountId: checking.id,
+            toAccountId: goal.id,
+          },
+          { transaction: dbTx }
+        );
+        rows.push(row);
+      }
       await dbTx.commit();
     } catch (error) {
       if (!dbTx.finished) await dbTx.rollback();
       throw error;
     }
-    try {
-      await createRecurringExpenses();
-    } catch (err) {
-      console.error("Recurring generation after monthly transfer failed:", err);
-    }
     res.status(201).json({
-      id: row.id,
-      recurringGroupId: row.recurringGroupId,
-      amount: parseFloat(row.amount),
-      date: row.date,
-      recurrence: row.recurrence,
+      recurringGroupId: rows[0].recurringGroupId,
+      amount: parseFloat(rows[0].amount),
+      dates: rows.map((r) => r.date),
+      until: rows[rows.length - 1].date,
+      count: rows.length,
     });
   })
 );

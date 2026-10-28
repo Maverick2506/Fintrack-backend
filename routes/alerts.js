@@ -29,12 +29,12 @@ router.get(
 // Accept: the newest charge becomes a monthly series; upcoming rows are generated after the commit
 router.post(
   "/subscription-suggestions/:id/accept",
-  validateBody(schemas.noFields),
+  validateBody(schemas.acceptSuggestion),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     let result;
     try {
-      result = await acceptSubscriptionSuggestion(req.params.id, getTodayString(), dbTx);
+      result = await acceptSubscriptionSuggestion(req.params.id, getTodayString(), dbTx, req.body.title);
       if (!result) {
         await dbTx.rollback();
         return res.status(404).json(NOT_FOUND);

@@ -2,7 +2,7 @@ const crypto = require("crypto");
 const { Op } = require("sequelize");
 const { Account, Transaction, Setting } = require("../models");
 const { getSubscriptionsSummary } = require("./subscriptionService");
-const { normalizePayeeTitle } = require("../utils/payeeNormalizer");
+const { normalizePayeeTitle, displayPayeeTitle } = require("../utils/payeeNormalizer");
 const {
   getNextOccurrenceDate,
   markSeriesRestart,
@@ -77,12 +77,20 @@ const recordPriceChanges = async (todayStr, dbTx = null) => {
   return alerts;
 };
 
-// The digest takes the queued alerts and clears the queue, so each is sent once
-const takePendingPriceAlerts = async (dbTx = null) => {
+// The digest sends the queued alerts on one day only: each is stamped with the day it was first sent
+// and sent again that day (the cron retries a digest that failed or timed out), then dropped.
+const takePendingPriceAlerts = async (todayStr, dbTx = null) => {
   const pending = await readJsonSetting(PRICE_ALERTS_PENDING_KEY, [], dbTx);
   if (!Array.isArray(pending) || pending.length === 0) return [];
-  await Setting.destroy({ where: { key: PRICE_ALERTS_PENDING_KEY }, transaction: dbTx });
-  return pending;
+  const due = pending
+    .filter((a) => !a.sentOn || a.sentOn === todayStr)
+    .map((a) => ({ ...a, sentOn: todayStr }));
+  if (due.length === 0) {
+    await Setting.destroy({ where: { key: PRICE_ALERTS_PENDING_KEY }, transaction: dbTx });
+  } else {
+    await Setting.upsert({ key: PRICE_ALERTS_PENDING_KEY, value: JSON.stringify(due) }, { transaction: dbTx });
+  }
+  return due;
 };
 
 const formatPriceAlert = (a) => `${a.title} $${a.from.toFixed(2)} → $${a.to.toFixed(2)}`;
@@ -163,7 +171,9 @@ const findSubscriptionSuggestions = async (todayStr, dbTx = null) => {
     suggestions.push({
       id: latest.id,
       key,
-      title: latest.title,
+      // The series' name: the payee without the date or reference of one charge ("Spotify 10/22" -> "Spotify")
+      title: displayPayeeTitle(latest.title),
+      rawTitle: latest.title,
       amount: round2(parseFloat(latest.amount)),
       category: latest.category,
       accountName: latest.fromAccount ? latest.fromAccount.name : "Primary Checking",
@@ -178,11 +188,12 @@ const findSubscriptionSuggestions = async (todayStr, dbTx = null) => {
 
 /**
  * Accept: the newest row becomes a monthly series and the two older rows join it as its history.
- * The series starts generating from today on (no backfill of a month that passed since the newest
- * row). Returns { recurringGroupId }, or null when the id is not a current suggestion.
- * Generation runs after the caller commits.
+ * The newest row, the series' template, takes the suggestion's clean name (or `title` when given), so
+ * generated charges don't repeat one charge's date. The series starts generating from today on (no
+ * backfill of a month that passed since the newest row). Returns { recurringGroupId, title, nextDate },
+ * or null when the id is not a current suggestion. Generation runs after the caller commits.
  */
-const acceptSubscriptionSuggestion = async (id, todayStr, dbTx) => {
+const acceptSubscriptionSuggestion = async (id, todayStr, dbTx, title = null) => {
   const suggestion = (await findSubscriptionSuggestions(todayStr, dbTx)).find((s) => s.id === id);
   if (!suggestion) return null;
   const recurringGroupId = crypto.randomUUID();
@@ -192,9 +203,10 @@ const acceptSubscriptionSuggestion = async (id, todayStr, dbTx) => {
     { where: { id: { [Op.in]: olderIds } }, transaction: dbTx }
   );
   const latest = await Transaction.findByPk(latestId, { transaction: dbTx });
-  await latest.update({ recurrence: "monthly", recurringGroupId }, { transaction: dbTx });
+  const seriesTitle = title || suggestion.title;
+  await latest.update({ recurrence: "monthly", recurringGroupId, title: seriesTitle }, { transaction: dbTx });
   await markSeriesRestart(recurringGroupId, todayStr, dbTx);
-  return { recurringGroupId, title: suggestion.title, nextDate: suggestion.nextDate };
+  return { recurringGroupId, title: seriesTitle, nextDate: suggestion.nextDate };
 };
 
 // Dismiss: remembered by normalized title, so the same charge is not suggested again

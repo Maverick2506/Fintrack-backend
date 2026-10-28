@@ -193,6 +193,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
             title: `[Overdue] ${trx.title}`,
             amount: -effAmt,
             type: "expense",
+            seriesId: trx.recurringGroupId,
           });
         }
       } else if (trx.type === "TRANSFER") {
@@ -242,6 +243,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           title: trx.title,
           amount: -effAmt,
           type: "expense",
+          seriesId: trx.recurringGroupId,
         });
       }
       // Note: Credit Card charges (fromAccount.type === "CREDIT_CARD") do NOT reduce checking!
@@ -319,6 +321,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
               amount: -effAmt,
               type: "expense",
               virtual: true,
+              seriesId: latest.recurringGroupId,
             });
           }
         } else if (latest.type === "TRANSFER") {
@@ -385,10 +388,20 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   }
 
   // 3d. Sinking funds: a goal saving for a bill sets its monthly amount aside on each contribution date
-  //     (sinkingFundService), unless a recurring transfer to the goal already does (projected in step 3)
+  //     (sinkingFundService), unless transfers to the goal already do (projected above), or the bill's
+  //     charge itself is in the window by the fund's due date: it is counted on its date, and setting
+  //     money aside for it as well would count it twice.
   const sinkingFunds = [];
   for (const [goalId, fund] of await getSinkingFunds(todayStr, dbTx)) {
     if (fund.monthlyTransfer || !fund.monthly) continue;
+    const billGroupId = fund.linkedBill?.recurringGroupId;
+    const billInWindow = Object.values(daysMap).some(
+      (day) => day.date <= fund.dueDate && day.items.some((it) => billGroupId && it.seriesId === billGroupId)
+    );
+    if (billInWindow) {
+      sinkingFunds.push({ id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates: [], billInWindow: true });
+      continue;
+    }
     const plannedDates = fund.dates.filter((d) => daysMap[d]);
     for (const d of plannedDates) {
       daysMap[d].items.push({
@@ -398,7 +411,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         planned: true,
       });
     }
-    sinkingFunds.push({ id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates });
+    sinkingFunds.push({ id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates, billInWindow: false });
   }
 
   // 4. Debts: interest on each due date, then auto-pay, projected exactly as the daily sweep runs them

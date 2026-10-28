@@ -50,4 +50,32 @@ const normalizePayeeTitle = (rawTitle) => {
   return cleaned || fallback;
 };
 
-module.exports = { normalizePayeeTitle };
+// The same date, reference and long-number tokens in any case, for display names
+const ci = (re) => new RegExp(re.source, "giu");
+const PHONE = new RegExp(`${B}\\(?\\d{3}\\)?[-. ]?\\d{3}[-. ]\\d{4}${E}`, "gu");
+
+/**
+ * A payee name to show and to title a new series with: "Spotify 10/22" -> "Spotify",
+ * "NETFLIX.COM 866-579-7172" -> "NETFLIX.COM", "Hydro #4521 Oct 2026" -> "Hydro". Removes what
+ * normalizePayeeTitle removes (dates, references, long numbers, phone numbers) but keeps the casing
+ * and spacing of the rest. Falls back to the trimmed title when nothing would be left.
+ */
+const displayPayeeTitle = (rawTitle) => {
+  if (!rawTitle || typeof rawTitle !== "string") return "";
+  const fallback = rawTitle.replace(/\s+/g, " ").trim();
+  const cleaned = fallback
+    .replace(PHONE, " ")
+    .replace(ci(ISO_DATE), " ")
+    .replace(ci(NUMERIC_DATE), " ")
+    .replace(ci(MONTH_DATE), " ")
+    .replace(ci(HASH_REF), " ")
+    .replace(ci(WORD_REF), " ")
+    .replace(ci(LONG_NUMBER), " ")
+    .split(/\s+/)
+    .filter((token) => token && (token === "&" || /[\p{L}\d]/u.test(token)))
+    .join(" ")
+    .replace(/^[\s&'.,*:/-]+|[\s&',*:/-]+$/g, "");
+  return cleaned || fallback;
+};
+
+module.exports = { normalizePayeeTitle, displayPayeeTitle };
