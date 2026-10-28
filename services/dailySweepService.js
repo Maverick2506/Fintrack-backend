@@ -13,6 +13,8 @@ const {
 } = require("./debtInterestService");
 const { getBalancesSummary } = require("./netWorthService");
 const { purgeDeletedTransactions } = require("./trashService");
+const { recordPriceChanges } = require("./alertService");
+const { payLinkedBillByDefault, settleCardFundBillsByDefault } = require("./sinkingFundService");
 
 const TIMEZONE = "America/Toronto";
 // Arbitrary constant shared by every instance so only one sweep runs at a time across processes
@@ -100,6 +102,7 @@ const runDailySweep = async (options = {}) => {
     let clearedIncomeCount = 0;
     let autoPayCount = 0;
     let interestCount = 0;
+    const paidFromFunds = [];
 
     // 0. Debt interest on each due date, before any payment that day (R2). Debts only, not cards;
     //    archived debts keep their balance. Auto-pay debts move to the next due date in step 3; other
@@ -201,6 +204,17 @@ const runDailySweep = async (options = {}) => {
         bill.taxApplied = taxApplied;
         await adjustAccountForTransaction(bill, 1, dbTx, true);
         clearedExpenseCount++;
+        // A bill a savings goal saves for is paid from it (the default when marking it paid), and the
+        // goal rolls on to the bill's next charge
+        // (a bill charged to a card waits: its fund pays when the card is paid)
+        const fundResult = await payLinkedBillByDefault(bill, todayString, dbTx);
+        if (fundResult?.paidFromFund) paidFromFunds.push({ billId: bill.id, ...fundResult.paidFromFund });
+        // A scheduled card payment: the bills on it that savings goals save for are paid from them
+        if (bill.toAccount?.type === "CREDIT_CARD") {
+          for (const paid of await settleCardFundBillsByDefault(bill, todayString, dbTx)) {
+            if (paid.transferId) paidFromFunds.push({ paymentId: bill.id, ...paid });
+          }
+        }
       }
     }
 
@@ -370,6 +384,16 @@ const runDailySweep = async (options = {}) => {
     }
 
     await dbTx.commit();
+
+    // 6. Price changes in recurring bills, queued for the morning digest (alertService). After the
+    //    commit and on its own: a failure here must not undo the sweep.
+    let priceAlerts = [];
+    try {
+      priceAlerts = await recordPriceChanges(todayString);
+    } catch (err) {
+      console.error("Price-change check failed:", err);
+    }
+
     console.log(
       `Daily sweep complete: ${clearedExpenseCount} expenses cleared, ${clearedIncomeCount} incomes cleared, ${autoPayCount} auto-pays processed. Net worth snapshot recorded (${balances.netWorth}).`
     );
@@ -379,6 +403,8 @@ const runDailySweep = async (options = {}) => {
       autoPayProcessed: autoPayCount,
       interestRecorded: interestCount,
       purgedFromTrash: purgedCount,
+      priceAlerts: priceAlerts.length,
+      paidFromFunds: paidFromFunds.length,
       date: todayString,
       netWorth: balances.netWorth,
     };

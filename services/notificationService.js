@@ -3,6 +3,7 @@ const { Op } = require("sequelize");
 const { getTodayString } = require("./accountBalanceService");
 const { addCalendarDays, getForecast } = require("./forecastService");
 const { toZonedTime } = require("date-fns-tz");
+const { takePendingPriceAlerts, formatPriceAlert } = require("./alertService");
 
 const LOW_BALANCE_WINDOW_DAYS = 14;
 const NO_INCOME_NOTE = "No income in your forecast — log your paycheques or set Expected pay";
@@ -45,6 +46,7 @@ const lowBalanceDip = (forecast) => {
  * Returns { title, message, priority, tags } or null if nothing to report.
  *
  * @param {import("sequelize").Transaction|null} [dbTx=null]
+ * @param {{ todayStr?: string }} [options] todayStr overrides "today" (America/Toronto) for tests
  * @returns {Promise<{ title: string, message: string, priority: string, tags: string } | null>}
  */
 const buildMorningDigest = async (dbTx = null, options = {}) => {
@@ -117,6 +119,19 @@ const buildMorningDigest = async (dbTx = null, options = {}) => {
       } else {
         sections.push(`  • ${card.name} payment due on ${card.dueDate}`);
       }
+    }
+  }
+
+  // 3b. Price changes the nightly job found since the last digest; each is sent on one day only
+  const priceAlerts = await takePendingPriceAlerts(todayStr, dbTx);
+  if (priceAlerts.length > 0) {
+    sections.push(`💸 Price Changes:`);
+    for (const alert of priceAlerts) {
+      sections.push(
+        showAmounts
+          ? `  • ${formatPriceAlert(alert)}`
+          : `  • ${alert.title} price went ${alert.to > alert.from ? "up" : "down"}`
+      );
     }
   }
 

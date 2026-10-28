@@ -57,6 +57,18 @@ const optionalDate = z.preprocess(
   z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").nullable().optional()
 );
 
+// Card statement day: 1-31, or empty/null to clear
+const optionalStatementDay = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.coerce.number().int().min(1, "Statement day is 1-31").max(31, "Statement day is 1-31").nullable().optional()
+);
+
+// A goal's linked bill: a series id, or empty/null to unlink
+const optionalSeriesId = z.preprocess(
+  (v) => (v === "" ? null : v),
+  z.string().uuid("Invalid bill").nullable().optional()
+);
+
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { DATE_FORMATS, MAX_IMPORT_ROWS } = require("../utils/csvImport");
 
@@ -89,6 +101,12 @@ const importMapping = z
       (m.debit !== undefined && m.debit !== null && m.credit !== undefined && m.credit !== null),
     { message: "Map an amount column, or both a debit and a credit column", path: ["amount"] }
   );
+
+// Card payments: each bill on the payment that a savings goal saves for, and whether its fund pays
+const fundBillsSchema = z
+  .array(z.object({ billId: z.string().uuid(), useFund: z.boolean() }))
+  .max(50)
+  .optional();
 
 const schemas = {
   createExpense: z.object({
@@ -133,6 +151,10 @@ const schemas = {
     taxApplied: z.boolean().optional(),
     recurringGroupId: z.string().uuid().nullable().optional(),
     clientRef: z.string().uuid().nullable().optional(),
+    // "Pay from <fund>" when marking a bill paid: the savings goal saving for this bill
+    payFromGoalId: z.string().uuid().nullable().optional(),
+    // "Use $X from <fund>" when marking a card payment paid: the bills on it that funds save for
+    fundBills: fundBillsSchema,
   }),
 
   createPaycheque: z.object({
@@ -150,12 +172,24 @@ const schemas = {
     amount: z.coerce.number().positive("Payment amount must be greater than 0"),
   }),
 
+  cardPayment: z.object({
+    amount: z.coerce.number().positive("Payment amount must be greater than 0"),
+    fundBills: fundBillsSchema,
+  }),
+
   createCreditCard: z.object({
     name: z.string().trim().min(1, "Card name is required").max(255),
     creditLimit: z.coerce.number().nonnegative("Credit limit cannot be negative"),
     currentBalance: z.coerce.number().optional().default(0),
     initialBalance: z.coerce.number().optional(),
     dueDate: optionalDate,
+    statementDay: optionalStatementDay,
+  }),
+
+  // POST /credit-cards/:id/scheduled-payment: "Pay statement balance" / "Pay full balance"
+  setScheduledCardPayment: z.object({
+    transactionId: z.string().uuid(),
+    pay: z.enum(["statement", "full"]),
   }),
 
   updateCreditCard: z.object({
@@ -164,6 +198,7 @@ const schemas = {
     currentBalance: z.coerce.number().optional(),
     initialBalance: z.coerce.number().optional(),
     dueDate: optionalDate,
+    statementDay: optionalStatementDay,
   }),
 
   createDebt: z.object({
@@ -221,12 +256,16 @@ const schemas = {
       ),
     contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
+    linkedRecurringGroupId: optionalSeriesId,
+    // A one-time bill to save for (a transaction id); it becomes the goal's linked bill
+    linkedBillId: z.string().uuid().optional(),
   }),
 
   updateSavingsGoal: z.object({
     name: z.string().trim().min(1).max(255).optional(),
-    target_amount: optionalNumber(z.coerce.number().positive()),
-    goal_amount: optionalNumber(z.coerce.number().positive()),
+    // null clears the goal's own target, so a goal saving for a bill follows the bill's amount
+    target_amount: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().positive().nullable().optional()),
+    goal_amount: z.preprocess((v) => (v === "" ? undefined : v), z.coerce.number().positive().nullable().optional()),
     current_amount: optionalNumber(z.coerce.number().nonnegative()),
     initialBalance: optionalNumber(z.coerce.number().nonnegative()),
     target_date: optionalDate,
@@ -238,6 +277,9 @@ const schemas = {
       ),
     contributionRoom: optionalNumber(z.coerce.number().nonnegative()),
     roomYear: optionalNumber(z.coerce.number().int().min(2000).max(2100)),
+    linkedRecurringGroupId: optionalSeriesId,
+    // A one-time bill to save for (a transaction id); it becomes the goal's linked bill
+    linkedBillId: z.string().uuid().optional(),
   }),
 
   // DELETE /credit-cards|debts|savings-goals/:id. An empty body archives and ends the account's series.
@@ -357,6 +399,16 @@ const schemas = {
   // POST /recurring/:recurringGroupId/end
   endSeries: z
     .object({ dryRun: z.boolean().optional() })
+    .optional()
+    .default({}),
+
+  // POST /savings-goals/:id/monthly-transfer and the subscription suggestion actions take no fields
+  noFields: z.object({}).strict().optional().default({}),
+
+  // Accept a "Make this a subscription?" suggestion, optionally with the series' name
+  acceptSuggestion: z
+    .object({ title: z.string().trim().min(1, "Name the subscription").max(255).optional() })
+    .strict()
     .optional()
     .default({}),
 

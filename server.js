@@ -45,6 +45,7 @@ const subscriptionRoutes = require("./routes/subscriptions");
 const accountRoutes = require("./routes/accounts");
 const ruleRoutes = require("./routes/rules");
 const importRoutes = require("./routes/import");
+const alertRoutes = require("./routes/alerts");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -135,6 +136,7 @@ app.use("/api/net-worth-history", netWorthHistoryRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
 app.use("/api/rules", ruleRoutes);
 app.use("/api/import", importRoutes);
+app.use("/api/alerts", alertRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);
@@ -286,6 +288,20 @@ async function initialize() {
         if (!accountTableDesc.dueDay) {
           await queryInterface.addColumn("Accounts", "dueDay", {
             type: DataTypes.INTEGER,
+            allowNull: true,
+          });
+        }
+        // Card statement cycles
+        if (!accountTableDesc.statementDay) {
+          await queryInterface.addColumn("Accounts", "statementDay", {
+            type: DataTypes.INTEGER,
+            allowNull: true,
+          });
+        }
+        // Sinking funds: a goal's linked bill
+        if (!accountTableDesc.linkedRecurringGroupId) {
+          await queryInterface.addColumn("Accounts", "linkedRecurringGroupId", {
+            type: DataTypes.UUID,
             allowNull: true,
           });
         }

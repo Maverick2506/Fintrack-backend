@@ -14,6 +14,12 @@ const {
 } = require("./recurring");
 const { endSeries, findSeriesRows, findCurrentOccurrence, seriesOf } = require("../services/seriesService");
 const { isClientRefConflict } = require("../services/clientRefService");
+const {
+  payLinkedBill,
+  settleCardFundBills,
+  reverseFundPayment,
+  reverseCardFundPayments,
+} = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
 const {
   snapshotArchivedBalances,
@@ -732,9 +738,51 @@ router.put(
         dbTx,
         wasBalanceApplied || (!wasCleared && nextIsCleared)
       );
+
+      // A bill a savings goal saves for, just marked paid: pay it from the goal when asked
+      // ("Pay from <fund>"), then roll recurring funds on to the next charge
+      let sinkingFund = null;
+      const billJustPaid = !wasCleared && nextIsCleared && trx.type === "EXPENSE";
+      if (req.body.payFromGoalId && !billJustPaid) {
+        throw new HttpError(400, "A savings goal can only pay a bill as it is marked paid.");
+      }
+      if (billJustPaid && trx.recurringGroupId) {
+        sinkingFund = await payLinkedBill(
+          trx,
+          { payFromGoalId: req.body.payFromGoalId || null },
+          getTodayString(),
+          dbTx
+        );
+      }
+      // A card payment just marked paid: the bills on it that savings goals save for are paid from
+      // them as the "Use $X from <fund>" boxes say (fundBills)
+      let cardFunds = null;
+      const paymentJustPaid = !wasCleared && nextIsCleared && trx.toAccountId && ["EXPENSE", "TRANSFER"].includes(trx.type);
+      if (req.body.fundBills) {
+        const card = paymentJustPaid ? await Account.findByPk(trx.toAccountId, { transaction: dbTx }) : null;
+        if (!card || card.type !== "CREDIT_CARD") {
+          throw new HttpError(400, "Savings goals can only pay bills as a card payment is marked paid.");
+        }
+        cardFunds = await settleCardFundBills(card, trx, req.body.fundBills, getTodayString(), dbTx);
+      }
+      // Un-marked: what a fund paid for this bill (or for the bills on this card payment) goes back,
+      // and the goals return to the charge they were saving for
+      let fundReversed = null;
+      if (wasCleared && !nextIsCleared) {
+        const back = ((await reverseFundPayment(trx.id, dbTx)) || 0) + (await reverseCardFundPayments(trx.id, dbTx));
+        fundReversed = Math.round(back * 100) / 100;
+      }
       await assertArchivedBalancesUnchanged(archivedBefore, dbTx);
 
-      updated = { ...trx.toJSON(), seriesEnded, removedUpcomingCount, removedUpcomingTotal };
+      updated = {
+        ...trx.toJSON(),
+        seriesEnded,
+        removedUpcomingCount,
+        removedUpcomingTotal,
+        sinkingFund,
+        cardFunds,
+        fundReversed,
+      };
       if (dryRun) {
         await dbTx.rollback();
         return res.json({ ...updated, dryRun: true });

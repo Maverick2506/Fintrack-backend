@@ -16,6 +16,8 @@ const {
   isDebtInterestEnabled,
   projectDebtSchedule,
 } = require("./debtInterestService");
+const { getCardStatement, getPendingCardCharges } = require("./statementService");
+const { getSinkingFunds, getCardFundBills, getChargeStatementDate } = require("./sinkingFundService");
 const { loadPayContext, expectedPayDates } = require("./payForecastService");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
@@ -110,6 +112,10 @@ const addExpectedPay = ({ daysMap, todayStr, endDateStr, expectedPay }) => {
   return dates;
 };
 
+// "$1,200" or "$1,150.50", for forecast line titles
+const formatMoney = (n) =>
+  `$${n.toLocaleString("en-US", Number.isInteger(n) ? {} : { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
 /**
  * Computes a day-by-day cashflow forecast for checking account over N days.
  *
@@ -199,6 +205,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
             title: `[Overdue] ${trx.title}`,
             amount: -effAmt,
             type: "expense",
+            seriesId: trx.recurringGroupId,
           });
         }
       } else if (trx.type === "TRANSFER") {
@@ -207,6 +214,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
             title: `[Overdue] ${trx.title}`,
             amount: -amt,
             type: "transfer",
+            toAccountId: trx.toAccountId,
           });
         }
       }
@@ -247,6 +255,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           title: trx.title,
           amount: -effAmt,
           type: "expense",
+          seriesId: trx.recurringGroupId,
         });
       }
       // Note: Credit Card charges (fromAccount.type === "CREDIT_CARD") do NOT reduce checking!
@@ -256,6 +265,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           title: trx.title,
           amount: -amt,
           type: "transfer",
+          toAccountId: trx.toAccountId,
         });
       }
     }
@@ -280,6 +290,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   // Each series projects from its newest recurring row, after its newest row of any kind (getSeriesTemplate)
   const { seriesTemplates } = groupSeries(recurringTrxs);
   const seriesVacated = await getSeriesVacatedDates(dbTx);
+  // Projected recurring charges to cards (they don't touch Checking, but raise what each card owes)
+  const virtualCardCharges = [];
 
   for (const { template: latest, newestDate, anchorDay } of Object.values(seriesTemplates)) {
     if (usesArchivedAccount(latest)) continue;
@@ -313,17 +325,20 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
             !latest.fromAccount ||
             latest.fromAccount.type === "CHECKING" ||
             (checkingId && latest.fromAccountId === checkingId);
+          let effAmt = amt;
+          if (latest.isTaxExclusive && latest.taxRate) {
+            effAmt = Math.round(effAmt * (1 + parseFloat(latest.taxRate) / 100) * 100) / 100;
+          }
           if (fromChecking) {
-            let effAmt = amt;
-            if (latest.isTaxExclusive && latest.taxRate) {
-              effAmt = Math.round(effAmt * (1 + parseFloat(latest.taxRate) / 100) * 100) / 100;
-            }
             daysMap[nextDate].items.push({
               title: latest.title,
               amount: -effAmt,
               type: "expense",
               virtual: true,
+              seriesId: latest.recurringGroupId,
             });
+          } else if (latest.fromAccount?.type === "CREDIT_CARD" && !latest.toAccountId) {
+            virtualCardCharges.push({ cardId: latest.fromAccountId, date: nextDate, amount: effAmt });
           }
         } else if (latest.type === "TRANSFER") {
           if (checkingId && latest.fromAccountId === checkingId) {
@@ -332,6 +347,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
               amount: -amt,
               type: "transfer",
               virtual: true,
+              toAccountId: latest.toAccountId,
             });
           }
         }
@@ -352,6 +368,180 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   const expectedPayUsed = !payContext.pay && payContext.expectedPay
     ? addExpectedPay({ daysMap, todayStr, endDateStr, expectedPay: payContext.expectedPay })
     : [];
+
+  // 3c. Card payments. Every scheduled payment to a card keeps its amount, capped at the card's full
+  //     balance projected for its date: today's balance, plus the charges dated by then (unpaid rows and
+  //     projected recurring charges), minus the payments counted before it. Paying more than the
+  //     statement balance pays down new charges, but nothing beyond what is owed leaves Checking.
+  //     A card with a statement day and nothing scheduled by the statement's due date (an overdue
+  //     statement is due today) pays its statement balance on that date.
+  const activeCards = await Account.findAll({
+    where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
+    order: [["createdAt", "ASC"]],
+    transaction: dbTx,
+  });
+  const cardPayments = [];
+  const cardStatements = new Map();
+  for (const card of activeCards) {
+    const statement = card.statementDay ? await getCardStatement(card, todayStr, dbTx) : null;
+    if (statement) cardStatements.set(card.id, statement);
+    const payBy = statement?.dueDate ? (statement.dueDate < todayStr ? todayStr : statement.dueDate) : null;
+    const scheduledByDue =
+      payBy && Object.values(daysMap).some((day) => day.date <= payBy && day.items.some((it) => it.toAccountId === card.id));
+    if (payBy && !scheduledByDue && statement.statementBalance > 0 && daysMap[payBy]) {
+      daysMap[payBy].items.push({
+        title: `Statement balance – ${card.name}`,
+        amount: -statement.statementBalance,
+        type: "card",
+        toAccountId: card.id,
+      });
+    }
+    const charges = virtualCardCharges.filter((c) => c.cardId === card.id);
+    const scheduled = [];
+    let paidSoFar = 0;
+    for (let i = 0; i < horizonDays; i++) {
+      const dStr = addCalendarDays(todayStr, i);
+      const bucket = daysMap[dStr];
+      const toCard = bucket.items.filter((it) => it.toAccountId === card.id);
+      if (toCard.length === 0) continue;
+      const owedThatDay =
+        (parseFloat(card.initialBalance) || 0) +
+        (await getPendingCardCharges(card.id, dStr, dbTx)) +
+        charges.filter((c) => c.date <= dStr).reduce((sum, c) => sum + c.amount, 0);
+      for (const it of toCard) {
+        if (it.type === "card") {
+          paidSoFar += -it.amount;
+          continue;
+        }
+        const scheduledAmount = Math.round(-it.amount * 100) / 100;
+        const paid = Math.round(Math.max(0, Math.min(scheduledAmount, owedThatDay - paidSoFar)) * 100) / 100;
+        paidSoFar += paid;
+        it.amount = -paid;
+        if (paid < scheduledAmount) {
+          it.capped = true;
+          it.scheduledAmount = scheduledAmount;
+        }
+        if (payBy && dStr <= payBy) scheduled.push({ date: dStr, scheduledAmount, amount: paid });
+      }
+      bucket.items = bucket.items.filter((it) => it.toAccountId !== card.id || it.amount !== 0);
+    }
+    if (!statement || !statement.dueDate) continue;
+    cardPayments.push({
+      id: card.id,
+      name: card.name,
+      statementDate: statement.statementDate,
+      dueDate: statement.dueDate,
+      statementBalance: statement.statementBalance,
+      newCharges: statement.newCharges,
+      scheduled,
+      paymentDate: scheduled.length > 0 ? scheduled[0].date : statement.statementBalance > 0 ? payBy : null,
+    });
+  }
+
+  // 3d. Sinking funds: a goal saving for a bill sets its monthly amount aside on each contribution date
+  //     (sinkingFundService), unless transfers to the goal already do (projected above), or the bill's
+  //     charge itself is in the window by the fund's due date. Then nothing is set aside, and the bill
+  //     is paid from the fund (the default when it is marked paid): the fund covers
+  //     min(bill, its balance + contributions dated before the bill), and only the shortfall leaves
+  //     Checking. Those contributions are Checking outflows on their own dates, so each dollar counts once.
+  //     A bill charged to a card is paid from its fund when the card is paid: the fund covers part of
+  //     the first payment to the card on or after the statement the charge is billed on (the charge's
+  //     date for a card without a statement day), and that payment's amount is what changes.
+  const contributedBefore = (goalId, dateStr) =>
+    Object.values(daysMap)
+      .filter((day) => day.date < dateStr)
+      .reduce(
+        (sum, day) => sum + day.items.filter((it) => it.toAccountId === goalId).reduce((a, it) => a - it.amount, 0),
+        0
+      );
+  const cardFundBills = new Map();
+  const sinkingFunds = [];
+  for (const [goalId, fund] of await getSinkingFunds(todayStr, dbTx)) {
+    if (fund.done) continue;
+    const billGroupId = fund.linkedBill?.recurringGroupId;
+    const card = fund.linkedBill?.cardId ? activeCards.find((c) => c.id === fund.linkedBill.cardId) : null;
+    if (card && billGroupId) {
+      if (!cardFundBills.has(card.id)) cardFundBills.set(card.id, await getCardFundBills(card, todayStr, dbTx));
+      // A charge on the card waiting for its fund, else the bill's next charge
+      const waiting = cardFundBills.get(card.id).find((b) => b.goalId === goalId && b.recurringGroupId === billGroupId);
+      const next = fund.linkedBill.nextDate;
+      const charge = waiting
+        ? { date: waiting.date, amount: waiting.amount }
+        : next && next <= endDateStr && (!fund.dueDate || next <= fund.dueDate)
+        ? { date: next, amount: fund.linkedBill.amount }
+        : null;
+      const statementDay = parseInt(card.statementDay, 10);
+      const billedOn = !charge
+        ? null
+        : statementDay >= 1 && statementDay <= 31
+        ? getChargeStatementDate(charge.date, statementDay)
+        : charge.date;
+      // The first payment to the card after the charge is billed that covers the whole charge (what is
+      // left of it after the bills counted before), as the card payment pays a fund's bill (settleCardFundBills)
+      const room = (it) => (it.billAmount ?? -it.amount) - (it.billsTaken || 0);
+      const fits = (it) => it.toAccountId === card.id && (it.billAmount ?? -it.amount) > 0 && room(it) >= charge.amount - 0.005;
+      const payDay = billedOn
+        ? Object.values(daysMap).find((day) => day.date >= billedOn && day.items.some(fits))
+        : null;
+      if (payDay) {
+        const payItem = payDay.items.find(fits);
+        payItem.billsTaken = (payItem.billsTaken || 0) + charge.amount;
+        const fundCovers =
+          Math.round(
+            Math.max(0, Math.min(charge.amount, fund.saved + contributedBefore(goalId, payDay.date), -payItem.amount)) * 100
+          ) / 100;
+        if (fundCovers > 0) {
+          if (!payItem.baseTitle) {
+            payItem.baseTitle = payItem.title;
+            payItem.billAmount = Math.round(-payItem.amount * 100) / 100;
+          }
+          payItem.fundCovers = Math.round(((payItem.fundCovers || 0) + fundCovers) * 100) / 100;
+          payItem.amount = Math.round((payItem.amount + fundCovers) * 100) / 100;
+          payItem.title = `${payItem.baseTitle} ${formatMoney(payItem.billAmount)} (fund covers ${formatMoney(payItem.fundCovers)})`;
+        }
+        sinkingFunds.push({
+          id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates: [],
+          billInWindow: true, billDate: charge.date, billAmount: charge.amount, fundCovers,
+          cardPayment: { cardId: card.id, date: payDay.date },
+        });
+        continue;
+      }
+    }
+    const billDay =
+      billGroupId && fund.dueDate
+        ? Object.values(daysMap).find(
+            (day) => day.date <= fund.dueDate && day.items.some((it) => it.seriesId === billGroupId)
+          )
+        : null;
+    if (billDay) {
+      const billItem = billDay.items.find((it) => it.seriesId === billGroupId);
+      const billAmount = Math.round(-billItem.amount * 100) / 100;
+      const fundCovers =
+        Math.round(Math.max(0, Math.min(billAmount, fund.saved + contributedBefore(goalId, billDay.date))) * 100) / 100;
+      if (fundCovers > 0) {
+        billItem.amount = -Math.round((billAmount - fundCovers) * 100) / 100;
+        billItem.title = `${billItem.title} ${formatMoney(billAmount)} (fund covers ${formatMoney(fundCovers)})`;
+        billItem.fundCovers = fundCovers;
+        billItem.billAmount = billAmount;
+      }
+      sinkingFunds.push({
+        id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates: [],
+        billInWindow: true, billDate: billDay.date, billAmount, fundCovers,
+      });
+      continue;
+    }
+    if (fund.monthlyTransfer || !fund.monthly) continue;
+    const plannedDates = fund.dates.filter((d) => daysMap[d]);
+    for (const d of plannedDates) {
+      daysMap[d].items.push({
+        title: `Set aside for ${fund.name}`,
+        amount: -fund.monthly,
+        type: "planned",
+        planned: true,
+      });
+    }
+    sinkingFunds.push({ id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates, billInWindow: false });
+  }
 
   // 4. Debts: interest on each due date, then auto-pay, projected exactly as the daily sweep runs them
   //    (debtInterestService.projectDebtSchedule). Only auto-pay leaves Checking; interest changes how
@@ -454,6 +644,10 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         title: it.title,
         amount: Math.round(it.amount * 100) / 100,
         ...(it.estimated ? { estimated: true } : {}),
+        ...(it.planned ? { planned: true } : {}),
+        ...(it.type === "card" ? { statement: true } : {}),
+        ...(it.capped ? { capped: true, scheduledAmount: it.scheduledAmount } : {}),
+        ...(it.fundCovers ? { fundCovers: it.fundCovers, billAmount: it.billAmount } : {}),
       })),
     };
     days.push(dayObj);
@@ -534,6 +728,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     // A pay_title that doesn't form a valid series is ignored for now (automatic detection runs instead)
     payOverrideIgnored: payContext.overrideIgnored,
     debts: debtProjections,
+    cardPayments,
+    sinkingFunds,
   };
 };
 

@@ -4,9 +4,14 @@ const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
-const { asyncHandler } = require("../middleware/errorHandler");
+const { asyncHandler, HttpError } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
 const { setBalanceAnchor } = require("../services/balanceAnchorService");
+const crypto = require("crypto");
+const { getCardStatement } = require("../services/statementService");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
+const { getCardFundBills, settleCardFundBills } = require("../services/sinkingFundService");
+const { getNextOccurrenceDate, getSeriesTemplate } = require("./recurring");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -25,10 +30,18 @@ router.get(
       where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
     });
-    const formatted = cards.map((c) => ({
-      ...c.toJSON(),
-      currentBalance: c.initialBalance,
-    }));
+    const todayStr = getTodayString();
+    const formatted = await Promise.all(
+      cards.map(async (c) => ({
+        ...c.toJSON(),
+        currentBalance: c.initialBalance,
+        // { statementDate, dueDate, statementBalance, newCharges, ... } when a statement day is set
+        statement: await getCardStatement(c, todayStr),
+        // Bills on this card that savings goals save for, which the next payment pays from them
+        // ("Use $X from <fund>" in the Pay dialog)
+        fundBills: await getCardFundBills(c, todayStr),
+      }))
+    );
     res.json(formatted);
   })
 );
@@ -37,7 +50,7 @@ router.post(
   "/credit-cards",
   validateBody(schemas.createCreditCard),
   asyncHandler(async (req, res) => {
-    const { name, creditLimit, currentBalance, initialBalance, dueDate } =
+    const { name, creditLimit, currentBalance, initialBalance, dueDate, statementDay } =
       req.body;
 
     const newCard = await Account.create({
@@ -46,27 +59,26 @@ router.post(
       initialBalance: currentBalance ?? initialBalance ?? 0.0,
       creditLimit: parseFloat(creditLimit),
       dueDate: dueDate || null,
+      statementDay: statementDay ?? null,
       isActive: true,
     });
 
-    res
-      .status(201)
-      .json({ ...newCard.toJSON(), currentBalance: newCard.initialBalance });
+    res.status(201).json({
+      ...newCard.toJSON(),
+      currentBalance: newCard.initialBalance,
+      statement: await getCardStatement(newCard, getTodayString()),
+    });
   })
 );
 
 router.post(
   "/credit-cards/:id/pay",
-  validateBody(schemas.paymentAmount),
+  validateBody(schemas.cardPayment),
   asyncHandler(async (req, res) => {
     const dbTx = await sequelize.transaction();
     try {
       const card = await Account.findByPk(req.params.id, { transaction: dbTx });
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
 
       if (!card || card.type !== "CREDIT_CARD") {
         await dbTx.rollback();
@@ -83,7 +95,7 @@ router.post(
       await card.reload({ transaction: dbTx });
 
       // Record as TRANSFER (not EXPENSE) to prevent double-counting card spending
-      await Transaction.create(
+      const payment = await Transaction.create(
         {
           title: `Payment for ${card.name}`,
           amount: paymentAmount,
@@ -97,9 +109,11 @@ router.post(
         },
         { transaction: dbTx }
       );
+      // The bills on this payment that savings goals save for: each checked fund pays min(saved, bill)
+      const cardFunds = await settleCardFundBills(card, payment, req.body.fundBills, getTodayString(), dbTx);
 
       await dbTx.commit();
-      res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
+      res.json({ ...card.toJSON(), currentBalance: card.initialBalance, paymentId: payment.id, cardFunds });
     } catch (error) {
       await dbTx.rollback();
       throw error;
@@ -137,9 +151,10 @@ router.put(
   asyncHandler(async (req, res) => {
     const card = await Account.findByPk(req.params.id);
     if (card && card.type === "CREDIT_CARD") {
-      const { name, creditLimit, currentBalance, initialBalance, dueDate } =
+      const { name, creditLimit, currentBalance, initialBalance, dueDate, statementDay } =
         req.body;
       await card.update({
+        statementDay: statementDay !== undefined ? statementDay : card.statementDay,
         name: name !== undefined ? name : card.name,
         creditLimit:
           creditLimit !== undefined
@@ -157,10 +172,86 @@ router.put(
       if (currentBalance !== undefined || initialBalance !== undefined) {
         await setBalanceAnchor(card.id, getTodayString());
       }
-      res.json({ ...card.toJSON(), currentBalance: card.initialBalance });
+      res.json({
+        ...card.toJSON(),
+        currentBalance: card.initialBalance,
+        statement: await getCardStatement(card, getTodayString()),
+      });
     } else {
       res.status(404).json({ error: "Credit Card not found" });
     }
+  })
+);
+
+// One-tap fix for a scheduled payment above what is owed: sets that payment to the statement balance
+// or to the full balance projected for its date (both worked out here). Only that row changes: when it
+// is the newest row of a recurring series, the next occurrence is added first at the old amount, so the
+// series keeps generating the amount it had.
+router.post(
+  "/credit-cards/:id/scheduled-payment",
+  validateBody(schemas.setScheduledCardPayment),
+  asyncHandler(async (req, res) => {
+    const todayStr = getTodayString();
+    const dbTx = await sequelize.transaction();
+    let statement;
+    try {
+      const card = await Account.findByPk(req.params.id, { transaction: dbTx });
+      if (!card || card.type !== "CREDIT_CARD" || card.isActive === false) {
+        throw new HttpError(404, "Credit Card not found");
+      }
+      const before = await getCardStatement(card, todayStr, dbTx);
+      const scheduled = before?.scheduledPayment;
+      if (!scheduled || scheduled.id !== req.body.transactionId) {
+        throw new HttpError(409, "That payment is no longer the next one scheduled for this card.");
+      }
+      const amount = req.body.pay === "statement" ? before.statementBalance : scheduled.projectedBalance;
+      if (!(amount > 0)) throw new HttpError(409, "Nothing is owed on this card for that payment.");
+
+      const row = await Transaction.findByPk(scheduled.id, { transaction: dbTx });
+      if (row.recurrence && row.recurrence !== "none") {
+        const groupId = row.recurringGroupId || crypto.randomUUID();
+        if (!row.recurringGroupId) await row.update({ recurringGroupId: groupId }, { transaction: dbTx });
+        const seriesRows = await Transaction.findAll({
+          where: { recurringGroupId: groupId },
+          order: [["date", "DESC"], ["createdAt", "DESC"]],
+          transaction: dbTx,
+        });
+        const series = getSeriesTemplate(seriesRows);
+        if (series && series.template.id === row.id) {
+          const nextDate = getNextOccurrenceDate(row.date, row.recurrence, 1, series.anchorDay);
+          const taken = await Transaction.findOne({
+            where: { recurringGroupId: groupId, date: nextDate },
+            paranoid: false,
+            transaction: dbTx,
+          });
+          if (nextDate && !taken) {
+            await Transaction.create(
+              {
+                title: row.title,
+                amount: row.amount,
+                date: nextDate,
+                type: row.type,
+                category: row.category,
+                isCleared: false,
+                balanceApplied: false,
+                recurrence: row.recurrence,
+                recurringGroupId: groupId,
+                fromAccountId: row.fromAccountId,
+                toAccountId: row.toAccountId,
+              },
+              { transaction: dbTx }
+            );
+          }
+        }
+      }
+      await row.update({ amount }, { transaction: dbTx });
+      statement = await getCardStatement(card, todayStr, dbTx);
+      await dbTx.commit();
+    } catch (error) {
+      if (!dbTx.finished) await dbTx.rollback();
+      throw error;
+    }
+    res.json({ statement });
   })
 );
 
