@@ -17,7 +17,7 @@ const {
   projectDebtSchedule,
 } = require("./debtInterestService");
 const { getCardStatement, getPendingCardCharges } = require("./statementService");
-const { getSinkingFunds } = require("./sinkingFundService");
+const { getSinkingFunds, getCardFundBills, getChargeStatementDate } = require("./sinkingFundService");
 const { loadPayContext, expectedPayDates } = require("./payForecastService");
 
 // Pure calendar day addition helper (YYYY-MM-DD + N days)
@@ -290,6 +290,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   // Each series projects from its newest recurring row, after its newest row of any kind (getSeriesTemplate)
   const { seriesTemplates } = groupSeries(recurringTrxs);
   const seriesVacated = await getSeriesVacatedDates(dbTx);
+  // Projected recurring charges to cards (they don't touch Checking, but raise what each card owes)
+  const virtualCardCharges = [];
 
   for (const { template: latest, newestDate, anchorDay } of Object.values(seriesTemplates)) {
     if (usesArchivedAccount(latest)) continue;
@@ -323,11 +325,11 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
             !latest.fromAccount ||
             latest.fromAccount.type === "CHECKING" ||
             (checkingId && latest.fromAccountId === checkingId);
+          let effAmt = amt;
+          if (latest.isTaxExclusive && latest.taxRate) {
+            effAmt = Math.round(effAmt * (1 + parseFloat(latest.taxRate) / 100) * 100) / 100;
+          }
           if (fromChecking) {
-            let effAmt = amt;
-            if (latest.isTaxExclusive && latest.taxRate) {
-              effAmt = Math.round(effAmt * (1 + parseFloat(latest.taxRate) / 100) * 100) / 100;
-            }
             daysMap[nextDate].items.push({
               title: latest.title,
               amount: -effAmt,
@@ -335,6 +337,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
               virtual: true,
               seriesId: latest.recurringGroupId,
             });
+          } else if (latest.fromAccount?.type === "CREDIT_CARD" && !latest.toAccountId) {
+            virtualCardCharges.push({ cardId: latest.fromAccountId, date: nextDate, amount: effAmt });
           }
         } else if (latest.type === "TRANSFER") {
           if (checkingId && latest.fromAccountId === checkingId) {
@@ -365,32 +369,50 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     ? addExpectedPay({ daysMap, todayStr, endDateStr, expectedPay: payContext.expectedPay })
     : [];
 
-  // 3c. Cards with a statement day. Scheduled payments to the card up to the statement's due date (an
-  //     overdue statement is due today) keep their amounts, each capped at the card's full balance
-  //     projected for its date: paying more than the statement balance pays down new charges, but
-  //     nothing beyond what is owed leaves Checking. With nothing scheduled, the statement balance is
-  //     paid on the due date. Payments after the due date stay as entered.
-  const statementCards = await Account.findAll({
-    where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false }, statementDay: { [Op.ne]: null } },
+  // 3c. Card payments. Every scheduled payment to a card keeps its amount, capped at the card's full
+  //     balance projected for its date: today's balance, plus the charges dated by then (unpaid rows and
+  //     projected recurring charges), minus the payments counted before it. Paying more than the
+  //     statement balance pays down new charges, but nothing beyond what is owed leaves Checking.
+  //     A card with a statement day and nothing scheduled by the statement's due date (an overdue
+  //     statement is due today) pays its statement balance on that date.
+  const activeCards = await Account.findAll({
+    where: { type: "CREDIT_CARD", isActive: { [Op.ne]: false } },
     order: [["createdAt", "ASC"]],
     transaction: dbTx,
   });
   const cardPayments = [];
-  for (const card of statementCards) {
-    const statement = await getCardStatement(card, todayStr, dbTx);
-    if (!statement || !statement.dueDate) continue;
-    const payBy = statement.dueDate < todayStr ? todayStr : statement.dueDate;
+  const cardStatements = new Map();
+  for (const card of activeCards) {
+    const statement = card.statementDay ? await getCardStatement(card, todayStr, dbTx) : null;
+    if (statement) cardStatements.set(card.id, statement);
+    const payBy = statement?.dueDate ? (statement.dueDate < todayStr ? todayStr : statement.dueDate) : null;
+    const scheduledByDue =
+      payBy && Object.values(daysMap).some((day) => day.date <= payBy && day.items.some((it) => it.toAccountId === card.id));
+    if (payBy && !scheduledByDue && statement.statementBalance > 0 && daysMap[payBy]) {
+      daysMap[payBy].items.push({
+        title: `Statement balance – ${card.name}`,
+        amount: -statement.statementBalance,
+        type: "card",
+        toAccountId: card.id,
+      });
+    }
+    const charges = virtualCardCharges.filter((c) => c.cardId === card.id);
     const scheduled = [];
     let paidSoFar = 0;
     for (let i = 0; i < horizonDays; i++) {
       const dStr = addCalendarDays(todayStr, i);
-      if (dStr > payBy) break;
       const bucket = daysMap[dStr];
       const toCard = bucket.items.filter((it) => it.toAccountId === card.id);
       if (toCard.length === 0) continue;
       const owedThatDay =
-        (parseFloat(card.initialBalance) || 0) + (await getPendingCardCharges(card.id, dStr, dbTx));
+        (parseFloat(card.initialBalance) || 0) +
+        (await getPendingCardCharges(card.id, dStr, dbTx)) +
+        charges.filter((c) => c.date <= dStr).reduce((sum, c) => sum + c.amount, 0);
       for (const it of toCard) {
+        if (it.type === "card") {
+          paidSoFar += -it.amount;
+          continue;
+        }
         const scheduledAmount = Math.round(-it.amount * 100) / 100;
         const paid = Math.round(Math.max(0, Math.min(scheduledAmount, owedThatDay - paidSoFar)) * 100) / 100;
         paidSoFar += paid;
@@ -399,18 +421,11 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           it.capped = true;
           it.scheduledAmount = scheduledAmount;
         }
-        scheduled.push({ date: dStr, scheduledAmount, amount: paid });
+        if (payBy && dStr <= payBy) scheduled.push({ date: dStr, scheduledAmount, amount: paid });
       }
       bucket.items = bucket.items.filter((it) => it.toAccountId !== card.id || it.amount !== 0);
     }
-    if (scheduled.length === 0 && statement.statementBalance > 0 && daysMap[payBy]) {
-      daysMap[payBy].items.push({
-        title: `Statement balance – ${card.name}`,
-        amount: -statement.statementBalance,
-        type: "card",
-        toAccountId: card.id,
-      });
-    }
+    if (!statement || !statement.dueDate) continue;
     cardPayments.push({
       id: card.id,
       name: card.name,
@@ -429,10 +444,66 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   //     is paid from the fund (the default when it is marked paid): the fund covers
   //     min(bill, its balance + contributions dated before the bill), and only the shortfall leaves
   //     Checking. Those contributions are Checking outflows on their own dates, so each dollar counts once.
+  //     A bill charged to a card is paid from its fund when the card is paid: the fund covers part of
+  //     the first payment to the card on or after the statement the charge is billed on (the charge's
+  //     date for a card without a statement day), and that payment's amount is what changes.
+  const contributedBefore = (goalId, dateStr) =>
+    Object.values(daysMap)
+      .filter((day) => day.date < dateStr)
+      .reduce(
+        (sum, day) => sum + day.items.filter((it) => it.toAccountId === goalId).reduce((a, it) => a - it.amount, 0),
+        0
+      );
+  const cardFundBills = new Map();
   const sinkingFunds = [];
   for (const [goalId, fund] of await getSinkingFunds(todayStr, dbTx)) {
     if (fund.done) continue;
     const billGroupId = fund.linkedBill?.recurringGroupId;
+    const card = fund.linkedBill?.cardId ? activeCards.find((c) => c.id === fund.linkedBill.cardId) : null;
+    if (card && billGroupId) {
+      if (!cardFundBills.has(card.id)) cardFundBills.set(card.id, await getCardFundBills(card, todayStr, dbTx));
+      // A charge on the card waiting for its fund, else the bill's next charge
+      const waiting = cardFundBills.get(card.id).find((b) => b.goalId === goalId && b.recurringGroupId === billGroupId);
+      const next = fund.linkedBill.nextDate;
+      const charge = waiting
+        ? { date: waiting.date, amount: waiting.amount }
+        : next && next <= endDateStr && (!fund.dueDate || next <= fund.dueDate)
+        ? { date: next, amount: fund.linkedBill.amount }
+        : null;
+      const statementDay = parseInt(card.statementDay, 10);
+      const billedOn = !charge
+        ? null
+        : statementDay >= 1 && statementDay <= 31
+        ? getChargeStatementDate(charge.date, statementDay)
+        : charge.date;
+      const payDay = billedOn
+        ? Object.values(daysMap).find(
+            (day) => day.date >= billedOn && day.items.some((it) => it.toAccountId === card.id && it.amount < 0)
+          )
+        : null;
+      if (payDay) {
+        const payItem = payDay.items.find((it) => it.toAccountId === card.id && it.amount < 0);
+        const fundCovers =
+          Math.round(
+            Math.max(0, Math.min(charge.amount, fund.saved + contributedBefore(goalId, payDay.date), -payItem.amount)) * 100
+          ) / 100;
+        if (fundCovers > 0) {
+          if (!payItem.baseTitle) {
+            payItem.baseTitle = payItem.title;
+            payItem.billAmount = Math.round(-payItem.amount * 100) / 100;
+          }
+          payItem.fundCovers = Math.round(((payItem.fundCovers || 0) + fundCovers) * 100) / 100;
+          payItem.amount = Math.round((payItem.amount + fundCovers) * 100) / 100;
+          payItem.title = `${payItem.baseTitle} ${formatMoney(payItem.billAmount)} (fund covers ${formatMoney(payItem.fundCovers)})`;
+        }
+        sinkingFunds.push({
+          id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates: [],
+          billInWindow: true, billDate: charge.date, billAmount: charge.amount, fundCovers,
+          cardPayment: { cardId: card.id, date: payDay.date },
+        });
+        continue;
+      }
+    }
     const billDay =
       billGroupId && fund.dueDate
         ? Object.values(daysMap).find(
@@ -442,13 +513,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     if (billDay) {
       const billItem = billDay.items.find((it) => it.seriesId === billGroupId);
       const billAmount = Math.round(-billItem.amount * 100) / 100;
-      const contributions = Object.values(daysMap)
-        .filter((day) => day.date < billDay.date)
-        .reduce(
-          (sum, day) => sum + day.items.filter((it) => it.toAccountId === goalId).reduce((a, it) => a - it.amount, 0),
-          0
-        );
-      const fundCovers = Math.round(Math.max(0, Math.min(billAmount, fund.saved + contributions)) * 100) / 100;
+      const fundCovers =
+        Math.round(Math.max(0, Math.min(billAmount, fund.saved + contributedBefore(goalId, billDay.date))) * 100) / 100;
       if (fundCovers > 0) {
         billItem.amount = -Math.round((billAmount - fundCovers) * 100) / 100;
         billItem.title = `${billItem.title} ${formatMoney(billAmount)} (fund covers ${formatMoney(fundCovers)})`;

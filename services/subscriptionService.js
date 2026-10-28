@@ -152,6 +152,13 @@ const getSubscriptionsSummary = async (todayStr, dbTx = null) => {
           percent,
           date: latestCleared.date,
           rowId: latestCleared.id,
+          // The three paid amounts before this one agree within ±2% of the one just before it: a
+          // steady price that changed, not a bill that varies (only those raise a price alert)
+          steadyBefore:
+            clearedOccurrences.length >= 4 &&
+            clearedOccurrences
+              .slice(-4, -1)
+              .every((t) => prevAmt > 0 && Math.abs(getComparableAmount(t) - prevAmt) <= prevAmt * 0.02),
         };
       }
     }

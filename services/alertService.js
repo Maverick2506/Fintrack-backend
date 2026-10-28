@@ -24,7 +24,8 @@ const withinPct = (a, b, pct) => b > 0 && Math.abs(a - b) / b <= pct;
 
 // ---------------------------------------------------------------------------------------------------
 // Price changes: a series' newest paid charge differs from the one before by more than 5%
-// (the same comparison as the Subscriptions page, subscriptionService priceChange). The nightly job
+// (the same comparison as the Subscriptions page, subscriptionService priceChange), and the three
+// paid amounts before it were steady (within ±2%), so a bill that varies (hydro) never alerts. The nightly job
 // records each change once, keyed by series and charge (Setting price_alert:<seriesId> = row id), and
 // queues it for the morning digest (Setting price_alerts_pending), which sends it to ntfy once.
 // ---------------------------------------------------------------------------------------------------
@@ -52,6 +53,7 @@ const recordPriceChanges = async (todayStr, dbTx = null) => {
     const change = sub.priceChange;
     if (!change || !(change.from > 0) || change.date < oldest) continue;
     if (Math.abs(change.to - change.from) / change.from <= PRICE_CHANGE_PCT) continue;
+    if (!change.steadyBefore) continue;
     const key = `${PRICE_ALERT_SEEN_PREFIX}${sub.id}`;
     const seen = await Setting.findByPk(key, { transaction: dbTx });
     if (seen && seen.value === change.rowId) continue;
