@@ -51,7 +51,7 @@ const SORT_FIELDS = { date: "date", amount: "amount", name: "name" };
 
 /**
  * Ledger rows kept by the filters, sorted like the Ledger. filters: { from, to (YYYY-MM-DD, inclusive),
- * type ("income" | "expense" | "transfer"), category, accountId (either side), tag, search,
+ * type ("income" | "expense" | "transfer"), category, accountId (either side), tag, needsReview, search,
  * sort ("date:desc" by default) }. Rows are the GET /expenses/all shape.
  */
 const filterLedgerRows = (rows, filters = {}) => {
@@ -64,6 +64,7 @@ const filterLedgerRows = (rows, filters = {}) => {
       (!filters.category || r.category === filters.category) &&
       (!filters.accountId || r.fromAccountId === filters.accountId || r.targetAccountId === filters.accountId) &&
       (!tag || tagsOf(r).includes(tag)) &&
+      (!filters.needsReview || r.needsReview) &&
       matchesSearch(r, filters.search)
   );
   const [key = "date", dir = "desc"] = String(filters.sort || "date:desc").split(":");
@@ -81,6 +82,32 @@ const filterLedgerRows = (rows, filters = {}) => {
     });
   }
   return out;
+};
+
+// The Ledger loads this many months at a time (GET /expenses/all without from=); "Load older" asks for more
+const LEDGER_WINDOW_MONTHS = 3;
+
+/** YYYY-MM-DD moved by whole months; the day is kept, or the month's last day when it has fewer (May 31 - 3 = Feb 28) */
+const addMonthsToDateStr = (dateStr, months) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const index = y * 12 + (m - 1) + months;
+  const year = Math.floor(index / 12);
+  const month = (index % 12) + 1;
+  const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return `${year}-${String(month).padStart(2, "0")}-${String(Math.min(d, lastDay)).padStart(2, "0")}`;
+};
+
+/**
+ * The dates GET /expenses/all reads: from=/to= as given (inclusive). Without from=, the last 3 months
+ * (upcoming rows have no end unless to= is given), counted back from to= when that is before today.
+ * A search or the Review inbox (needsReview) reads all history unless from= is given.
+ */
+const ledgerWindow = (query = {}, todayStr) => {
+  const to = query.to || null;
+  if (query.from) return { from: query.from, to };
+  if (String(query.search || "").trim() || query.needsReview) return { from: null, to };
+  const base = to && to < todayStr ? to : todayStr;
+  return { from: addMonthsToDateStr(base, -LEDGER_WINDOW_MONTHS), to };
 };
 
 // A text cell a spreadsheet would run as a formula (= + - @, or a tab/CR first) gets a leading '
@@ -123,4 +150,14 @@ const ledgerCsv = (rows) => {
   return `${lines.join("\r\n")}\r\n`;
 };
 
-module.exports = { ledgerAccountText, matchesSearch, filterLedgerRows, neutralizeFormula, ledgerCsv, EXPORT_COLUMNS };
+module.exports = {
+  ledgerAccountText,
+  matchesSearch,
+  filterLedgerRows,
+  ledgerWindow,
+  addMonthsToDateStr,
+  LEDGER_WINDOW_MONTHS,
+  neutralizeFormula,
+  ledgerCsv,
+  EXPORT_COLUMNS,
+};

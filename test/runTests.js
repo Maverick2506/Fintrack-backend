@@ -272,7 +272,7 @@ async function runTestSuite() {
     method: "GET",
     headers: authHeaders,
   });
-  const payTx = (ledgerRes.body || []).find((t) => t.toAccount === "Automated Suite Card");
+  const payTx = (ledgerRes.body?.rows || []).find((t) => t.toAccount === "Automated Suite Card");
   assert(payTx && payTx.type === "transfer", `Card payment categorized as TRANSFER (not EXPENSE) to avoid double counting`);
 
   if (payTx) {
@@ -405,7 +405,7 @@ async function runTestSuite() {
     method: "GET",
     headers: authHeaders,
   });
-  const preservedTx = (ledgerAfterDel.body || []).find((t) => t.id === testExpId);
+  const preservedTx = (ledgerAfterDel.body?.rows || []).find((t) => t.id === testExpId);
   assert(preservedTx && preservedTx.name === "Preserved Card Purchase", "Purchase transaction preserved in ledger (No CASCADE deletion!)");
 
   // Clean up test transactions & future paycheque
@@ -756,7 +756,7 @@ async function runTestSuite() {
     method: "GET",
     headers: authHeaders,
   });
-  const allTxs = allLedgerRes.body || [];
+  const allTxs = allLedgerRes.body?.rows || [];
   const bad30thRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === "2026-10-30");
   assert(!bad30thRent, "No duplicate rent transaction generated for 30th of current month");
 
@@ -1532,7 +1532,7 @@ async function runTestSuite() {
     method: "GET",
     headers: authHeaders,
   });
-  const allTrx = Array.isArray(trxList.body) ? trxList.body : [];
+  const allTrx = Array.isArray(trxList.body?.rows) ? trxList.body.rows : [];
   const contribTrx = allTrx.find((t) => t.targetAccountId === savingsGoalId);
   assert(contribTrx && contribTrx.balanceApplied === true, "Savings contribution has balanceApplied: true");
 
@@ -4674,7 +4674,7 @@ async function runTestSuite() {
   const s33Pay = await s33("POST", `/api/debts/${s33DebtId}/pay`, { amount: 40.0 });
   assert(s33Pay.status === 200, "Pays $40 toward Suite 33 debt");
   const s33Ledger = await s33("GET", "/api/expenses/all");
-  const s33PayRow = (s33Ledger.body || []).find((r) => r.name === "Payment for Suite 33 Loan");
+  const s33PayRow = (s33Ledger.body?.rows || []).find((r) => r.name === "Payment for Suite 33 Loan");
   assert(s33PayRow && s33PayRow.type === "transfer", "Debt payment via /debts/:id/pay is stored as a TRANSFER (C5)");
   const s33SpendAfter = await s33Spending();
   assert(Math.abs(s33SpendAfter - s33SpendBefore) < 0.01, "Debt payment does not change monthly totalSpending (C5)");
@@ -4699,7 +4699,7 @@ async function runTestSuite() {
   const s33Tax = await s33("POST", "/api/expenses", { name: "Suite 33 Taxed", amount: 100.0, category: "Shopping", due_date: s33Today, is_paid: true, isTaxExclusive: true, taxRate: 13 });
   assert(s33Tax.status === 201, "Creates tax-exclusive expense");
   const s33Ledger2 = await s33("GET", "/api/expenses/all");
-  const s33TaxRow = (s33Ledger2.body || []).find((r) => r.id === s33Tax.body.id);
+  const s33TaxRow = (s33Ledger2.body?.rows || []).find((r) => r.id === s33Tax.body.id);
   assert(
     s33TaxRow && s33TaxRow.isTaxExclusive === true && s33TaxRow.taxRate === 13 && s33TaxRow.baseAmount === 100 && s33TaxRow.taxApplied === true,
     "/expenses/all returns isTaxExclusive, taxRate, baseAmount and taxApplied (B2)"
@@ -5318,7 +5318,7 @@ async function runTestSuite() {
   assert(!(await s37ForecastTitles()).some((t) => t.includes("Suite 37")), "Archived card's rows are left out of the forecast");
   assert(!(await s37UpcomingTitles()).some((t) => t.includes("Suite 37")), "Archived card's rows are left out of Upcoming Bills");
   const s37Ledger = await s33("GET", "/api/expenses/all");
-  const s37LedgerRow = (s37Ledger.body || []).find((r) => r.recurringGroupId === s37NetflixGroup);
+  const s37LedgerRow = (s37Ledger.body?.rows || []).find((r) => r.recurringGroupId === s37NetflixGroup);
   assert(
     s37LedgerRow && s37LedgerRow.fromAccount === "Suite 37 Visa" && s37LedgerRow.fromAccountArchived === true,
     "The Ledger still shows the archived card's name on its past rows"
@@ -5736,7 +5736,7 @@ async function runTestSuite() {
 
   // 38.12 Ledger shows interest rows; editing one from the Ledger keeps it on the debt
   const s38Ledger = await s33("GET", "/api/expenses/all");
-  const s38LedgerRow = (s38Ledger.body || []).find((r) => r.id === s38Row.id);
+  const s38LedgerRow = (s38Ledger.body?.rows || []).find((r) => r.id === s38Row.id);
   assert(s38LedgerRow && s38LedgerRow.category === "Interest" && s38LedgerRow.fromAccountType === "DEBT", "Ledger lists the interest row with category Interest, from the debt");
   const s38Edit = await s33("PUT", `/api/expenses/${s38Row.id}`, { name: "Interest – Suite 38 Car Loan", amount: 70, creditCardId: null, category: "Interest" });
   const s38Edited = await Transaction.findByPk(s38Row.id);
@@ -6035,7 +6035,7 @@ async function runTestSuite() {
     card: await s40Bal(s40CardId),
     goal: await s40Bal(s40GoalId),
   });
-  const s40Ledger = async () => ((await s33("GET", "/api/expenses/all")).body || []).map((r) => r.id);
+  const s40Ledger = async () => ((await s33("GET", "/api/expenses/all")).body?.rows || []).map((r) => r.id);
   const s40Trash = async () => (await s33("GET", "/api/expenses/trash")).body || [];
   const s40Live = (where) => Transaction.count({ where });
   const s40All = (where) => Transaction.count({ where, paranoid: false });
@@ -7866,8 +7866,8 @@ async function runTestSuite() {
   assert(
     s50Inbox.status === 200 && s50Imported.every((id) => s50Inbox.body.some((r) => r.id === id)) &&
       !s50Inbox.body.some((r) => r.id === s47Bill.id) &&
-      s50All.body.find((r) => r.id === s50Imported[0])?.needsReview === true &&
-      s50All.body.find((r) => r.id === s47Bill.id)?.needsReview === false,
+      s50All.body.rows.find((r) => r.id === s50Imported[0])?.needsReview === true &&
+      s50All.body.rows.find((r) => r.id === s47Bill.id)?.needsReview === false,
     `GET /api/import/review lists imported rows only, and the Ledger rows say whether they need review (got ${s50Inbox.body.length})`
   );
   const s50Confirm = await api("POST", "/api/import/review/confirm", { ids: s50Imported.slice(0, 2) });
@@ -9682,12 +9682,12 @@ async function runTestSuite() {
   // The Ledger's tag filter, case-insensitive and with or without "#"
   const s63Tagged = await s33("GET", "/api/expenses/all?tag=%23WORK");
   const s63All = await s33("GET", "/api/expenses/all");
-  const s63TaggedNames = s63Tagged.body.map((r) => r.name).sort();
+  const s63TaggedNames = s63Tagged.body.rows.map((r) => r.name).sort();
   assert(
     JSON.stringify(s63TaggedNames) === JSON.stringify(["Suite63 Bonus", "Suite63 Lunch"]) &&
-      s63Tagged.body.every((r) => r.tags.includes("work")) && s63All.body.length > s63Tagged.body.length &&
-      s63All.body.find((r) => r.name === "Suite63 Plain")?.tags.length === 0 &&
-      s63All.body.find((r) => r.name === "Suite63 Lunch")?.notes === "Client lunch, with Sam\nsplit later",
+      s63Tagged.body.rows.every((r) => r.tags.includes("work")) && s63All.body.rows.length > s63Tagged.body.rows.length &&
+      s63All.body.rows.find((r) => r.name === "Suite63 Plain")?.tags.length === 0 &&
+      s63All.body.rows.find((r) => r.name === "Suite63 Lunch")?.notes === "Client lunch, with Sam\nsplit later",
     `GET /expenses/all?tag=#WORK returns only the two rows tagged "work"; every row has tags and notes ` +
       `(got ${JSON.stringify(s63TaggedNames)})`
   );
@@ -9763,8 +9763,8 @@ async function runTestSuite() {
   for (const q of s64Queries) {
     const [csv, all] = await Promise.all([s64Csv(q), s33("GET", `/api/expenses/all?${q}`)]);
     const titles = s64Rows(csv.raw).slice(1).map((r) => r[1].replace(/^'/, ""));
-    if (csv.status !== 200 || all.status !== 200 || JSON.stringify(titles) !== JSON.stringify(all.body.map((r) => r.name))) {
-      s64Mismatch.push(`${q}: csv ${JSON.stringify(titles)} vs ledger ${JSON.stringify(all.body?.map?.((r) => r.name))}`);
+    if (csv.status !== 200 || all.status !== 200 || JSON.stringify(titles) !== JSON.stringify(all.body.rows.map((r) => r.name))) {
+      s64Mismatch.push(`${q}: csv ${JSON.stringify(titles)} vs ledger ${JSON.stringify(all.body?.rows?.map?.((r) => r.name))}`);
     }
   }
   assert(s64Mismatch.length === 0, `Each filtered download matches the Ledger query (${s64Mismatch.join(" | ") || "all 8 match"})`);
@@ -9842,6 +9842,462 @@ async function runTestSuite() {
 
   await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "%Suite64%" } }, { fromAccountId: s64Card.id }] }, force: true });
   await s64Card.destroy();
+
+  // --- Suite 66: the Ledger a page at a time (R5) ---
+  console.log("\n--- Suite 66: Ledger pages: last 3 months by default, Load older, search across all history ---");
+  const { addMonthsToDateStr: s66AddMonths, ledgerWindow: s66Window } = require("../utils/ledgerExport");
+  const s66ShiftDays = (dateStr, days) => {
+    const [y, m, d] = dateStr.split("-").map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d + days, 12));
+    return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+  };
+  assert(
+    s66AddMonths("2026-05-31", -3) === "2026-02-28" && s66AddMonths("2024-05-31", -3) === "2024-02-29" &&
+      s66AddMonths("2026-01-15", -3) === "2025-10-15" && s66AddMonths("2025-11-30", 3) === "2026-02-28",
+    "Months back keep the day, or use the month's last day (May 31 - 3 months = Feb 28; Feb 29 in a leap year)"
+  );
+  assert(
+    s66Window({}, "2026-10-28").from === "2026-07-28" && s66Window({}, "2026-10-28").to === null &&
+      s66Window({ to: "2026-03-10" }, "2026-10-28").from === "2025-12-10" &&
+      s66Window({ search: "hydro" }, "2026-10-28").from === null && s66Window({ needsReview: true }, "2026-10-28").from === null &&
+      s66Window({ search: "hydro", from: "2026-01-01" }, "2026-10-28").from === "2026-01-01" &&
+      s66Window({ search: "   " }, "2026-10-28").from === "2026-07-28",
+    "The window: 3 months back from today (or from to= when earlier), no end; a search or the Review inbox reads all history"
+  );
+
+  const s66Today = getTorontoToday();
+  const s66Start = s66AddMonths(s66Today, -3);
+  const s66Ancient = s66AddMonths(s66Today, -24);
+  const s66Make = (title, date, extra = {}) =>
+    Transaction.create({ title, amount: 10, date, type: "EXPENSE", category: "Shopping", isCleared: date <= s66Today, tags: ["s66"], ...extra });
+  const s66Rows = {
+    edge: await s66Make("Suite66 Edge", s66Start),
+    older: await s66Make("Suite66 Older", s66ShiftDays(s66Start, -1)),
+    recent: await s66Make("Suite66 Recent zebra", s66ShiftDays(s66Today, -2)),
+    upcoming: await s66Make("Suite66 Upcoming", s66ShiftDays(s66Today, 20)),
+    ancient: await s66Make("Suite66 Ancient zebra", s66Ancient, { needsReview: true }),
+  };
+  const s66Names = (res) => (res.body?.rows || []).filter((r) => r.name.startsWith("Suite66")).map((r) => r.name).sort();
+
+  const s66First = await s33("GET", "/api/expenses/all");
+  assert(
+    s66First.status === 200 && Array.isArray(s66First.body.rows) && s66First.body.from === s66Start && s66First.body.to === null &&
+      s66First.body.hasMore === true &&
+      JSON.stringify(s66Names(s66First)) === JSON.stringify(["Suite66 Edge", "Suite66 Recent zebra", "Suite66 Upcoming"]),
+    `GET /expenses/all returns { rows, hasMore }: the last 3 months from ${s66Start} (that day included) and upcoming rows, ` +
+      `with older rows waiting (got ${JSON.stringify(s66Names(s66First))}, hasMore ${s66First.body?.hasMore})`
+  );
+  assert(
+    s66First.body.reviewCount >= 1 && !s66First.body.rows.some((r) => r.name === "Suite66 Ancient zebra"),
+    `The header's review count covers all history, even rows outside the page (got ${s66First.body.reviewCount})`
+  );
+
+  const s66OlderFrom = s66AddMonths(s66Start, -3);
+  const s66Second = await s33("GET", `/api/expenses/all?from=${s66OlderFrom}`);
+  assert(
+    s66Second.status === 200 && s66Second.body.from === s66OlderFrom && s66Second.body.hasMore === true &&
+      JSON.stringify(s66Names(s66Second)) === JSON.stringify(["Suite66 Edge", "Suite66 Older", "Suite66 Recent zebra", "Suite66 Upcoming"]),
+    `"Load older" (from=${s66OlderFrom}) adds the day before the first page and keeps everything after it (got ${JSON.stringify(s66Names(s66Second))})`
+  );
+
+  const s66OneDay = await s33("GET", `/api/expenses/all?from=${s66Rows.older.date}&to=${s66Rows.older.date}`);
+  const s66ToOnly = await s33("GET", `/api/expenses/all?to=${s66Today}`);
+  assert(
+    JSON.stringify(s66Names(s66OneDay)) === JSON.stringify(["Suite66 Older"]) &&
+      !s66Names(s66ToOnly).includes("Suite66 Upcoming") && s66Names(s66ToOnly).includes("Suite66 Edge") && s66ToOnly.body.to === s66Today,
+    `from= and to= are both inclusive; to= alone stops at that day (got ${JSON.stringify(s66Names(s66OneDay))}, ${JSON.stringify(s66Names(s66ToOnly))})`
+  );
+
+  // hasMore follows the filters: tagged rows older than from=, then none once the oldest is loaded
+  const s66TagMore = await s33("GET", `/api/expenses/all?tag=s66&from=${s66ShiftDays(s66Ancient, 1)}`);
+  const s66TagAll = await s33("GET", `/api/expenses/all?tag=s66&from=${s66Ancient}`);
+  const s66TypeNone = await s33("GET", `/api/expenses/all?type=income&tag=s66`);
+  assert(
+    s66TagMore.body.hasMore === true && !s66Names(s66TagMore).includes("Suite66 Ancient zebra") &&
+      s66TagAll.body.hasMore === false && s66Names(s66TagAll).length === 5 &&
+      s66TypeNone.body.hasMore === false && s66TypeNone.body.rows.length === 0,
+    `hasMore is true only while a row older than from= passes the same filters (got ${s66TagMore.body.hasMore}, ${s66TagAll.body.hasMore}, ${s66TypeNone.body.hasMore})`
+  );
+
+  const s66Search = await s33("GET", "/api/expenses/all?search=ZEBRA");
+  assert(
+    s66Search.status === 200 && s66Search.body.from === null && s66Search.body.hasMore === false &&
+      JSON.stringify(s66Names(s66Search)) === JSON.stringify(["Suite66 Ancient zebra", "Suite66 Recent zebra"]),
+    `A search runs on the server across all history, 2 years back included (got ${JSON.stringify(s66Names(s66Search))})`
+  );
+  const s66Review = await s33("GET", "/api/expenses/all?needsReview=true");
+  assert(
+    s66Review.status === 200 && s66Review.body.rows.length >= 1 && s66Review.body.rows.every((r) => r.needsReview) &&
+      s66Names(s66Review).includes("Suite66 Ancient zebra"),
+    "needsReview=true (the Review inbox) lists every row waiting for review, however old"
+  );
+
+  const s66Bad = await Promise.all(
+    ["from=yesterday", `from=${s66Today}&to=${s66Start}`, "needsReview=maybe"].map((q) => s33("GET", `/api/expenses/all?${q}`))
+  );
+  assert(s66Bad.every((r) => r.status === 400), `A bad from=, from after to, or a bad needsReview get 400 (got ${s66Bad.map((r) => r.status)})`);
+
+  // The CSV download has no default window: it still holds all history for its filters
+  const s66Csv = await s33("GET", "/api/expenses/export.csv?tag=s66");
+  const s66CsvWindow = await s33("GET", `/api/expenses/export.csv?tag=s66&from=${s66Start}`);
+  assert(
+    s66Csv.status === 200 && s66Csv.raw.includes("Suite66 Ancient zebra") && s66Csv.raw.includes("Suite66 Older") &&
+      !s66CsvWindow.raw.includes("Suite66 Older") && s66CsvWindow.raw.includes("Suite66 Edge"),
+    "The Ledger CSV keeps its filters: all history without from=, the loaded window with it"
+  );
+  await Transaction.destroy({ where: { title: { [Op.like]: "Suite66 %" } }, force: true });
+
+  // --- Suite 67: an offline Quick Add save replayed from the queue (F10) ---
+  console.log("\n--- Suite 67: Replaying a queued offline save twice creates one row ---");
+  // The app queues the save with its clientRef and date while offline, then sends it when back online.
+  // A replay can happen twice (the first answer lost on a bad network, two tabs, a reload mid-sync).
+  const s67Yesterday = getTorontoOffsetDate(-1);
+  const s67Ref = "5b9c3e1a-7d2f-4c6b-9a8e-0f1d2c3b4a67";
+  const s67Save = { name: "Suite67 Offline coffee", amount: 4.25, due_date: s67Yesterday, category: "Food & Drink", is_paid: true, recurrence: "none", clientRef: s67Ref };
+  const s67First = await s33("POST", "/api/expenses", s67Save);
+  const s67Again = await s33("POST", "/api/expenses", s67Save);
+  assert(
+    s67First.status === 201 && s67Again.status === 200 && s67Again.body.isDuplicate === true && s67Again.body.id === s67First.body.id &&
+      (await Transaction.count({ where: { clientRef: s67Ref } })) === 1,
+    `The same queued save sent twice is stored once; the replay gets the stored row back (got ${s67First.status}, ${s67Again.status})`
+  );
+  const s67Row = await Transaction.findOne({ where: { clientRef: s67Ref } });
+  assert(s67Row.date === s67Yesterday && Number(s67Row.amount) === 4.25, "The replay keeps the date it was queued with (yesterday), not the day it synced");
+
+  const s67PayRef = "5b9c3e1a-7d2f-4c6b-9a8e-0f1d2c3b4a69";
+  const s67Pay = { name: "Suite67 Offline tips", amount: 40, payment_date: s67Yesterday, recurrence: "none", clientRef: s67PayRef };
+  const s67PayRes = [await s33("POST", "/api/paycheques", s67Pay), await s33("POST", "/api/paycheques", s67Pay)];
+  assert(
+    s67PayRes[0].status === 201 && s67PayRes[1].body?.isDuplicate === true && (await Transaction.count({ where: { clientRef: s67PayRef } })) === 1,
+    `A queued income save replayed twice is stored once too (got ${s67PayRes.map((r) => r.status)})`
+  );
+  await Transaction.destroy({ where: { title: { [Op.like]: "Suite67 %" } }, force: true });
+
+  // --- Suites 68-69 run the AI routes in this process with a mocked model, over real HTTP ---
+  const s68Express = require("express");
+  const s68Gemini = require("../routes/gemini");
+  const { errorHandler: s68ErrorHandler } = require("../middleware/errorHandler");
+  const { aiLimiter: s68AiLimiter } = require("../middleware/rateLimit");
+  const { AiUsage: s68AiUsage, Rule: s68Rule } = require("../models");
+  const s68App = s68Express();
+  s68App.use(s68Express.json());
+  s68App.use("/api/categorize-receipt", s68AiLimiter);
+  s68App.use("/api/chat-advisor", s68AiLimiter);
+  s68App.use("/api", s68Gemini);
+  s68App.use(s68ErrorHandler);
+  const s68Server = await new Promise((resolve) => {
+    const srv = s68App.listen(0, () => resolve(srv));
+  });
+  const s68Port = s68Server.address().port;
+  const s68Today = getTorontoToday();
+
+  // multipart/form-data with one file in the "image" field
+  const s68Upload = (bytes, { mime = "image/jpeg", filename = "receipt.jpg", field = "image", auth = true } = {}) => {
+    const boundary = "----s68boundary7MA4YWxkTrZu0gW";
+    const parts = [];
+    if (bytes) {
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${filename}"\r\nContent-Type: ${mime}\r\n\r\n`));
+      parts.push(bytes);
+      parts.push(Buffer.from("\r\n"));
+    }
+    parts.push(Buffer.from(`--${boundary}--\r\n`));
+    const body = Buffer.concat(parts);
+    return new Promise((resolve, reject) => {
+      const headers = { "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": body.length };
+      if (auth) headers.Authorization = authHeaders.Authorization;
+      const req = http.request({ hostname: "localhost", port: s68Port, path: "/api/categorize-receipt", method: "POST", headers }, (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          let parsed = null;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            parsed = null;
+          }
+          resolve({ status: res.statusCode, body: parsed });
+        });
+      });
+      req.on("error", reject);
+      req.end(body);
+    });
+  };
+  const s68Jpeg = (size = 2048) => {
+    const b = Buffer.alloc(size, 0x20);
+    b[0] = 0xff;
+    b[1] = 0xd8;
+    b[2] = 0xff;
+    b[3] = 0xe0;
+    return b;
+  };
+
+  // --- Suite 68: receipt photo -> draft (AI5) ---
+  console.log("\n--- Suite 68: POST /categorize-receipt: size and type checks, a draft from a mocked model, nothing saved ---");
+  let s68Reply = { amount: 23.456, merchant: "Suite68 Corner Store\n#204", date: s68Today, taxAmount: 2.7, category: "Shopping" };
+  const s68Calls = [];
+  s68Gemini.setAiClientForTests({
+    models: {
+      generateContent: async (params) => {
+        s68Calls.push(params);
+        return { text: JSON.stringify(s68Reply), usageMetadata: { promptTokenCount: 300, candidatesTokenCount: 20, totalTokenCount: 320 } };
+      },
+    },
+  });
+  await s68AiUsage.destroy({ where: { date: s68Today } });
+  await Setting.destroy({ where: { key: "ai_daily_cap" } });
+  const s68CountBefore = await Transaction.count({ paranoid: false });
+
+  const s68NoAuth = await s68Upload(s68Jpeg(), { auth: false });
+  const s68NoFile = await s68Upload(null);
+  const s68WrongField = await s68Upload(s68Jpeg(), { field: "photo" });
+  const s68Pdf = await s68Upload(Buffer.from("%PDF-1.7 not a photo at all"), { mime: "application/pdf", filename: "r.pdf" });
+  const s68Fake = await s68Upload(Buffer.from("this is text pretending to be a jpeg"), { mime: "image/jpeg" });
+  const s68TooBig = await s68Upload(s68Jpeg(5 * 1024 * 1024 + 1));
+  assert(
+    s68NoAuth.status === 401 && s68NoFile.status === 400 && s68WrongField.status === 400 && s68Pdf.status === 415 &&
+      s68Fake.status === 415 && s68TooBig.status === 413 && /5 MB/.test(s68TooBig.body?.error || ""),
+    `Needs auth (401), a photo (400), the 'image' field (400), an image type (415 for a PDF or text named .jpg), ` +
+      `at most 5 MB (413) (got ${[s68NoAuth, s68NoFile, s68WrongField, s68Pdf, s68Fake, s68TooBig].map((r) => r.status)})`
+  );
+  assert(s68Calls.length === 0 && !(await s68AiUsage.findByPk(s68Today)), "Refused uploads never reach the model or use the daily AI limit");
+
+  const s68Ok = await s68Upload(s68Jpeg(5 * 1024 * 1024));
+  const s68Part = s68Calls[0]?.contents?.[0]?.parts?.[0]?.inlineData;
+  assert(
+    s68Ok.status === 200 && s68Ok.body.amount === 23.46 && s68Ok.body.merchant === "Suite68 Corner Store #204" &&
+      s68Ok.body.date === s68Today && s68Ok.body.taxAmount === 2.7 && s68Ok.body.category === "Shopping" && s68Ok.body.saved === false &&
+      s68Part?.mimeType === "image/jpeg" && s68Part.data.length > 0,
+    `A 5 MB JPEG gives a draft { amount, merchant, date, taxAmount, category } (got ${s68Ok.status} ${JSON.stringify(s68Ok.body)})`
+  );
+  assert(
+    (await Transaction.count({ paranoid: false })) === s68CountBefore && (await s68AiUsage.findByPk(s68Today))?.calls === 1,
+    "Reading a receipt saves nothing and counts as one AI request"
+  );
+  const s68Png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64)]);
+  const s68Mislabeled = await s68Upload(s68Png, { mime: "image/jpeg" });
+  const s68Untyped = await s68Upload(s68Jpeg(), { mime: "application/octet-stream", filename: "IMG_2041.HEIC" });
+  const s68UntypedText = await s68Upload(Buffer.from("plain text, no photo here at all"), { mime: "application/octet-stream" });
+  assert(
+    s68Untyped.status === 200 && s68Calls[2]?.contents?.[0]?.parts?.[0]?.inlineData?.mimeType === "image/jpeg" && s68UntypedText.status === 415,
+    `A photo sent with no type (application/octet-stream) is judged by its bytes: a JPEG is read, text is 415 (got ${s68Untyped.status}, ${s68UntypedText.status})`
+  );
+  assert(
+    s68Mislabeled.status === 200 && s68Calls[1]?.contents?.[0]?.parts?.[0]?.inlineData?.mimeType === "image/png",
+    "The model is told the type the photo's bytes show, not the one the browser claimed"
+  );
+
+  // The user's rules beat the model's category; unusable values come back empty
+  const s68RuleRow = await s68Rule.create({ match: "suite68 corner", category: "Food & Drink", priority: 1 });
+  s68Reply = { amount: -5, merchant: "Suite68 Corner Store", date: getTorontoOffsetDate(3), taxAmount: 99, category: "Not a category" };
+  const s68Ruled = await s68Upload(s68Jpeg());
+  assert(
+    s68Ruled.status === 200 && s68Ruled.body.category === "Food & Drink" && s68Ruled.body.categorySource === "rule" &&
+      s68Ruled.body.amount === null && s68Ruled.body.date === null && s68Ruled.body.taxAmount === null,
+    `A rule sets the category; a negative total, a future date and a bad category are dropped (got ${JSON.stringify(s68Ruled.body)})`
+  );
+  await s68RuleRow.destroy();
+  s68Reply = { amount: null, merchant: null, date: null, taxAmount: null, category: "Other" };
+  const s68Blank = await s68Upload(s68Jpeg());
+  assert(s68Blank.status === 422, `A photo with nothing readable gets 422 and a hint (got ${s68Blank.status})`);
+
+  await Setting.upsert({ key: "ai_daily_cap", value: "5" });
+  const s68Capped = await s68Upload(s68Jpeg());
+  await Setting.destroy({ where: { key: "ai_daily_cap" } });
+  s68Gemini.setAiClientForTests(null);
+  const s68NoKey = process.env.GEMINI_API_KEY ? { status: 503 } : await s68Upload(s68Jpeg());
+  assert(
+    s68Capped.status === 429 && s68Capped.body?.code === "AI_DAILY_CAP" && s68NoKey.status === 503,
+    `Over the daily AI limit gets 429; no Gemini key gets 503 (got ${s68Capped.status}, ${s68NoKey.status})`
+  );
+  const { cleanReceiptDraft: s68Clean, sniffImageType: s68Sniff } = require("../utils/receiptDraft");
+  const s68Heic = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypheic"), Buffer.alloc(16)]);
+  assert(
+    s68Sniff(s68Heic) === "image/heic" && s68Sniff(Buffer.from("RIFF0000WEBPVP8 ")) === "image/webp" && s68Sniff(Buffer.from("GIF89a000000")) === null &&
+      s68Clean({ amount: "$1,234.5", date: "2026-02-30", taxAmount: "0" }, { todayStr: "2026-10-28" }).amount === 1234.5 &&
+      s68Clean({ date: "2026-02-30" }, { todayStr: "2026-10-28" }).date === null &&
+      s68Clean({ taxAmount: "0", amount: 3 }, { todayStr: "2026-10-28" }).taxAmount === 0 &&
+      s68Clean({ taxAmount: null, amount: 3 }, { todayStr: "2026-10-28" }).taxAmount === null,
+    "HEIC and WebP photos are recognised (GIF is not); amounts like $1,234.5 are read, Feb 30 is not a date, no tax read stays empty"
+  );
+
+  // --- Suite 69: streamed chat answers (AI6) ---
+  console.log("\n--- Suite 69: /chat-advisor streams the answer as Server-Sent Events, with a non-streaming fallback ---");
+  const s69Chat = (body, { stream = true } = {}) =>
+    new Promise((resolve, reject) => {
+      const payload = JSON.stringify(body);
+      const headers = { ...authHeaders, "Content-Length": Buffer.byteLength(payload) };
+      if (stream) headers.Accept = "text/event-stream";
+      const req = http.request({ hostname: "localhost", port: s68Port, path: "/api/chat-advisor", method: "POST", headers }, (res) => {
+        let data = "";
+        const arrivals = [];
+        res.on("data", (c) => {
+          data += c;
+          arrivals.push(Date.now());
+        });
+        res.on("end", () => {
+          const events = data
+            .split("\n\n")
+            .filter((block) => block.startsWith("event: "))
+            .map((block) => {
+              const [eventLine, dataLine] = block.split("\n");
+              return { event: eventLine.slice(7), data: JSON.parse(dataLine.slice(6)) };
+            });
+          let json = null;
+          try {
+            json = JSON.parse(data);
+          } catch {
+            json = null;
+          }
+          resolve({ status: res.statusCode, type: res.headers["content-type"] || "", events, json, chunks: arrivals.length });
+        });
+      });
+      req.on("error", reject);
+      req.end(payload);
+    });
+  const s69Usage = { promptTokenCount: 50, candidatesTokenCount: 5, totalTokenCount: 55 };
+  const s69Chunk = (parts, last = false) => ({ candidates: [{ content: { role: "model", parts } }], ...(last ? { usageMetadata: s69Usage } : {}) });
+  const s69Pause = () => new Promise((r) => setTimeout(r, 20));
+  let s69Mode = "tool-then-text";
+  const s69StreamCalls = [];
+  const s69PlainCalls = [];
+  const s69ToolTurn = (params) => !params.contents[params.contents.length - 1].parts.some((p) => p.functionResponse);
+  s68Gemini.setAiClientForTests({
+    models: {
+      generateContent: async (params) => {
+        s69PlainCalls.push(params);
+        return { text: "Plain answer: **$42**", usageMetadata: s69Usage };
+      },
+      generateContentStream: async (params) => {
+        s69StreamCalls.push(params);
+        if (s69Mode === "broken") throw new Error("UNAVAILABLE: streaming is down");
+        const call = { name: "getSubscriptions", args: {} };
+        const firstCall = s69ToolTurn(params);
+        return (async function* () {
+          if (s69Mode === "mid-error") {
+            yield s69Chunk([{ text: "Half an ans" }]);
+            await s69Pause();
+            throw new Error("connection reset");
+          }
+          if (firstCall && s69Mode === "preamble-then-tool") {
+            yield s69Chunk([{ text: "Let me check. " }]);
+            await s69Pause();
+            yield s69Chunk([{ functionCall: call, thoughtSignature: "sig-1" }], true);
+            return;
+          }
+          if (firstCall && s69Mode === "tool-then-text") {
+            yield s69Chunk([{ functionCall: call, thoughtSignature: "sig-1" }], true);
+            return;
+          }
+          for (const piece of ["You spend ", "**$15.99**", " a month."]) {
+            yield s69Chunk([{ text: piece }]);
+            await s69Pause();
+          }
+          yield s69Chunk([{ text: "" }], true);
+        })();
+      },
+    },
+  });
+  await s68AiUsage.destroy({ where: { date: s68Today } });
+  const s69Deltas = (res) => res.events.filter((e) => e.event === "delta").map((e) => e.data.text);
+  const s69Done = (res) => res.events.find((e) => e.event === "done")?.data;
+
+  const s69Tool = await s69Chat({ message: "what do my subscriptions cost?", history: [] });
+  const s69ModelTurn = s69StreamCalls[1]?.contents?.find((c) => c.role === "model");
+  assert(
+    s69Tool.status === 200 && /^text\/event-stream/.test(s69Tool.type) &&
+      JSON.stringify(s69Deltas(s69Tool)) === JSON.stringify(["You spend ", "**$15.99**", " a month."]) &&
+      s69Done(s69Tool)?.reply === "You spend **$15.99** a month." && s69Tool.chunks >= 3,
+    `The answer arrives in pieces (delta events) after the tool ran, then "done" with the whole reply ` +
+      `(got ${s69Tool.type}, ${JSON.stringify(s69Deltas(s69Tool))}, ${s69Tool.chunks} chunks)`
+  );
+  const s69Order = s69Tool.events.map((e) => e.event);
+  assert(
+    s69Order.indexOf("status") > -1 && s69Order.indexOf("status") < s69Order.indexOf("delta") && s69Order[s69Order.length - 1] === "done" &&
+      s69ModelTurn?.parts?.[0]?.thoughtSignature === "sig-1" && s69PlainCalls.length === 0,
+    `The tool loop finishes on the server before any text is sent, and the tool call keeps its thought signature (got ${s69Order.join(",")})`
+  );
+
+  s69Mode = "preamble-then-tool";
+  const s69Preamble = await s69Chat({ message: "subscriptions?", history: [] });
+  const s69PreOrder = s69Preamble.events.map((e) => e.event);
+  assert(
+    s69PreOrder.indexOf("reset") > s69PreOrder.indexOf("delta") && s69Done(s69Preamble)?.reply === "You spend **$15.99** a month.",
+    `Text sent before the model asked for a tool is withdrawn with a "reset" event (got ${s69PreOrder.join(",")})`
+  );
+
+  s69Mode = "broken";
+  const s69PlainBefore = s69PlainCalls.length;
+  const s69Fallback = await s69Chat({ message: "hi", history: [] });
+  assert(
+    s69Fallback.status === 200 && s69Done(s69Fallback)?.reply === "Plain answer: **$42**" && s69Deltas(s69Fallback).length === 0 &&
+      s69PlainCalls.length === s69PlainBefore + 1,
+    `When the stream fails before any text, the server answers with one ordinary call and sends it as "done" (got ${JSON.stringify(s69Done(s69Fallback))})`
+  );
+  const s69Json = await s69Chat({ message: "hi", history: [] }, { stream: false });
+  assert(
+    s69Json.status === 200 && /application\/json/.test(s69Json.type) && s69Json.json?.reply === "Plain answer: **$42**" && Array.isArray(s69Json.json?.proposals),
+    `Without Accept: text/event-stream the route answers one JSON { reply, proposals } as before (got ${s69Json.type})`
+  );
+
+  s69Mode = "mid-error";
+  const s69MidError = await s69Chat({ message: "hi", history: [] });
+  const s69Err = s69MidError.events.find((e) => e.event === "error")?.data;
+  assert(
+    s69MidError.status === 200 && s69Deltas(s69MidError).join("") === "Half an ans" && s69Err?.status === 500 && !s69Done(s69MidError),
+    `A stream that breaks after text ends with an "error" event the app can show (got ${JSON.stringify(s69Err)})`
+  );
+
+  // Closing the panel mid-answer cancels the model call and runs no more rounds
+  s69Mode = "slow";
+  let s69SlowSignal = null;
+  let s69SlowCalls = 0;
+  s68Gemini.setAiClientForTests({
+    models: {
+      generateContent: async () => ({ text: "unused", usageMetadata: s69Usage }),
+      generateContentStream: async (params) => {
+        s69SlowCalls++;
+        s69SlowSignal = params.config.abortSignal;
+        return (async function* () {
+          yield s69Chunk([{ text: "Starting… " }]);
+          for (let i = 0; i < 40 && !params.config.abortSignal.aborted; i++) await s69Pause();
+          yield s69Chunk([{ text: "too late" }], true);
+        })();
+      },
+    },
+  });
+  await new Promise((resolve, reject) => {
+    const payload = JSON.stringify({ message: "hi", history: [] });
+    const req = http.request(
+      { hostname: "localhost", port: s68Port, path: "/api/chat-advisor", method: "POST", headers: { ...authHeaders, Accept: "text/event-stream", "Content-Length": Buffer.byteLength(payload) } },
+      (res) => {
+        res.on("data", (c) => {
+          if (String(c).includes("event: delta")) req.destroy();
+        });
+        res.on("close", resolve);
+      }
+    );
+    req.on("error", () => resolve());
+    req.end(payload);
+    setTimeout(() => reject(new Error("closing the chat timed out")), 5000);
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  assert(
+    s69SlowSignal?.aborted === true && s69SlowCalls === 1,
+    `Closing Ask FinTrack mid-answer aborts the Gemini call (got aborted ${s69SlowSignal?.aborted}, ${s69SlowCalls} call)`
+  );
+  s68Gemini.setAiClientForTests({ models: { generateContent: async () => ({ text: "unused", usageMetadata: s69Usage }) } });
+
+  await Setting.upsert({ key: "ai_daily_cap", value: String((await s68AiUsage.findByPk(s68Today))?.calls || 0) });
+  const s69Capped = await s69Chat({ message: "hi", history: [] });
+  await Setting.destroy({ where: { key: "ai_daily_cap" } });
+  assert(
+    s69Capped.status === 429 && s69Capped.json?.code === "AI_DAILY_CAP" && s69Capped.events.length === 0,
+    `Over the daily limit, a streaming request still gets the plain 429 before any stream starts (got ${s69Capped.status})`
+  );
+
+  s68Gemini.setAiClientForTests(null);
+  await s68AiUsage.destroy({ where: { date: s68Today } });
+  await new Promise((resolve) => s68Server.close(resolve));
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
