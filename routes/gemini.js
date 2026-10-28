@@ -1453,3 +1453,6 @@ module.exports.runChatLoop = runChatLoop;
 module.exports.buildQuickAddText = buildQuickAddText;
 module.exports.CHAT_TOOLS = CHAT_TOOLS;
 module.exports.setAiClientForTests = setAiClientForTests;
+module.exports.getAiClient = getAiClient;
+module.exports.generate = generate;
+module.exports.getModels = getModels;

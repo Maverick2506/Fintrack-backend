@@ -517,6 +517,76 @@ async function runGeminiUnitTests() {
     assert(draft({ amount: 5, title: "  $ " }).error);
   });
 
+  // --- Suite H: Month close commentary (F6): Gemini's lines may only quote the month's numbers ---
+  console.log("\n--- Suite H: Month close commentary ---");
+  const { sanitizeCommentary, buildCommentaryPrompt, digestLines } = require("../services/monthCloseService");
+  const hFacts = { spending: 1234.5, spendingChange: 80, biggestIncreases: [{ category: "Dining", change: 80, percent: 160 }], netWorthChange: -42.1 };
+
+  test("At most 3 lines; bullets, numbering and markdown are stripped", () => {
+    const lines = sanitizeCommentary(["- **Dining** up $80.00", "2) Spent $1,234.50", "• Net worth down $42.10", "Fourth line"], hFacts);
+    assert.deepStrictEqual(lines, ["Dining up $80.00", "Spent $1,234.50", "Net worth down $42.10"]);
+  });
+
+  test("A line quoting a $ amount or % that isn't in the numbers is dropped", () => {
+    const lines = sanitizeCommentary(["Dining rose 160%", "You saved $500 this month", "Dining is up 75%", "Spending was about $1,235"], hFacts);
+    assert.deepStrictEqual(lines, ["Dining rose 160%", "Spending was about $1,235"]);
+  });
+
+  test("A number written without $ or % that isn't in the facts drops the line (review R1)", () => {
+    const goalFacts = { saved: 400, target: 1000, percent: 40, year: 2026, overBudgetCount: 3, goals: [{ name: "Trip 2026", saved: 400 }] };
+    const lines = sanitizeCommentary(
+      [
+        "You are 600 away from your goal.",
+        "You could save 250 dollars next month.",
+        "Your goal is 41 percent done",
+        "About 1.2k saved so far",
+        "Trip 2026 has 400 of 1,000 saved, 40 percent.",
+        "3 budgets went over in 2026.",
+      ],
+      goalFacts
+    );
+    assert.deepStrictEqual(lines, ["Trip 2026 has 400 of 1,000 saved, 40 percent.", "3 budgets went over in 2026."]);
+  });
+
+  test("Blank or non-text answers give no lines; a long line is cut at a word", () => {
+    assert.deepStrictEqual(sanitizeCommentary(null, hFacts), []);
+    assert.deepStrictEqual(sanitizeCommentary(["", "   "], hFacts), []);
+    const [long] = sanitizeCommentary(["word ".repeat(60)], hFacts);
+    assert(long.length <= 160 && long.endsWith("…"), long);
+  });
+
+  test("The prompt carries the numbers and the rules, and nothing else to compute from", () => {
+    const prompt = buildCommentaryPrompt(hFacts);
+    assert(prompt.includes(JSON.stringify(hFacts)));
+    assert(/at most 3 short lines/i.test(prompt) && /Use only the numbers above/.test(prompt));
+  });
+
+  test("Numbers written as words are checked too, and fractions or multiples drop the line (re-review)", () => {
+    const facts = { year: 2026, overBudgetCount: 2, goals: [{ name: "Trip", saved: 400, target: 1000, percent: 40 }] };
+    const kept = sanitizeCommentary(["Two budgets went over in 2026.", "One goal is at 40%."], facts);
+    assert.deepStrictEqual(kept, ["Two budgets went over in 2026.", "One goal is at 40%."]);
+    const dropped = sanitizeCommentary(
+      ["Two thirds of the way to Trip.", "Spending doubled.", "You saved half of it.", "Three budgets went over.", "A few hundred left."],
+      facts
+    );
+    assert.deepStrictEqual(dropped, []);
+  });
+
+  test("The digest's month close writes thousands with a comma", () => {
+    const lines = digestLines(
+      {
+        label: "May 2024",
+        totals: { spending: 2000, income: 12345.5, previousSpending: 0, spendingChange: 0, budgeted: 0, spentInBudgeted: 0, overBudgetCount: 0 },
+        increases: [],
+        priceRises: [],
+        netWorth: { change: -1500 },
+      },
+      true
+    ).join("\n");
+    assert(lines.includes("Spent $2,000.00, income $12,345.50"), lines);
+    assert(lines.includes("Net worth −$1,500.00"), lines);
+  });
+
   console.log("\n==================================================");
   console.log(`   UNIT TEST RUN: ${passed} passed, ${failed} failed`);
   console.log("==================================================");

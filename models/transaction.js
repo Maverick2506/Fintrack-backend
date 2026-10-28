@@ -77,6 +77,15 @@ const Transaction = sequelize.define(
       allowNull: false,
       defaultValue: false,
     },
+    // Free-text notes and a list of tags (F11); both optional
+    notes: {
+      type: DataTypes.TEXT,
+      allowNull: true,
+    },
+    tags: {
+      type: DataTypes.JSON,
+      allowNull: true,
+    },
   },
   {
     // Deleted rows stay in the Trash (deletedAt set) until the nightly sweep purges them after 30 days.

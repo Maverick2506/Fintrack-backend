@@ -46,6 +46,7 @@ const accountRoutes = require("./routes/accounts");
 const ruleRoutes = require("./routes/rules");
 const importRoutes = require("./routes/import");
 const alertRoutes = require("./routes/alerts");
+const reportRoutes = require("./routes/reports");
 const {
   router: recurringRoutes,
   createRecurringExpenses,
@@ -82,6 +83,8 @@ const corsOptions = {
   },
   methods: "GET,POST,PUT,DELETE,OPTIONS",
   allowedHeaders: "Content-Type,Authorization",
+  // Lets the app read the CSV download's file name
+  exposedHeaders: "Content-Disposition",
   credentials: true,
 };
 
@@ -97,6 +100,7 @@ app.use("/api/auth/login", loginLimiter);
 app.use("/api/financial-advice", aiLimiter);
 app.use("/api/categorize-expense", aiLimiter);
 app.use("/api/chat-advisor", aiLimiter);
+app.use("/api/reports/month-close/commentary", aiLimiter);
 app.use("/api", apiLimiter);
 
 // --- HEALTH CHECK ---
@@ -137,6 +141,7 @@ app.use("/api/subscriptions", subscriptionRoutes);
 app.use("/api/rules", ruleRoutes);
 app.use("/api/import", importRoutes);
 app.use("/api/alerts", alertRoutes);
+app.use("/api/reports", reportRoutes);
 
 // --- 404 & CENTRAL ERROR HANDLING ---
 app.use(notFoundHandler);
@@ -260,6 +265,19 @@ async function initialize() {
         await queryInterface.addColumn("Transactions", "balanceReversedOnDelete", {
           type: DataTypes.BOOLEAN,
           defaultValue: false,
+        });
+      }
+      // Notes and tags on a transaction (F11)
+      if (!tableDesc.notes) {
+        await queryInterface.addColumn("Transactions", "notes", {
+          type: DataTypes.TEXT,
+          allowNull: true,
+        });
+      }
+      if (!tableDesc.tags) {
+        await queryInterface.addColumn("Transactions", "tags", {
+          type: DataTypes.JSON,
+          allowNull: true,
         });
       }
 

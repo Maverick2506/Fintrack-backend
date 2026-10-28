@@ -78,6 +78,8 @@ router.post(
         isCleared,
         toAccountId: checking ? checking.id : null,
         recurrence: recurrence || "none",
+        notes: req.body.notes ?? null,
+        tags: req.body.tags ?? null,
         clientRef: req.body.clientRef || null,
       });
     } catch (error) {

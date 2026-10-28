@@ -151,6 +151,7 @@ async function runTestSuite() {
     { prefix: "/api/rules", r: require("../routes/rules") },
     { prefix: "/api/import", r: require("../routes/import") },
     { prefix: "/api/alerts", r: require("../routes/alerts") },
+    { prefix: "/api/reports", r: require("../routes/reports") },
   ];
   const publicAllowlist = [
     /^\/api\/health/,
@@ -9458,6 +9459,389 @@ async function runTestSuite() {
   await Setting.destroy({
     where: { key: { [Op.or]: [{ [Op.like]: "fund_paid:%" }, { [Op.like]: "fund_paid_by:%" }, { [Op.like]: "fund_undone:%" }] } },
   });
+
+  console.log("\n--- Suite 62: Month close review (numbers match /spending-summary, budgets, moves, price rises, goals, net worth, commentary) ---");
+  const { generateCommentary: s62Generate, COMMENTARY_KEY_PREFIX: s62CommentaryKey } = require("../services/monthCloseService");
+  const s62Gemini = require("../routes/gemini");
+  const s62Ai = require("../services/aiUsageService");
+  // A month long past, so rows other suites leave behind are unlikely to fall in it
+  const s62Month = "2024-05";
+  const s62Prev = "2024-04";
+  const s62Rows = [
+    // Last month
+    ["S62 Dining", 50, `${s62Prev}-10`], ["S62 Groceries", 300, `${s62Prev}-12`], ["S62 Fun", 20, `${s62Prev}-20`],
+    // This month: Dining up $80 and over its $100 budget, Groceries down $110 (a $10 refund included), Fun the same
+    ["S62 Dining", 70, `${s62Month}-03`], ["S62 Dining", 60, `${s62Month}-21`], ["S62 Groceries", 200, `${s62Month}-08`],
+    ["S62 Groceries", -10, `${s62Month}-09`], ["S62 Fun", 20, `${s62Month}-30`],
+  ];
+  for (const [category, amount, date] of s62Rows) {
+    await Transaction.create({ title: `Suite62 ${category}`, amount, date, type: "EXPENSE", category, isCleared: true });
+  }
+  // Unpaid rows aren't spending yet
+  await Transaction.create({ title: "Suite62 Unpaid", amount: 999, date: `${s62Month}-25`, type: "EXPENSE", category: "S62 Dining", isCleared: false });
+  await Transaction.create({ title: "Suite62 Pay", amount: 2000, date: `${s62Month}-15`, type: "INCOME", category: "Income", isCleared: true });
+  await s33("PUT", `/api/budgets/${encodeURIComponent("S62 Dining")}`, { monthlyLimit: 100 });
+  await s33("PUT", `/api/budgets/${encodeURIComponent("S62 Groceries")}`, { monthlyLimit: 400 });
+  // A subscription whose price rose from $10 to $12 this month
+  const s62Series = require("crypto").randomUUID();
+  for (const [date, amount] of [["2024-02-05", 10], ["2024-03-05", 10], ["2024-04-05", 10], ["2024-05-05", 12]]) {
+    await Transaction.create({
+      title: "Suite62 Stream", amount, date, type: "EXPENSE", category: "S62 Subs", isCleared: true,
+      recurrence: "monthly", recurringGroupId: s62Series,
+    });
+  }
+  // A goal: $500 saved today, $200 went in during May and $100 after it, so $400 at the end of May
+  const s62Goal = await Account.create({ name: "Suite62 Trip", type: "SAVINGS_GOAL", initialBalance: 500, targetAmount: 1000, isActive: true });
+  await s45Opened(s62Goal, "2024-01-15");
+  // A goal opened after May isn't in May's close
+  const s62LaterGoal = await Account.create({ name: "Suite62 Later", type: "SAVINGS_GOAL", initialBalance: 50, targetAmount: 100, isActive: true });
+  // The subscription changed again in June: May's close still shows May's rise
+  await Transaction.create({
+    title: "Suite62 Stream", amount: 13, date: "2024-06-05", type: "EXPENSE", category: "S62 Subs", isCleared: true,
+    recurrence: "monthly", recurringGroupId: s62Series,
+  });
+  await Transaction.create({ title: "Suite62 To Trip", amount: 200, date: `${s62Month}-10`, type: "TRANSFER", category: "Savings", isCleared: true, balanceApplied: true, toAccountId: s62Goal.id });
+  await Transaction.create({ title: "Suite62 To Trip later", amount: 100, date: "2024-07-01", type: "TRANSFER", category: "Savings", isCleared: true, balanceApplied: true, toAccountId: s62Goal.id });
+  // Net worth: $1,000 at the end of April, $1,350 at the end of May
+  const s62Snaps = await Promise.all([
+    NetWorthSnapshot.create({ date: "2024-04-30", netWorth: 1000 }),
+    NetWorthSnapshot.create({ date: "2024-05-15", netWorth: 1200 }),
+    NetWorthSnapshot.create({ date: "2024-05-31", netWorth: 1350 }),
+  ]);
+
+  const [s62Res, s62Summary] = await Promise.all([
+    s33("GET", `/api/reports/month-close?month=${s62Month}`),
+    s33("GET", "/api/spending-summary?year=2024&month=5"),
+  ]);
+  const s62 = s62Res.body;
+  const s62Cat = (name) => (s62.categories || []).find((c) => c.category === name);
+  assert(s62Res.status === 200 && s62Summary.status === 200, `GET /reports/month-close and /spending-summary return 200 (got ${s62Res.status})`);
+  const s62SummaryTotal = s62Summary.body.reduce((sum, r) => sum + r.value, 0);
+  const s62Mismatch = s62Summary.body.filter((r) => Math.abs((s62Cat(r.name || "Other")?.spent ?? NaN) - r.value) > 0.005);
+  assert(
+    s62Mismatch.length === 0 && Math.abs(s62.totals.spending - s62SummaryTotal) < 0.005 &&
+      s62Cat("S62 Dining").spent === 130 && s62Cat("S62 Groceries").spent === 190,
+    `Every category's spending and the month total match /spending-summary (total ${s62.totals.spending} vs ${s62SummaryTotal}; ` +
+      `mismatched: ${s62Mismatch.map((r) => r.name).join(", ") || "none"})`
+  );
+  assert(
+    s62Cat("S62 Dining").budget === 100 && s62Cat("S62 Dining").overBudget === true && s62Cat("S62 Dining").remaining === -30 &&
+      s62Cat("S62 Groceries").budget === 400 && s62Cat("S62 Groceries").overBudget === false && s62Cat("S62 Fun").budget === null,
+    `Dining is $30 over its $100 budget, Groceries within $400, Fun has no budget (got ${JSON.stringify(s62Cat("S62 Dining"))})`
+  );
+  const s62Up = s62.increases.find((m) => m.category === "S62 Dining");
+  const s62Down = s62.decreases.find((m) => m.category === "S62 Groceries");
+  assert(
+    s62Up?.change === 80 && s62Up.previous === 50 && s62Up.percent === 160 && s62Down?.change === -110 &&
+      !s62.increases.concat(s62.decreases).some((m) => m.category === "S62 Fun") &&
+      s62.increases.length <= 3 && s62.decreases.length <= 3,
+    `Biggest increase Dining +$80 (160%), biggest decrease Groceries -$110, unchanged Fun in neither ` +
+      `(got ${JSON.stringify(s62.increases)} / ${JSON.stringify(s62.decreases)})`
+  );
+  const s62Rise = s62.priceRises.find((p) => p.name === "Suite62 Stream");
+  assert(
+    s62Rise?.from === 10 && s62Rise.to === 12 && s62Rise.percent === 20 && s62Rise.date === "2024-05-05",
+    `The $10 -> $12 subscription is listed as a price rise in May (got ${JSON.stringify(s62Rise)})`
+  );
+  const s62GoalRow = s62.goals.find((g) => g.id === s62Goal.id);
+  assert(
+    !s62.goals.some((g) => g.id === s62LaterGoal.id) && typeof s62.commentaryKey === "string" && s62.commentaryKey.length === 32,
+    `A goal opened after the month is left out; the response carries a commentary key (got ${s62.goals.map((g) => g.name).join(", ")})`
+  );
+  assert(
+    s62GoalRow?.saved === 400 && s62GoalRow.contributed === 200 && s62GoalRow.target === 1000 && s62GoalRow.percent === 40,
+    `Goal at the end of May: $400 of $1,000 (40%), $200 put in during May (got ${JSON.stringify(s62GoalRow)})`
+  );
+  assert(
+    s62.netWorth?.start === 1000 && s62.netWorth.end === 1350 && s62.netWorth.change === 350 &&
+      s62.netWorth.startDate === "2024-04-30" && s62.netWorth.endDate === "2024-05-31",
+    `Net worth went from $1,000 (Apr 30) to $1,350 (May 31), +$350 (got ${JSON.stringify(s62.netWorth)})`
+  );
+  assert(
+    s62.totals.income === 2000 && s62.totals.previousSpending === 380 && s62.isComplete === true && s62.commentary === null &&
+      s62.label === "May 2024",
+    `Totals: income $2,000, last month $380 (the $10 subscription included); May is over; no commentary written yet (got ${JSON.stringify(s62.totals)})`
+  );
+  const [s62Future, s62Bad, s62NoKey] = await Promise.all([
+    s33("GET", "/api/reports/month-close?month=2099-01"),
+    s33("GET", "/api/reports/month-close?month=2024-13"),
+    s33("GET", `/api/reports/month-close/commentary?month=${s62Month}`),
+  ]);
+  assert(
+    s62Future.status === 400 && s62Bad.status === 400 && s62NoKey.status === 503,
+    `A future month and a bad month are refused (400); commentary without an API key is 503 (got ${s62Future.status}, ${s62Bad.status}, ${s62NoKey.status})`
+  );
+
+  // Commentary from a mocked model: at most 3 lines, a line with a made-up figure is dropped, cached per month
+  let s62Calls = 0;
+  const s62MockAi = {
+    models: {
+      generateContent: async () => {
+        s62Calls++;
+        return {
+          text: JSON.stringify({
+            lines: [
+              "- **Dining** rose $80.00 (160%) and went over its budget.",
+              "You could save $999.99 by cooking more.",
+              "Groceries fell $110.00 from last month.",
+              "Net worth grew $350.00.",
+              "Suite62 Stream went from $10.00 to $12.00.",
+            ],
+          }),
+        };
+      },
+    },
+  };
+  const s62Helpers = {
+    ai: s62MockAi, generate: s62Gemini.generate, reserveCall: s62Ai.reserveCall, releaseUnanswered: s62Ai.releaseUnanswered,
+    model: "gemini-test", todayStr: getTorontoToday(),
+  };
+  const s62First = await s62Generate(s62, s62Helpers);
+  const s62Again = await s62Generate(s62, s62Helpers);
+  const s62WithText = await s33("GET", `/api/reports/month-close?month=${s62Month}`);
+  assert(
+    s62First.lines.length === 3 && s62First.lines[0] === "Dining rose $80.00 (160%) and went over its budget." &&
+      !s62First.lines.some((l) => l.includes("999")) && s62Calls === 1 && s62Again.cached === true &&
+      JSON.stringify(s62WithText.body.commentary) === JSON.stringify(s62First.lines),
+    `Commentary keeps 3 lines with only the month's numbers, is cached, and GET returns it ` +
+      `(got ${JSON.stringify(s62First.lines)}, ${s62Calls} model call(s), GET ${JSON.stringify(s62WithText.body.commentary)})`
+  );
+
+  // An answer whose every line is dropped isn't kept, so the next try can still write a note
+  const s62Cached = await Setting.findByPk(`${s62CommentaryKey}${s62Month}`);
+  await Setting.destroy({ where: { key: `${s62CommentaryKey}${s62Month}` } });
+  const s62MadeUp = await s62Generate(s62, { ...s62Helpers, ai: { models: { generateContent: async () => ({ text: JSON.stringify({ lines: ["You saved 999 dollars."] }) }) } } });
+  const s62AfterBad = await Setting.findByPk(`${s62CommentaryKey}${s62Month}`);
+  assert(
+    s62MadeUp.lines.length === 0 && s62AfterBad === null,
+    `An answer with only made-up numbers gives no lines and isn't cached (got ${JSON.stringify(s62MadeUp.lines)}, cached ${Boolean(s62AfterBad)})`
+  );
+  await Setting.create({ key: s62Cached.key, value: s62Cached.value });
+
+  // The digest on the 1st sums up the month that just ended; other days don't
+  const { buildMorningDigest: s62Digest } = require("../services/notificationService");
+  const s62OnFirst = await s62Digest(null, { todayStr: "2024-06-01" });
+  const s62OnSecond = await s62Digest(null, { todayStr: "2024-06-02" });
+  assert(
+    s62OnFirst?.message.includes("🗓️ May 2024 close:") && s62OnFirst.message.includes("Biggest increase: S62 Dining +$80.00") &&
+      s62OnFirst.message.includes("Suite62 Stream $10.00 → $12.00") && s62OnFirst.message.includes("Net worth +$350.00") &&
+      s62OnFirst.message.includes("💬 Dining rose $80.00") && !(s62OnSecond?.message || "").includes("close:"),
+    `The June 1 digest has the May close with its commentary; June 2 has none (got ${JSON.stringify(s62OnFirst?.message)})`
+  );
+  await Setting.upsert({ key: "NOTIFY_DETAIL", value: "counts" });
+  const s62Counts = await s62Digest(null, { todayStr: "2024-06-01" });
+  await Setting.destroy({ where: { key: "NOTIFY_DETAIL" } });
+  assert(
+    s62Counts?.message.includes("May 2024 close:") && !/\$\d/.test(s62Counts.message.split("May 2024 close:")[1].split("\n").slice(0, 4).join("\n")) &&
+      !s62Counts.message.includes("💬"),
+    `With amounts off, the month close has counts only and no commentary (got ${JSON.stringify(s62Counts?.message)})`
+  );
+
+  await Transaction.destroy({ where: { title: { [Op.like]: "Suite62 %" } }, force: true });
+  await Account.destroy({ where: { id: { [Op.in]: [s62Goal.id, s62LaterGoal.id] } } });
+  await Budget.destroy({ where: { category: { [Op.in]: ["S62 Dining", "S62 Groceries"] } } });
+  await Promise.all(s62Snaps.map((s) => s.destroy()));
+  await Setting.destroy({ where: { key: `${s62CommentaryKey}${s62Month}` } });
+
+  console.log("\n--- Suite 63: Notes and tags on transactions (save, edit, Ledger filter, Gem feed) ---");
+  const s63Today = getTorontoToday();
+  const s63Lunch = await s33("POST", "/api/expenses", {
+    name: "Suite63 Lunch", amount: 18.25, due_date: s63Today, category: "Dining Out", is_paid: true,
+    tags: ["#Work", "work", "  Trip   2026 "], notes: "  Client lunch, with Sam\nsplit later  ",
+  });
+  const s63Pay = await s33("POST", "/api/paycheques", { name: "Suite63 Bonus", amount: 500, payment_date: s63Today, tags: ["Work"] });
+  const s63Plain = await s33("POST", "/api/expenses", { name: "Suite63 Plain", amount: 3, due_date: s63Today, category: "Other", is_paid: true });
+  assert(
+    s63Lunch.status === 201 || s63Lunch.status === 200,
+    `POST /expenses with tags and notes saves (got ${s63Lunch.status} ${JSON.stringify(s63Lunch.body).slice(0, 200)})`
+  );
+  const s63Row = await Transaction.findByPk(s63Lunch.body.id);
+  assert(
+    JSON.stringify(s63Row.tags) === JSON.stringify(["work", "trip 2026"]) && s63Row.notes === "Client lunch, with Sam\nsplit later" &&
+      JSON.stringify((await Transaction.findByPk(s63Pay.body.id)).tags) === JSON.stringify(["work"]) &&
+      (await Transaction.findByPk(s63Plain.body.id)).tags === null,
+    `Tags are stored lowercase without "#" or repeats, notes trimmed; a paycheque takes tags; no tags is null ` +
+      `(got ${JSON.stringify(s63Row.tags)} / ${JSON.stringify(s63Row.notes)})`
+  );
+  const [s63TooMany, s63TooLong, s63LongNote] = await Promise.all([
+    s33("POST", "/api/expenses", { name: "Suite63 Bad", amount: 1, tags: Array.from({ length: 11 }, (_, i) => `t${i}`) }),
+    s33("POST", "/api/expenses", { name: "Suite63 Bad", amount: 1, tags: ["x".repeat(31)] }),
+    s33("PUT", `/api/expenses/${s63Lunch.body.id}`, { notes: "n".repeat(1001) }),
+  ]);
+  const s63HashTag = await s33("PUT", `/api/expenses/${s63Plain.body.id}`, { tags: [`#${"y".repeat(30)}`] });
+  assert(
+    s63HashTag.status === 200 && JSON.stringify((await Transaction.findByPk(s63Plain.body.id)).tags) === JSON.stringify(["y".repeat(30)]),
+    `"#" plus 30 characters is a 30-character tag and is saved (got ${s63HashTag.status})`
+  );
+  await s33("PUT", `/api/expenses/${s63Plain.body.id}`, { tags: [] });
+  assert(
+    s63TooMany.status === 400 && s63TooLong.status === 400 && s63LongNote.status === 400,
+    `11 tags, a 31-character tag and a 1,001-character note are refused (got ${s63TooMany.status}, ${s63TooLong.status}, ${s63LongNote.status})`
+  );
+
+  // The Ledger's tag filter, case-insensitive and with or without "#"
+  const s63Tagged = await s33("GET", "/api/expenses/all?tag=%23WORK");
+  const s63All = await s33("GET", "/api/expenses/all");
+  const s63TaggedNames = s63Tagged.body.map((r) => r.name).sort();
+  assert(
+    JSON.stringify(s63TaggedNames) === JSON.stringify(["Suite63 Bonus", "Suite63 Lunch"]) &&
+      s63Tagged.body.every((r) => r.tags.includes("work")) && s63All.body.length > s63Tagged.body.length &&
+      s63All.body.find((r) => r.name === "Suite63 Plain")?.tags.length === 0 &&
+      s63All.body.find((r) => r.name === "Suite63 Lunch")?.notes === "Client lunch, with Sam\nsplit later",
+    `GET /expenses/all?tag=#WORK returns only the two rows tagged "work"; every row has tags and notes ` +
+      `(got ${JSON.stringify(s63TaggedNames)})`
+  );
+
+  // The Gem feed's recent rows carry the tags and the note on one line
+  const s63Key = (await s33("GET", "/api/export/gemini-config")).body.feedKey;
+  const [s63CsvRes, s63MdRes] = await Promise.all([
+    s36(`/api/export/financial-feed.csv?key=${s63Key}`),
+    s36(`/api/export/financial-feed.md?key=${s63Key}`),
+  ]);
+  const s63Csv = s36ParseCsv(s63CsvRes.raw);
+  const s63Header = s63Csv.find((r) => r[0] === "SECTION" && r[1] === "DATE" && r[2] === "TYPE");
+  const s63CsvLunch = s63Csv.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] === "Suite63 Lunch");
+  assert(
+    s63Header?.[7] === "TAGS" && s63Header[8] === "NOTES" && s63CsvLunch?.[7] === "work; trip 2026" &&
+      s63CsvLunch[8] === "Client lunch, with Sam split later",
+    `CSV feed RECENT_TRANSACTIONS has TAGS and NOTES columns (got header ${s63Header?.join(",")}, row ${s63CsvLunch?.join(",")})`
+  );
+  assert(
+    s63MdRes.raw.includes("| Account | Tags | Notes |") && s63MdRes.raw.includes("| work; trip 2026 | Client lunch, with Sam split later |"),
+    "Markdown feed's recent rows have Tags and Notes columns"
+  );
+
+  // Editing: a body without them keeps them; null and [] clear them
+  await s33("PUT", `/api/expenses/${s63Lunch.body.id}`, { name: "Suite63 Lunch", amount: 19 });
+  await s63Row.reload();
+  const s63Kept = JSON.stringify(s63Row.tags) === JSON.stringify(["work", "trip 2026"]) && Boolean(s63Row.notes);
+  await s33("PUT", `/api/expenses/${s63Lunch.body.id}`, { notes: null, tags: [] });
+  await s63Row.reload();
+  assert(
+    s63Kept && s63Row.notes === null && s63Row.tags === null,
+    `An edit without tags or notes keeps them; null and [] clear them (got ${JSON.stringify(s63Row.tags)} / ${s63Row.notes})`
+  );
+
+  // A recurring bill's next occurrences keep its tags but not its note
+  const s63Bill = await s33("POST", "/api/expenses", {
+    name: "Suite63 Gym", amount: 40, due_date: getTorontoOffsetDate(-1), category: "Health", is_paid: true, recurrence: "monthly",
+    tags: ["health"], notes: "Paid in cash this time",
+  });
+  const s63Next = await Transaction.findAll({ where: { recurringGroupId: s63Bill.body.recurringGroupId, id: { [Op.ne]: s63Bill.body.id } } });
+  assert(
+    s63Next.length > 0 && s63Next.every((t) => JSON.stringify(t.tags) === JSON.stringify(["health"]) && t.notes === null),
+    `Generated occurrences keep the "health" tag and have no note (got ${s63Next.map((t) => `${t.date} ${JSON.stringify(t.tags)} ${t.notes}`).join("; ")})`
+  );
+  await Transaction.destroy({ where: { title: { [Op.like]: "Suite63 %" } }, force: true });
+
+  console.log("\n--- Suite 64: Ledger CSV download (same filters as the Ledger, formula-safe), feed notes cut to 100 characters ---");
+  const s64Today = getTorontoToday();
+  const s64Card = await Account.create({ name: "Suite64 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 1000, isActive: true });
+  const s64Long = `Suite64 long note ${"x".repeat(150)}`;
+  const s64Made = [
+    await s33("POST", "/api/expenses", { name: "=HYPERLINK(\"http://evil.example\",\"Suite64 click\")", amount: 5, due_date: s64Today, category: "Other", is_paid: true, tags: ["s64"] }),
+    await s33("POST", "/api/expenses", { name: "Suite64 Work lunch", amount: 21.5, due_date: s64Today, category: "Dining Out", is_paid: true, tags: ["s64", "work"], notes: "+1 for Sam, \"split\"" }),
+    await s33("POST", "/api/expenses", { name: "Suite64 Card gas", amount: 40, due_date: getTorontoOffsetDate(-3), category: "Transportation", is_paid: true, creditCardId: s64Card.id, tags: ["s64"], notes: s64Long }),
+    await s33("POST", "/api/paycheques", { name: "Suite64 Pay", amount: 900, payment_date: getTorontoOffsetDate(-2), tags: ["s64"] }),
+  ];
+  assert(s64Made.every((r) => r.status === 200 || r.status === 201), `Suite 64 rows saved (got ${s64Made.map((r) => r.status).join(",")})`);
+  const s64Csv = (q) => s33("GET", `/api/expenses/export.csv?${q}`);
+  const s64Rows = (raw) => s36ParseCsv(raw.replace(/^﻿/, "").replace(/\r/g, "").trim());
+
+  // The download holds exactly the rows GET /expenses/all returns for the same filters, in order
+  const s64Queries = [
+    "tag=s64",
+    "tag=%23S64&type=expense",
+    `tag=s64&from=${getTorontoOffsetDate(-3)}&to=${getTorontoOffsetDate(-1)}`,
+    `tag=s64&accountId=${s64Card.id}`,
+    "tag=s64&search=sam",
+    "tag=s64&search=suite64%20visa",
+    "tag=s64&category=Dining%20Out",
+    "tag=s64&sort=amount:asc",
+  ];
+  const s64Mismatch = [];
+  for (const q of s64Queries) {
+    const [csv, all] = await Promise.all([s64Csv(q), s33("GET", `/api/expenses/all?${q}`)]);
+    const titles = s64Rows(csv.raw).slice(1).map((r) => r[1].replace(/^'/, ""));
+    if (csv.status !== 200 || all.status !== 200 || JSON.stringify(titles) !== JSON.stringify(all.body.map((r) => r.name))) {
+      s64Mismatch.push(`${q}: csv ${JSON.stringify(titles)} vs ledger ${JSON.stringify(all.body?.map?.((r) => r.name))}`);
+    }
+  }
+  assert(s64Mismatch.length === 0, `Each filtered download matches the Ledger query (${s64Mismatch.join(" | ") || "all 8 match"})`);
+  const s64Counts = await Promise.all(["tag=s64", "tag=s64&type=expense", "tag=work&search=suite64", "tag=s64&accountId=" + s64Card.id].map(async (q) => s64Rows((await s64Csv(q)).raw).length - 1));
+  assert(
+    JSON.stringify(s64Counts) === JSON.stringify([4, 3, 1, 1]),
+    `Tag filters: 4 rows tagged s64, 3 of them expenses, 1 tagged work, 1 on the card (got ${s64Counts.join(",")})`
+  );
+
+  const s64Res = await s64Csv("tag=s64&sort=amount:desc");
+  const s64Table = s64Rows(s64Res.raw);
+  const s64ByTitle = (t) => s64Table.find((r) => r[1].includes(t));
+  const s64Evil = s64ByTitle("Suite64 click");
+  const s64Lunch = s64ByTitle("Suite64 Work lunch");
+  const s64Gas = s64ByTitle("Suite64 Card gas");
+  assert(
+    s64Res.headers["content-type"].includes("text/csv") && /attachment; filename="fintrack-ledger-\d{4}-\d{2}-\d{2}\.csv"/.test(s64Res.headers["content-disposition"]) &&
+      s64Table[0].join(",") === "date,title,type,category,account,amount,paid,tags,notes",
+    `CSV download headers and columns (got ${s64Res.headers["content-disposition"]}; ${s64Table[0].join(",")})`
+  );
+  assert(
+    s64Evil?.[1] === "'=HYPERLINK(\"http://evil.example\",\"Suite64 click\")" && s64Lunch?.[8] === "'+1 for Sam, \"split\"",
+    `A title starting with = and a note starting with + get a leading ' so a spreadsheet won't run them (got ${s64Evil?.[1]} / ${s64Lunch?.[8]})`
+  );
+  assert(
+    s64Lunch?.[0] === s64Today && s64Lunch[2] === "expense" && s64Lunch[3] === "Dining Out" && s64Lunch[4] === "Checking" &&
+      s64Lunch[5] === "21.50" && s64Lunch[6] === "yes" && s64Lunch[7] === "s64; work" &&
+      s64Gas?.[4] === "Suite64 Visa" && s64Gas[8] === s64Long && s64ByTitle("Suite64 Pay")?.[2] === "income",
+    `Row cells: date, type, category, the Ledger's account text, amount, paid, tags and the full note (got ${s64Lunch?.join("|")})`
+  );
+  const [s64BadDate, s64BadType, s64NoAuth] = await Promise.all([
+    s64Csv("from=28-10-2026"),
+    s64Csv("type=refund"),
+    request({ hostname: "localhost", port: 8000, path: "/api/expenses/export.csv", method: "GET" }),
+  ]);
+  assert(
+    s64BadDate.status === 400 && s64BadType.status === 400 && s64NoAuth.status === 401,
+    `Bad filters are refused and the download needs a login (got ${s64BadDate.status}, ${s64BadType.status}, ${s64NoAuth.status})`
+  );
+
+  // The Gem feed's recent rows show the tags and the note cut to 100 characters
+  const s64Feed = s36ParseCsv((await s36(`/api/export/financial-feed.csv?key=${s63Key}`)).raw);
+  const s64FeedGas = s64Feed.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] === "Suite64 Card gas");
+  const s64Md = (await s36(`/api/export/financial-feed.md?key=${s63Key}`)).raw;
+  assert(
+    s64FeedGas?.[7] === "s64" && s64FeedGas[8].length === 100 && s64FeedGas[8].endsWith("…") && s64FeedGas[8].startsWith("Suite64 long note xxx") &&
+      s64Md.includes(`| s64 | ${s64FeedGas[8]} |`),
+    `Feed TAGS and NOTES, the note cut to 100 characters in CSV and Markdown (got ${s64FeedGas?.[8]?.length} chars)`
+  );
+
+  // --- Suite 65: the Gem feed CSV is formula-safe too (it is loaded into Sheets with IMPORTDATA) ---
+  console.log("\n--- Suite 65: Gem feed CSV is formula-safe ---");
+  const s65Link = s64Feed.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4].includes("Suite64 click"));
+  const s65Lunch = s64Feed.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] === "Suite64 Work lunch");
+  assert(
+    s65Link?.[4].startsWith("'=HYPERLINK(") && s65Lunch?.[8].startsWith("'+1 for Sam"),
+    `A feed title starting with = and a note starting with + become text (got ${s65Link?.[4]}, ${s65Lunch?.[8]})`
+  );
+  const s65Raw = s64Feed.flat().filter((c) => /^[=+@\t\r]/.test(c) || (/^-/.test(c) && !/^-\$?\d[\d,]*(?:\.\d+)?%?$/.test(c)));
+  assert(s65Raw.length === 0, `No feed cell starts like a formula (got ${JSON.stringify(s65Raw.slice(0, 3))})`);
+  const s65Amounts = s64Feed.filter((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] !== "TITLE").map((r) => r[5]);
+  assert(
+    s65Amounts.length > 0 && s65Amounts.every((a) => /^-?\d+\.\d{2}$/.test(a)),
+    `Feed amounts, negative ones included, stay plain numbers (got ${s65Amounts.slice(0, 4).join(", ")})`
+  );
+  const s65Quoted = s64Feed.flat().filter((c) => c.startsWith("'") && !/Suite64/.test(c) && !c.startsWith("'+1 for Sam"));
+  assert(s65Quoted.length === 0, `Only formula-like cells get the leading ' (also got ${JSON.stringify(s65Quoted.slice(0, 3))})`);
+  const s65Cors = await s33("GET", "/api/expenses/export.csv?tag=s64", null, { ...authHeaders, Origin: "http://localhost:5173" });
+  assert(
+    /content-disposition/i.test(s65Cors.headers["access-control-expose-headers"] || ""),
+    `The app can read the download's file name across origins (got ${s65Cors.headers["access-control-expose-headers"]})`
+  );
+  const s65Md = s64Md.split("\n").find((l) => l.includes("Suite64 click")) || "";
+  assert(s65Md.includes("=HYPERLINK("), "The Markdown feed is not a spreadsheet, so it shows the title as written");
+
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "%Suite64%" } }, { fromAccountId: s64Card.id }] }, force: true });
+  await s64Card.destroy();
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

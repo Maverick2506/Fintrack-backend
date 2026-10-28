@@ -4,6 +4,9 @@ const { getTodayString } = require("./accountBalanceService");
 const { addCalendarDays, getForecast } = require("./forecastService");
 const { toZonedTime } = require("date-fns-tz");
 const { takePendingPriceAlerts, formatPriceAlert } = require("./alertService");
+const { buildMonthClose, previousMonthOf, generateCommentary, digestLines } = require("./monthCloseService");
+const { reserveCall, releaseUnanswered } = require("./aiUsageService");
+const gemini = require("../routes/gemini");
 
 const LOW_BALANCE_WINDOW_DAYS = 14;
 const NO_INCOME_NOTE = "No income in your forecast — log your paycheques or set Expected pay";
@@ -132,6 +135,29 @@ const buildMorningDigest = async (dbTx = null, options = {}) => {
           ? `  • ${formatPriceAlert(alert)}`
           : `  • ${alert.title} price went ${alert.to > alert.from ? "up" : "down"}`
       );
+    }
+  }
+
+  // 3c. On the 1st: the month that just ended (F6), with Gemini's lines when amounts are shown
+  if (todayStr.endsWith("-01")) {
+    try {
+      const close = await buildMonthClose(previousMonthOf(todayStr.slice(0, 7)), todayStr);
+      sections.push(`🗓️ ${close.label} close:`);
+      sections.push(...digestLines(close, showAmounts));
+      if (showAmounts) {
+        const commentary = await generateCommentary(close, {
+          ai: gemini.getAiClient(),
+          generate: gemini.generate,
+          reserveCall,
+          releaseUnanswered,
+          model: gemini.getModels().advice,
+          todayStr,
+          endpoint: "digest-month-close",
+        });
+        for (const line of commentary.lines) sections.push(`  💬 ${line}`);
+      }
+    } catch (err) {
+      console.error("Month close error while building digest:", err);
     }
   }
 
