@@ -354,4 +354,29 @@ const payLinkedBill = async (bill, { payFromGoalId = null } = {}, todayStr, dbTx
   return { paidFromFund, rolledOver };
 };
 
-module.exports = { computeSinkingFund, getLinkedBill, getSinkingFunds, rollOverLinkedFunds, payLinkedBill };
+/**
+ * A bill cleared without anyone choosing (the nightly sweep clears unpaid bills on their date): it is
+ * paid from the goal saving for it, the same default as the "Pay from <fund>" box, when that goal has
+ * money in it; either way the goals roll over. Returns payLinkedBill's result, or null for a bill no
+ * goal saves for.
+ */
+const payLinkedBillByDefault = async (bill, todayStr, dbTx = null) => {
+  if (bill.type !== "EXPENSE" || !bill.recurringGroupId) return null;
+  const goals = await Account.findAll({
+    where: { type: "SAVINGS_GOAL", isActive: { [Op.ne]: false }, linkedRecurringGroupId: bill.recurringGroupId },
+    order: [["createdAt", "ASC"]],
+    transaction: dbTx,
+  });
+  if (goals.length === 0) return null;
+  const funded = goals.find((g) => (parseFloat(g.initialBalance) || 0) > 0);
+  return payLinkedBill(bill, { payFromGoalId: funded ? funded.id : null }, todayStr, dbTx);
+};
+
+module.exports = {
+  computeSinkingFund,
+  getLinkedBill,
+  getSinkingFunds,
+  rollOverLinkedFunds,
+  payLinkedBill,
+  payLinkedBillByDefault,
+};

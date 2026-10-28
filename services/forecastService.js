@@ -107,6 +107,10 @@ const estimatePaycheques = async ({ daysMap, todayStr, endDateStr, checkingId, d
   return dates.length ? { amount, cadence, basedOn: recent.length, dates } : null;
 };
 
+// "$1,200" or "$1,150.50", for forecast line titles
+const formatMoney = (n) =>
+  `$${n.toLocaleString("en-US", Number.isInteger(n) ? {} : { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
 /**
  * Computes a day-by-day cashflow forecast for checking account over N days.
  *
@@ -402,10 +406,10 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
   // 3d. Sinking funds: a goal saving for a bill sets its monthly amount aside on each contribution date
   //     (sinkingFundService), unless transfers to the goal already do (projected above), or the bill's
-  //     charge itself is in the window by the fund's due date: it is counted on its date, and setting
-  //     money aside for it as well would count it twice. Marking a linked bill paid pays it from the
-  //     fund by default (min of what is saved and the bill), so on the bill's date the fund's money
-  //     comes back to Checking.
+  //     charge itself is in the window by the fund's due date. Then nothing is set aside, and the bill
+  //     is paid from the fund (the default when it is marked paid): the fund covers
+  //     min(bill, its balance + contributions dated before the bill), and only the shortfall leaves
+  //     Checking. Those contributions are Checking outflows on their own dates, so each dollar counts once.
   const sinkingFunds = [];
   for (const [goalId, fund] of await getSinkingFunds(todayStr, dbTx)) {
     if (fund.done) continue;
@@ -417,25 +421,24 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           )
         : null;
     if (billDay) {
-      const billAmount = -billDay.items.find((it) => it.seriesId === billGroupId).amount;
-      const transfersIn = Object.values(daysMap)
-        .filter((day) => day.date <= billDay.date)
+      const billItem = billDay.items.find((it) => it.seriesId === billGroupId);
+      const billAmount = Math.round(-billItem.amount * 100) / 100;
+      const contributions = Object.values(daysMap)
+        .filter((day) => day.date < billDay.date)
         .reduce(
           (sum, day) => sum + day.items.filter((it) => it.toAccountId === goalId).reduce((a, it) => a - it.amount, 0),
           0
         );
-      const fromFund = Math.round(Math.max(0, Math.min(fund.saved + transfersIn, billAmount)) * 100) / 100;
-      if (fromFund > 0) {
-        billDay.items.push({
-          title: `From ${fund.name} for ${fund.linkedBill.title}`,
-          amount: fromFund,
-          type: "transfer",
-          fromFund: true,
-        });
+      const fundCovers = Math.round(Math.max(0, Math.min(billAmount, fund.saved + contributions)) * 100) / 100;
+      if (fundCovers > 0) {
+        billItem.amount = -Math.round((billAmount - fundCovers) * 100) / 100;
+        billItem.title = `${billItem.title} ${formatMoney(billAmount)} (fund covers ${formatMoney(fundCovers)})`;
+        billItem.fundCovers = fundCovers;
+        billItem.billAmount = billAmount;
       }
       sinkingFunds.push({
         id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates: [],
-        billInWindow: true, fromFund, fromFundDate: billDay.date,
+        billInWindow: true, billDate: billDay.date, billAmount, fundCovers,
       });
       continue;
     }
@@ -556,7 +559,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         ...(it.planned ? { planned: true } : {}),
         ...(it.type === "card" ? { statement: true } : {}),
         ...(it.capped ? { capped: true, scheduledAmount: it.scheduledAmount } : {}),
-        ...(it.fromFund ? { fromFund: true } : {}),
+        ...(it.fundCovers ? { fundCovers: it.fundCovers, billAmount: it.billAmount } : {}),
       })),
     };
     days.push(dayObj);

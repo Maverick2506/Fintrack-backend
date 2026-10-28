@@ -8501,17 +8501,64 @@ async function runTestSuite() {
     });
   const s58Goals = async () => (await s33("GET", "/api/savings-goals")).body;
 
-  // Full: a $600 yearly bill, $600 saved. Safe to Spend sees the fund pay it on its date.
-  const s58Full = await s58Bill("Suite58 Insurance", 600, 5);
-  const s58FullGoal = await s58Goal("Suite58 Insurance Fund", 600, s58Full);
+  // Safe to Spend with a linked bill inside its window: the fund covers min(bill, balance + contributions
+  // dated before the bill); only the shortfall leaves Checking, on one line that says so
   await s58Checking.update({ initialBalance: parseFloat(s58Checking.initialBalance) + 100000 });
+  const s58NoBill = (await s54Forecast(60)).safeToSpend;
+  const s58Full = await s58Bill("Suite58 Insurance", 600, 5);
+  const s58Unlinked = (await s54Forecast(60)).safeToSpend;
+  const s58FullGoal = await s58Goal("Suite58 Insurance Fund", 600, s58Full);
   const s58F = await s54Forecast(60);
+  const s58Line = s54ItemsOn(s58F, s58Full.date).find((it) => it.title.startsWith("Suite58 Insurance"));
   assert(
-    s54ItemsOn(s58F, s58Full.date).some((it) => it.fromFund && it.amount === 600) &&
-      s58F.sinkingFunds.some((f) => f.id === s58FullGoal.id && f.fromFund === 600),
-    `With the bill in Safe to Spend's window, the forecast pays it from the fund's $600 on its date ` +
-      `(got ${JSON.stringify(s54ItemsOn(s58F, s58Full.date))})`
+    Math.abs(s58NoBill - s58Unlinked - 600) < 0.005 && Math.abs(s58F.safeToSpend - s58NoBill) < 0.005 &&
+      s58Line?.title === "Suite58 Insurance $600 (fund covers $600)" && s58Line.amount === 0 && s58Line.fundCovers === 600 &&
+      s58F.sinkingFunds.some((f) => f.id === s58FullGoal.id && f.fundCovers === 600 && f.billInWindow) &&
+      !s58F.days.some((d) => d.items.some((it) => it.planned)),
+    `A fully funded $600 bill leaves Safe to Spend as it was without the bill (${s58NoBill}; got ${s58F.safeToSpend}, ` +
+      `unlinked ${s58Unlinked}), on one line: ${JSON.stringify(s58Line)}`
   );
+  await s58FullGoal.update({ initialBalance: 450 });
+  const s58Partial = await s54Forecast(60);
+  const s58PartLine = s54ItemsOn(s58Partial, s58Full.date).find((it) => it.title.startsWith("Suite58 Insurance"));
+  assert(
+    Math.abs(s58NoBill - s58Partial.safeToSpend - 150) < 0.005 &&
+      s58PartLine?.title === "Suite58 Insurance $600 (fund covers $450)" && s58PartLine.amount === -150,
+    `A partly funded bill ($450 of $600): only the $150 shortfall counts (got ${s58NoBill} -> ${s58Partial.safeToSpend}, ` +
+      `${JSON.stringify(s58PartLine)})`
+  );
+  const s58Contribution = await Transaction.create({
+    title: "Suite58 contribution", amount: 150, date: getTorontoOffsetDate(2), type: "TRANSFER", category: "Savings Transfer",
+    isCleared: false, fromAccountId: s58Checking.id, toAccountId: s58FullGoal.id,
+  });
+  const s58WithContribution = await s54Forecast(60);
+  const s58ContLine = s54ItemsOn(s58WithContribution, s58Full.date).find((it) => it.title.startsWith("Suite58 Insurance"));
+  assert(
+    Math.abs(s58NoBill - s58WithContribution.safeToSpend - 150) < 0.005 && s58ContLine?.amount === 0 &&
+      s58ContLine.fundCovers === 600 &&
+      s54ItemsOn(s58WithContribution, getTorontoOffsetDate(2)).some((it) => it.title === "Suite58 contribution" && it.amount === -150),
+    `A $150 contribution before the bill counts once: it leaves Checking on its date and the fund then covers all $600 ` +
+      `(got ${s58NoBill} -> ${s58WithContribution.safeToSpend}, ${JSON.stringify(s58ContLine)})`
+  );
+  // The dashboard (GET /forecast), the AI tools and the Gem feed show the same Safe to Spend
+  const { executeTool: s58Tool } = require("../routes/gemini");
+  const [s58Api, s58Ai, s58Feed] = await Promise.all([
+    s33("GET", "/api/forecast?days=60"),
+    s58Tool("simulatePurchase", { amount: 1, account: "checking" }, s58Today),
+    s36(`/api/export/financial-feed.csv?key=${s36Key}`),
+  ]);
+  const s58FeedSafe = parseFloat(
+    (s36ParseCsv(s58Feed.raw).find((r) => r[0] === "FORECAST" && r[1] === "SAFE_TO_SPEND") || [])[2]
+  );
+  assert(
+    Math.abs(s58Api.body.safeToSpend - s58WithContribution.safeToSpend) < 0.005 &&
+      Math.abs(s58Ai.currentSafeToSpend - s58Api.body.safeToSpend) < 0.005 &&
+      Math.abs(s58FeedSafe - s58Api.body.safeToSpend) < 0.005,
+    `Dashboard, AI tools and Gem feed agree on Safe to Spend with the fund covering the bill ` +
+      `(got ${s58Api.body.safeToSpend} / ${s58Ai.currentSafeToSpend} / ${s58FeedSafe})`
+  );
+  await s58Contribution.destroy({ force: true });
+  await s58FullGoal.update({ initialBalance: 600 });
   const s58Before = await s58CheckingBal();
   const s58Paid = await s33("PUT", `/api/expenses/${s58Full.id}`, { is_paid: true, payFromGoalId: s58FullGoal.id });
   const s58After = await s58CheckingBal();
@@ -8599,9 +8646,28 @@ async function runTestSuite() {
     `A one-time bill can be saved for; once paid from the fund the goal is Done ` +
       `(got ${JSON.stringify(s58Done.sinkingFund)}, setup ${s58DoneSetup.status})`
   );
+  // The nightly sweep clears a linked bill on its date: the fund pays it (the default), Checking is
+  // unchanged and the goal rolls over
+  const { runDailySweep: s58Sweep } = require("../services/dailySweepService");
+  const s58Due = await s58Bill("Suite58 Sweep insurance", 1200, 0);
+  const s58SweepGoal = await s58Goal("Suite58 Sweep Fund", 1200, s58Due);
+  const s58SB = await s58CheckingBal();
+  const s58SweepRes = await s58Sweep({ todayStr: s58Today });
+  const s58SA = await s58CheckingBal();
+  await s58SweepGoal.reload();
+  await s58Due.reload();
+  assert(
+    s58Due.isCleared && s58SweepRes.paidFromFunds >= 1 && Math.abs(s58SA - s58SB) < 0.005 &&
+      parseFloat(s58SweepGoal.initialBalance) === 0 &&
+      (await Transaction.count({ where: { fromAccountId: s58SweepGoal.id, type: "TRANSFER", isCleared: true } })) === 1 &&
+      s58SweepGoal.dueDate === getNextOccurrenceDate(s58Due.date, "yearly", 1),
+    `The sweep clears a $1,200 linked bill due today, pays it from the fund (Checking ${s58SB} -> ${s58SA}) and rolls ` +
+      `the goal to ${s58SweepGoal.dueDate}`
+  );
+
   await s58Checking.reload();
   await s58Checking.update({ initialBalance: parseFloat(s58Checking.initialBalance) - 100000 });
-  const s58GoalIds = [s58FullGoal.id, s58PartGoal.id, s58UnGoal.id, s58OnceGoal.id];
+  const s58GoalIds = [s58FullGoal.id, s58PartGoal.id, s58UnGoal.id, s58OnceGoal.id, s58SweepGoal.id];
   await Transaction.destroy({
     where: { [Op.or]: [{ title: { [Op.like]: "Suite58 %" } }, { fromAccountId: { [Op.in]: s58GoalIds } }] },
     force: true,

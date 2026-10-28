@@ -14,6 +14,7 @@ const {
 const { getBalancesSummary } = require("./netWorthService");
 const { purgeDeletedTransactions } = require("./trashService");
 const { recordPriceChanges } = require("./alertService");
+const { payLinkedBillByDefault } = require("./sinkingFundService");
 
 const TIMEZONE = "America/Toronto";
 // Arbitrary constant shared by every instance so only one sweep runs at a time across processes
@@ -101,6 +102,7 @@ const runDailySweep = async (options = {}) => {
     let clearedIncomeCount = 0;
     let autoPayCount = 0;
     let interestCount = 0;
+    const paidFromFunds = [];
 
     // 0. Debt interest on each due date, before any payment that day (R2). Debts only, not cards;
     //    archived debts keep their balance. Auto-pay debts move to the next due date in step 3; other
@@ -202,6 +204,10 @@ const runDailySweep = async (options = {}) => {
         bill.taxApplied = taxApplied;
         await adjustAccountForTransaction(bill, 1, dbTx, true);
         clearedExpenseCount++;
+        // A bill a savings goal saves for is paid from it (the default when marking it paid), and the
+        // goal rolls on to the bill's next charge
+        const fundResult = await payLinkedBillByDefault(bill, todayString, dbTx);
+        if (fundResult?.paidFromFund) paidFromFunds.push({ billId: bill.id, ...fundResult.paidFromFund });
       }
     }
 
@@ -391,6 +397,7 @@ const runDailySweep = async (options = {}) => {
       interestRecorded: interestCount,
       purgedFromTrash: purgedCount,
       priceAlerts: priceAlerts.length,
+      paidFromFunds: paidFromFunds.length,
       date: todayString,
       netWorth: balances.netWorth,
     };
