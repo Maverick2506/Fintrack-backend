@@ -99,6 +99,7 @@ app.use(express.json());
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/financial-advice", aiLimiter);
 app.use("/api/categorize-expense", aiLimiter);
+app.use("/api/categorize-receipt", aiLimiter);
 app.use("/api/chat-advisor", aiLimiter);
 app.use("/api/reports/month-close/commentary", aiLimiter);
 app.use("/api", apiLimiter);

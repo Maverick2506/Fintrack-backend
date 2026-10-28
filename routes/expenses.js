@@ -22,7 +22,7 @@ const {
 } = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
 const { tagsOf } = require("../utils/transactionTags");
-const { filterLedgerRows, ledgerCsv } = require("../utils/ledgerExport");
+const { filterLedgerRows, ledgerCsv, ledgerWindow } = require("../utils/ledgerExport");
 const {
   snapshotArchivedBalances,
   assertArchivedBalancesUnchanged,
@@ -200,9 +200,10 @@ router.get(
   })
 );
 
-// Every row as the Ledger shows it (GET /expenses/all), newest first
-const loadLedgerRows = async () => {
+// Rows as the Ledger shows them (GET /expenses/all), newest first; where narrows them (e.g. by date)
+const loadLedgerRows = async (where = {}) => {
   const found = await Transaction.findAll({
+    where,
     order: [
       ["date", "DESC"],
       ["createdAt", "DESC"],
@@ -251,23 +252,54 @@ const loadLedgerRows = async () => {
   }));
 };
 
-// Full ledger: Transactions of ALL types combined natively. Takes the Ledger's filters (ledgerQuery:
-// from, to, type, category, accountId, tag, search, sort); they run here because JSON columns (tags)
-// can't be filtered the same way on SQLite and Postgres.
+// SQL date range for the Ledger's from/to (inclusive; either may be null)
+const dateRangeWhere = (from, to) => {
+  if (!from && !to) return {};
+  const date = {};
+  if (from) date[Op.gte] = from;
+  if (to) date[Op.lte] = to;
+  return { date };
+};
+
+// Whether "Load older" would find anything: a row before from that passes the same filters
+const hasRowsBefore = async (from, filters) => {
+  const older = { date: { [Op.lt]: from } };
+  const { type, category, accountId, tag, needsReview, search } = filters;
+  if (!type && !category && !accountId && !tag && !needsReview && !String(search || "").trim()) {
+    return (await Transaction.count({ where: older })) > 0;
+  }
+  return filterLedgerRows(await loadLedgerRows(older), { ...filters, from: null, to: null }).length > 0;
+};
+
+// The Ledger, a page at a time: { rows, hasMore, from, to, reviewCount }. Without from= it is the last
+// 3 months plus every upcoming row; "Load older" asks again with an earlier from=. A search (or
+// needsReview=true, the Review inbox) reads all history. The other filters (type, category, accountId,
+// tag, search, sort) run here too, because JSON columns (tags) can't be filtered the same way on
+// SQLite and Postgres. hasMore says rows older than from pass the same filters.
 router.get(
   "/expenses/all",
   validateQuery(schemas.ledgerQuery),
   asyncHandler(async (req, res) => {
-    res.json(filterLedgerRows(await loadLedgerRows(), req.validatedQuery));
+    const { from, to } = ledgerWindow(req.validatedQuery, getTodayString());
+    const filters = { ...req.validatedQuery, from, to };
+    const [rows, hasMore, reviewCount] = await Promise.all([
+      loadLedgerRows(dateRangeWhere(from, to)).then((found) => filterLedgerRows(found, filters)),
+      from ? hasRowsBefore(from, filters) : false,
+      // Rows still waiting in Review new, across all history (the Ledger header's "N to review")
+      Transaction.count({ where: { needsReview: true } }),
+    ]);
+    res.json({ rows, hasMore, from, to, reviewCount });
   })
 );
 
-// The Ledger's rows as a CSV download, with the same filters as GET /expenses/all
+// The Ledger's rows as a CSV download, with the same filters as GET /expenses/all. It has no default
+// window: without from= it holds all history (the Ledger sends the from= of the rows it has loaded).
 router.get(
   "/expenses/export.csv",
   validateQuery(schemas.ledgerQuery),
   asyncHandler(async (req, res) => {
-    const rows = filterLedgerRows(await loadLedgerRows(), req.validatedQuery);
+    const { from, to } = req.validatedQuery;
+    const rows = filterLedgerRows(await loadLedgerRows(dateRangeWhere(from, to)), req.validatedQuery);
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="fintrack-ledger-${getTodayString()}.csv"`);
     res.setHeader("Cache-Control", "no-store");

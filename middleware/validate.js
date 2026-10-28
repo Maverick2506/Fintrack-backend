@@ -392,6 +392,9 @@ const schemas = {
     name: z.string().trim().min(1, "Name is required").max(100, "Name must be at most 100 characters"),
   }),
 
+  // POST /categorize-receipt is multipart: the photo is the 'image' file and no other fields are used
+  categorizeReceipt: z.object({}),
+
   chatAdvisor: z.object({
     message: z.string().trim().min(1, "Message is required").max(2000, "Message is too long (max 2000 characters)"),
     history: z
@@ -448,9 +451,11 @@ const schemas = {
     category: z.string().trim().max(100).optional(),
     accountId: z.string().uuid("Invalid account").optional(),
     tag: z.string().trim().max(60).optional(),
+    // The Review inbox: only rows an import added that still need a look (all history)
+    needsReview: z.enum(["true", "false"]).transform((v) => v === "true").optional(),
     search: z.string().max(200).optional(),
     sort: z.enum(["date:desc", "date:asc", "amount:desc", "amount:asc", "name:asc", "name:desc"]).optional(),
-  }),
+  }).refine((q) => !q.from || !q.to || q.from <= q.to, { message: "from must be on or before to", path: ["from"] }),
 
   // GET /reports/month-close?month=YYYY-MM (defaults to the current Toronto month)
   monthCloseQuery: z.object({
