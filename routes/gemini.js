@@ -687,7 +687,9 @@ const receiptUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: RECEIPT_MAX_BYTES, files: 1, fields: 5 },
   fileFilter: (req, file, cb) => {
-    if (!ALLOWED_MIME_TYPES.has(String(file.mimetype || "").toLowerCase())) {
+    // A photo the phone gave no type arrives as application/octet-stream (or blank); its bytes decide
+    const type = String(file.mimetype || "").toLowerCase();
+    if (!ALLOWED_MIME_TYPES.has(type) && type !== "application/octet-stream" && type !== "") {
       return cb(new HttpError(415, "Upload a photo of the receipt (JPEG, PNG, WebP or HEIC)."));
     }
     cb(null, true);
@@ -1376,6 +1378,9 @@ const CHAT_TOOLS = [
  * (generateContentStream) and the answer's text goes to onText as it arrives. The tools still run here
  * on the server; if a call that already sent text turns out to call a tool, onReset() tells the app to
  * drop that text. A call whose stream fails before any text was sent falls back to one ordinary call.
+ *
+ * signal (optional): aborted when the app closed the request; the model call in flight is cancelled
+ * and no further rounds run.
  */
 async function runChatLoop({
   ai,
@@ -1386,6 +1391,7 @@ async function runChatLoop({
   runTool = executeTool,
   usage = { todayStr, endpoint: "chat-advisor" },
   stream = null,
+  signal = null,
 }) {
   const toolsConfig = [{ functionDeclarations: CHAT_TOOLS }];
   const proposals = [];
@@ -1398,11 +1404,20 @@ async function runChatLoop({
     config: {
       systemInstruction: systemPrompt,
       tools: toolsConfig,
-      abortSignal: AbortSignal.timeout(timeoutMs),
+      abortSignal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
     },
   });
 
+  const stopIfGone = () => {
+    if (signal?.aborted) {
+      const err = new Error("The app closed the request");
+      err.clientGone = true;
+      throw err;
+    }
+  };
+
   const ask = async () => {
+    stopIfGone();
     sentText = false;
     if (!canStream) return generate(ai, params(20000), usage);
     try {
@@ -1411,7 +1426,7 @@ async function runChatLoop({
         stream.onText(text);
       });
     } catch (err) {
-      if (sentText) throw err;
+      if (sentText || signal?.aborted) throw err;
       // The stream failed before the app saw anything: answer this call the non-streaming way
       console.warn("Chat stream failed, falling back to one ordinary call:", err.message);
       return generate(ai, params(20000), usage);
@@ -1433,6 +1448,7 @@ async function runChatLoop({
     // Collect all function responses into ONE user turn (C2)
     const parts = [];
     for (const call of calls) {
+      stopIfGone();
       if (stream?.onTool) stream.onTool(call.name);
       const output = await runTool(call.name, call.args || {}, todayStr);
       if (call.name === "proposeTransaction" && output?.quickAddText && proposals.length < 5) {
@@ -1476,6 +1492,13 @@ router.post(
     let usage = null;
     // Set once the event stream has started; errors after that go down the stream as an "error" event
     let sse = null;
+    // Closing Ask FinTrack (or losing the connection) cancels the model call and stops the tool loop
+    const clientGone = new AbortController();
+    if (typeof res.on === "function") {
+      res.on("close", () => {
+        if (!res.writableEnded) clientGone.abort();
+      });
+    }
     try {
       const nowZoned = toZonedTime(new Date(), TIMEZONE);
       const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
@@ -1624,6 +1647,7 @@ BEHAVIOR GUIDELINES:
         systemPrompt,
         todayStr,
         usage,
+        signal: clientGone.signal,
         stream: sse && {
           onText: (text) => sse.send("delta", { text }),
           onReset: () => sse.send("reset", {}),
@@ -1639,6 +1663,11 @@ BEHAVIOR GUIDELINES:
       res.json({ reply, proposals });
     } catch (error) {
       await releaseUnanswered(usage);
+      if (clientGone.signal.aborted) {
+        // Nobody is listening any more
+        if (sse) sse.end();
+        return;
+      }
       const status = error.status === 504 ? 504 : 500;
       const message = status === 504 ? error.message : "Failed to generate response from AI advisor.";
       if (status !== 504) console.error("Gemini chat advisor error:", error);

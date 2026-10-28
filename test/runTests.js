@@ -10075,6 +10075,12 @@ async function runTestSuite() {
   );
   const s68Png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64)]);
   const s68Mislabeled = await s68Upload(s68Png, { mime: "image/jpeg" });
+  const s68Untyped = await s68Upload(s68Jpeg(), { mime: "application/octet-stream", filename: "IMG_2041.HEIC" });
+  const s68UntypedText = await s68Upload(Buffer.from("plain text, no photo here at all"), { mime: "application/octet-stream" });
+  assert(
+    s68Untyped.status === 200 && s68Calls[2]?.contents?.[0]?.parts?.[0]?.inlineData?.mimeType === "image/jpeg" && s68UntypedText.status === 415,
+    `A photo sent with no type (application/octet-stream) is judged by its bytes: a JPEG is read, text is 415 (got ${s68Untyped.status}, ${s68UntypedText.status})`
+  );
   assert(
     s68Mislabeled.status === 200 && s68Calls[1]?.contents?.[0]?.parts?.[0]?.inlineData?.mimeType === "image/png",
     "The model is told the type the photo's bytes show, not the one the browser claimed"
@@ -10094,7 +10100,7 @@ async function runTestSuite() {
   const s68Blank = await s68Upload(s68Jpeg());
   assert(s68Blank.status === 422, `A photo with nothing readable gets 422 and a hint (got ${s68Blank.status})`);
 
-  await Setting.upsert({ key: "ai_daily_cap", value: "4" });
+  await Setting.upsert({ key: "ai_daily_cap", value: "5" });
   const s68Capped = await s68Upload(s68Jpeg());
   await Setting.destroy({ where: { key: "ai_daily_cap" } });
   s68Gemini.setAiClientForTests(null);
@@ -10240,6 +10246,46 @@ async function runTestSuite() {
     s69MidError.status === 200 && s69Deltas(s69MidError).join("") === "Half an ans" && s69Err?.status === 500 && !s69Done(s69MidError),
     `A stream that breaks after text ends with an "error" event the app can show (got ${JSON.stringify(s69Err)})`
   );
+
+  // Closing the panel mid-answer cancels the model call and runs no more rounds
+  s69Mode = "slow";
+  let s69SlowSignal = null;
+  let s69SlowCalls = 0;
+  s68Gemini.setAiClientForTests({
+    models: {
+      generateContent: async () => ({ text: "unused", usageMetadata: s69Usage }),
+      generateContentStream: async (params) => {
+        s69SlowCalls++;
+        s69SlowSignal = params.config.abortSignal;
+        return (async function* () {
+          yield s69Chunk([{ text: "Starting… " }]);
+          for (let i = 0; i < 40 && !params.config.abortSignal.aborted; i++) await s69Pause();
+          yield s69Chunk([{ text: "too late" }], true);
+        })();
+      },
+    },
+  });
+  await new Promise((resolve, reject) => {
+    const payload = JSON.stringify({ message: "hi", history: [] });
+    const req = http.request(
+      { hostname: "localhost", port: s68Port, path: "/api/chat-advisor", method: "POST", headers: { ...authHeaders, Accept: "text/event-stream", "Content-Length": Buffer.byteLength(payload) } },
+      (res) => {
+        res.on("data", (c) => {
+          if (String(c).includes("event: delta")) req.destroy();
+        });
+        res.on("close", resolve);
+      }
+    );
+    req.on("error", () => resolve());
+    req.end(payload);
+    setTimeout(() => reject(new Error("closing the chat timed out")), 5000);
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  assert(
+    s69SlowSignal?.aborted === true && s69SlowCalls === 1,
+    `Closing Ask FinTrack mid-answer aborts the Gemini call (got aborted ${s69SlowSignal?.aborted}, ${s69SlowCalls} call)`
+  );
+  s68Gemini.setAiClientForTests({ models: { generateContent: async () => ({ text: "unused", usageMetadata: s69Usage }) } });
 
   await Setting.upsert({ key: "ai_daily_cap", value: String((await s68AiUsage.findByPk(s68Today))?.calls || 0) });
   const s69Capped = await s69Chat({ message: "hi", history: [] });
