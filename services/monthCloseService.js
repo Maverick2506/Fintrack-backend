@@ -3,7 +3,6 @@ const { Type } = require("@google/genai");
 const { Op } = require("sequelize");
 const { Account, Transaction, Budget, Setting, NetWorthSnapshot } = require("../models");
 const { getClearedMonthTotals, monthRange, isMonthStr } = require("./trendsService");
-const { getSubscriptionsSummary } = require("./subscriptionService");
 const { getSinkingFunds } = require("./sinkingFundService");
 const { getBalancesSummary } = require("./netWorthService");
 
@@ -11,6 +10,7 @@ const { getBalancesSummary } = require("./netWorthService");
 // short lines about them (generateCommentary), and a line quoting a $ or % figure that isn't in these
 // numbers is dropped.
 
+const torontoDateOf = (when) => new Intl.DateTimeFormat("en-CA", { timeZone: "America/Toronto" }).format(new Date(when));
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 const MOVERS_LIMIT = 3;
 const COMMENTARY_LINES = 3;
@@ -84,10 +84,12 @@ const buildMovers = (categories) => {
  * what went in during the month, and its target (a sinking fund without one follows its bill).
  */
 const buildGoals = async (start, end, todayStr) => {
-  const goals = await Account.findAll({
+  let goals = await Account.findAll({
     where: { type: "SAVINGS_GOAL", isActive: { [Op.ne]: false } },
     order: [["createdAt", "ASC"]],
   });
+  // A goal opened after the month didn't exist then
+  goals = goals.filter((g) => !g.createdAt || torontoDateOf(g.createdAt) <= end);
   if (goals.length === 0) return [];
   const ids = goals.map((g) => g.id);
   const [flows, funds] = await Promise.all([
@@ -162,6 +164,54 @@ const buildNetWorth = async (start, end, todayStr) => {
   };
 };
 
+// The price a series row is compared at: the pre-tax amount for a tax-exclusive bill (as subscriptionService)
+const comparableAmount = (t) =>
+  t.isTaxExclusive && t.baseAmount !== null && t.baseAmount !== undefined ? parseFloat(t.baseAmount) : parseFloat(t.amount);
+
+/**
+ * Recurring bills whose price went up in the month: a paid row dated in the month that cost more than
+ * the series' paid row before it. Each series is listed once, with its last rise in the month, so a
+ * later change doesn't hide it from a past month's close.
+ */
+const buildPriceRises = async (start, end) => {
+  const rows = await Transaction.findAll({
+    attributes: ["title", "amount", "baseAmount", "isTaxExclusive", "date", "recurrence", "recurringGroupId"],
+    where: { type: "EXPENSE", isCleared: true, recurringGroupId: { [Op.ne]: null }, date: { [Op.lte]: end } },
+    order: [
+      ["date", "ASC"],
+      ["createdAt", "ASC"],
+    ],
+  });
+  const bySeries = new Map();
+  for (const r of rows) {
+    if (!bySeries.has(r.recurringGroupId)) bySeries.set(r.recurringGroupId, []);
+    bySeries.get(r.recurringGroupId).push(r);
+  }
+  const rises = [];
+  for (const series of bySeries.values()) {
+    let rise = null;
+    for (let i = 1; i < series.length; i++) {
+      const row = series[i];
+      if (row.date < start) continue;
+      const from = comparableAmount(series[i - 1]);
+      const to = comparableAmount(row);
+      if (to - from > 0.005) {
+        rise = {
+          name: row.title,
+          cadence: row.recurrence,
+          from: round2(from),
+          to: round2(to),
+          difference: round2(to - from),
+          percent: from > 0 ? Math.round(((to - from) / from) * 1000) / 10 : 0,
+          date: row.date,
+        };
+      }
+    }
+    if (rise) rises.push(rise);
+  }
+  return rises.sort((a, b) => b.difference - a.difference);
+};
+
 /**
  * The month close for "YYYY-MM": spending vs budget by category (the same totals as /spending-summary),
  * the biggest moves vs last month, subscriptions whose price rose in the month, goal progress and the
@@ -173,10 +223,9 @@ const buildMonthClose = async (month, todayStr) => {
   const [start, end] = monthRange(month);
   const [prevStart] = monthRange(previousMonth);
 
-  const [totals, budgets, subscriptions, goals, netWorth] = await Promise.all([
+  const [totals, budgets, goals, netWorth] = await Promise.all([
     getClearedMonthTotals(prevStart, end),
     Budget.findAll({ order: [["category", "ASC"]] }),
-    getSubscriptionsSummary(todayStr),
     buildGoals(start, end, todayStr),
     buildNetWorth(start, end, todayStr),
   ]);
@@ -187,18 +236,7 @@ const buildMonthClose = async (month, todayStr) => {
   const budgeted = categories.filter((c) => c.budget !== null);
   const { increases, decreases } = buildMovers(categories);
 
-  const priceRises = subscriptions.subscriptions
-    .filter((s) => s.priceChange && s.priceChange.to > s.priceChange.from && s.priceChange.date >= start && s.priceChange.date <= end)
-    .map((s) => ({
-      name: s.name,
-      cadence: s.cadence,
-      from: round2(s.priceChange.from),
-      to: round2(s.priceChange.to),
-      difference: round2(s.priceChange.difference),
-      percent: s.priceChange.percent,
-      date: s.priceChange.date,
-    }))
-    .sort((a, b) => b.difference - a.difference);
+  const priceRises = await buildPriceRises(start, end);
 
   return {
     month,
@@ -232,6 +270,7 @@ const money = (n) => `$${Math.abs(round2(n)).toFixed(2)}`;
 /** The facts the model sees: only numbers from the month close */
 const commentaryFacts = (close) => ({
   month: close.label,
+  year: Number(close.month.slice(0, 4)),
   monthIsOver: close.isComplete,
   spending: close.totals.spending,
   income: close.totals.income,
@@ -245,6 +284,10 @@ const commentaryFacts = (close) => ({
   priceRises: close.priceRises.map(({ name, from, to, percent }) => ({ name, from, to, percent })),
   goals: close.goals.map(({ name, saved, target, percent, contributed }) => ({ name, saved, target, percent, contributed })),
   netWorthChange: close.netWorth ? close.netWorth.change : null,
+  // Counts the note may mention ("3 budgets", "2 price rises")
+  overBudgetCount: close.totals.overBudgetCount,
+  priceRiseCount: close.priceRises.length,
+  goalCount: close.goals.length,
 });
 
 const buildCommentaryPrompt = (facts) => `You write the month-close note in FinTrack, Maverick's personal finance app.
@@ -253,46 +296,56 @@ ${JSON.stringify(facts)}
 
 Write at most ${COMMENTARY_LINES} short lines (each under 20 words) about what stands out: a category that rose or fell, a budget that was missed or kept, a price rise, goal progress or the net worth change.
 Rules:
-- Use only the numbers above, exactly as given (dollars like $123.45, percents like 12.5%). Never calculate, round differently or estimate a new number.
+- Use only the numbers above, exactly as given (dollars like $123.45, percents like 12.5%). Never calculate a difference, a remainder or any other new number, and never round differently or estimate.
 - No advice lists, no greetings, no markdown, no emoji.
 - If the month is not over yet (monthIsOver false), say "so far" where it matters.`;
 
-// Every number in the facts, for checking the model's lines
-const allowedNumbers = (facts) => {
-  const values = [];
+// Every number in the facts, and every name (a category, goal or bill may have digits in it)
+const factsVocabulary = (facts) => {
+  const numbers = [];
+  const names = [];
   const walk = (v) => {
-    if (typeof v === "number" && Number.isFinite(v)) values.push(Math.abs(v));
+    if (typeof v === "number" && Number.isFinite(v)) numbers.push(Math.abs(v));
+    else if (typeof v === "string" && /\d/.test(v)) names.push(v);
     else if (Array.isArray(v)) v.forEach(walk);
     else if (v && typeof v === "object") Object.values(v).forEach(walk);
   };
   walk(facts);
-  return values;
+  // Longest first, so "Trip 2026 fund" is removed before "Trip 2026"
+  return { numbers, names: names.sort((a, b) => b.length - a.length) };
 };
 
 const quotesKnownNumber = (n, allowed) =>
   allowed.some((a) => Math.abs(a - n) < 0.005 || Math.round(a) === n);
 
+// Each number written in a line ("$1,234.50", "41%", "250 dollars", "1.2k"), as a value
+const numbersIn = (text) =>
+  [...text.matchAll(/(\d[\d,]*(?:\.\d+)?)\s?(k\b)?/gi)].map((m) => {
+    const n = parseFloat(m[1].replace(/,/g, ""));
+    return m[2] ? n * 1000 : n;
+  });
+
 /**
  * The model's lines, cleaned: at most three, bullets and markdown stripped, each cut to a sensible
- * length, and any line quoting a $ amount or % that isn't one of the facts' numbers dropped.
+ * length, and any line with a number that isn't one of the facts' numbers dropped ("$600 to go",
+ * "250 dollars", "41 percent" when the facts don't say so). Digits inside a name from the facts
+ * (a goal called "Trip 2026") don't count.
  */
 const sanitizeCommentary = (lines, facts) => {
-  const allowed = allowedNumbers(facts);
+  const { numbers, names } = factsVocabulary(facts);
   const out = [];
   for (const raw of Array.isArray(lines) ? lines : []) {
     if (out.length >= COMMENTARY_LINES) break;
     let line = String(raw ?? "")
       .replace(/[*_`#>]/g, "")
-      .replace(/^\s*(?:[-•]|\d+[.)])\s*/, "")
+      .replace(/^\s*(?:[-•]|\d+[.)])\s+/, "")
       .replace(/\s+/g, " ")
       .trim();
     if (!line) continue;
     if (line.length > COMMENTARY_LINE_MAX) line = `${line.slice(0, COMMENTARY_LINE_MAX - 1).replace(/\s+\S*$/, "")}…`;
-    const figures = [
-      ...[...line.matchAll(/\$\s?(\d[\d,]*(?:\.\d+)?)/g)].map((m) => m[1]),
-      ...[...line.matchAll(/(\d[\d,]*(?:\.\d+)?)\s?%/g)].map((m) => m[1]),
-    ].map((s) => parseFloat(s.replace(/,/g, "")));
-    if (figures.some((n) => !quotesKnownNumber(n, allowed))) continue;
+    let figuresText = line;
+    for (const name of names) figuresText = figuresText.split(name).join(" ");
+    if (numbersIn(figuresText).some((n) => !quotesKnownNumber(n, numbers))) continue;
     out.push(line);
   }
   return out;
@@ -300,13 +353,18 @@ const sanitizeCommentary = (lines, facts) => {
 
 const factsHash = (facts) => crypto.createHash("sha256").update(JSON.stringify(facts)).digest("hex").slice(0, 32);
 
+/** A key for these exact numbers: it changes whenever the commentary would (the client keys its query on it) */
+const commentaryKeyOf = (close) => factsHash(commentaryFacts(close));
+
 /** Commentary saved for these exact numbers, or null */
 const getCachedCommentary = async (close) => {
   const record = await Setting.findByPk(`${COMMENTARY_KEY_PREFIX}${close.month}`);
   if (!record) return null;
   try {
     const saved = JSON.parse(record.value);
-    return saved.hash === factsHash(commentaryFacts(close)) && Array.isArray(saved.lines) ? saved.lines : null;
+    return saved.hash === factsHash(commentaryFacts(close)) && Array.isArray(saved.lines) && saved.lines.length > 0
+      ? saved.lines
+      : null;
   } catch {
     return null;
   }
@@ -352,10 +410,13 @@ const generateCommentary = async (close, { ai, generate, reserveCall, releaseUna
       parsed = { lines: String(response.text || "").split("\n") };
     }
     const lines = sanitizeCommentary(parsed.lines, facts);
-    await Setting.upsert({
-      key: `${COMMENTARY_KEY_PREFIX}${close.month}`,
-      value: JSON.stringify({ hash: factsHash(facts), lines }),
-    });
+    // Nothing usable (every line dropped) isn't kept, so the next try can write a note
+    if (lines.length > 0) {
+      await Setting.upsert({
+        key: `${COMMENTARY_KEY_PREFIX}${close.month}`,
+        value: JSON.stringify({ hash: factsHash(facts), lines }),
+      });
+    }
     return { lines, cached: false };
   } catch (err) {
     await releaseUnanswered(usage);
@@ -402,6 +463,7 @@ module.exports = {
   buildCommentaryPrompt,
   sanitizeCommentary,
   getCachedCommentary,
+  commentaryKeyOf,
   generateCommentary,
   digestLines,
 };

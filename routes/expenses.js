@@ -21,7 +21,8 @@ const {
   reverseCardFundPayments,
 } = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
-const { normalizeTag, hasTag, tagsOf } = require("../utils/transactionTags");
+const { tagsOf } = require("../utils/transactionTags");
+const { filterLedgerRows, ledgerCsv } = require("../utils/ledgerExport");
 const {
   snapshotArchivedBalances,
   assertArchivedBalancesUnchanged,
@@ -199,63 +200,79 @@ router.get(
   })
 );
 
-// Full ledger: Transactions of ALL types combined natively. ?tag=work keeps only rows with that tag.
+// Every row as the Ledger shows it (GET /expenses/all), newest first
+const loadLedgerRows = async () => {
+  const found = await Transaction.findAll({
+    order: [
+      ["date", "DESC"],
+      ["createdAt", "DESC"],
+    ],
+    include: [
+      { model: Account, as: "fromAccount" },
+      { model: Account, as: "toAccount" },
+    ],
+  });
+  return found.map((t) => ({
+    id: t.id,
+    type: t.type.toLowerCase(),
+    name: t.title,
+    amount: parseFloat(t.amount),
+    date: t.date,
+    due_date: t.date,
+    payment_date: t.type === "INCOME" ? t.date : undefined,
+    category: t.category,
+    is_paid: t.isCleared,
+    balanceApplied: Boolean(t.balanceApplied),
+    recurrence: t.recurrence || "none",
+    recurringGroupId: t.recurringGroupId || null,
+    // Tax fields so editing from the Ledger keeps the tax setting and pre-tax amount (B2)
+    isTaxExclusive: Boolean(t.isTaxExclusive),
+    taxRate: t.taxRate !== null && t.taxRate !== undefined ? parseFloat(t.taxRate) : null,
+    baseAmount:
+      t.baseAmount !== null && t.baseAmount !== undefined ? parseFloat(t.baseAmount) : null,
+    taxApplied: Boolean(t.taxApplied),
+    // Imported from a bank CSV and not yet confirmed in the "Review new" inbox
+    needsReview: Boolean(t.needsReview),
+    notes: t.notes || null,
+    tags: tagsOf(t),
+    fromAccountId: t.fromAccountId || null,
+    creditCardId:
+      t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
+        ? t.fromAccount.id
+        : null,
+    targetAccountId: t.toAccountId || null,
+    fromAccount: t.fromAccount ? t.fromAccount.name : null,
+    toAccount: t.toAccount ? t.toAccount.name : null,
+    fromAccountType: t.fromAccount ? t.fromAccount.type : null,
+    toAccountType: t.toAccount ? t.toAccount.type : null,
+    // Archived accounts keep their name in the history
+    fromAccountArchived: t.fromAccount ? t.fromAccount.isActive === false : false,
+    toAccountArchived: t.toAccount ? t.toAccount.isActive === false : false,
+  }));
+};
+
+// Full ledger: Transactions of ALL types combined natively. Takes the Ledger's filters (ledgerQuery:
+// from, to, type, category, accountId, tag, search, sort); they run here because JSON columns (tags)
+// can't be filtered the same way on SQLite and Postgres.
 router.get(
   "/expenses/all",
+  validateQuery(schemas.ledgerQuery),
   asyncHandler(async (req, res) => {
-    const tag = typeof req.query.tag === "string" ? normalizeTag(req.query.tag) : "";
-    const found = await Transaction.findAll({
-      order: [
-        ["date", "DESC"],
-        ["createdAt", "DESC"],
-      ],
-      include: [
-        { model: Account, as: "fromAccount" },
-        { model: Account, as: "toAccount" },
-      ],
-    });
+    res.json(filterLedgerRows(await loadLedgerRows(), req.validatedQuery));
+  })
+);
 
-    // JSON columns can't be filtered the same way on SQLite and Postgres, so the tag filter runs here
-    const all = tag ? found.filter((t) => hasTag(t, tag)) : found;
-
-    const rows = all.map((t) => ({
-      id: t.id,
-      type: t.type.toLowerCase(),
-      name: t.title,
-      amount: parseFloat(t.amount),
-      date: t.date,
-      due_date: t.date,
-      payment_date: t.type === "INCOME" ? t.date : undefined,
-      category: t.category,
-      is_paid: t.isCleared,
-      balanceApplied: Boolean(t.balanceApplied),
-      recurrence: t.recurrence || "none",
-      recurringGroupId: t.recurringGroupId || null,
-      // Tax fields so editing from the Ledger keeps the tax setting and pre-tax amount (B2)
-      isTaxExclusive: Boolean(t.isTaxExclusive),
-      taxRate: t.taxRate !== null && t.taxRate !== undefined ? parseFloat(t.taxRate) : null,
-      baseAmount:
-        t.baseAmount !== null && t.baseAmount !== undefined ? parseFloat(t.baseAmount) : null,
-      taxApplied: Boolean(t.taxApplied),
-      // Imported from a bank CSV and not yet confirmed in the "Review new" inbox
-      needsReview: Boolean(t.needsReview),
-      notes: t.notes || null,
-      tags: tagsOf(t),
-      creditCardId:
-        t.fromAccount && t.fromAccount.type === "CREDIT_CARD"
-          ? t.fromAccount.id
-          : null,
-      targetAccountId: t.toAccountId || null,
-      fromAccount: t.fromAccount ? t.fromAccount.name : null,
-      toAccount: t.toAccount ? t.toAccount.name : null,
-      fromAccountType: t.fromAccount ? t.fromAccount.type : null,
-      toAccountType: t.toAccount ? t.toAccount.type : null,
-      // Archived accounts keep their name in the history
-      fromAccountArchived: t.fromAccount ? t.fromAccount.isActive === false : false,
-      toAccountArchived: t.toAccount ? t.toAccount.isActive === false : false,
-    }));
-
-    res.json(rows);
+// The Ledger's rows as a CSV download, with the same filters as GET /expenses/all
+router.get(
+  "/expenses/export.csv",
+  validateQuery(schemas.ledgerQuery),
+  asyncHandler(async (req, res) => {
+    const rows = filterLedgerRows(await loadLedgerRows(), req.validatedQuery);
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="fintrack-ledger-${getTodayString()}.csv"`);
+    res.setHeader("Cache-Control", "no-store");
+    // The BOM makes Excel read the file as UTF-8 (arrows, accents)
+    res.send(`\uFEFF${ledgerCsv(rows)}`);
   })
 );
 

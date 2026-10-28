@@ -532,6 +532,22 @@ async function runGeminiUnitTests() {
     assert.deepStrictEqual(lines, ["Dining rose 160%", "Spending was about $1,235"]);
   });
 
+  test("A number written without $ or % that isn't in the facts drops the line (review R1)", () => {
+    const goalFacts = { saved: 400, target: 1000, percent: 40, year: 2026, overBudgetCount: 3, goals: [{ name: "Trip 2026", saved: 400 }] };
+    const lines = sanitizeCommentary(
+      [
+        "You are 600 away from your goal.",
+        "You could save 250 dollars next month.",
+        "Your goal is 41 percent done",
+        "About 1.2k saved so far",
+        "Trip 2026 has 400 of 1,000 saved, 40 percent.",
+        "3 budgets went over in 2026.",
+      ],
+      goalFacts
+    );
+    assert.deepStrictEqual(lines, ["Trip 2026 has 400 of 1,000 saved, 40 percent.", "3 budgets went over in 2026."]);
+  });
+
   test("Blank or non-text answers give no lines; a long line is cut at a word", () => {
     assert.deepStrictEqual(sanitizeCommentary(null, hFacts), []);
     assert.deepStrictEqual(sanitizeCommentary(["", "   "], hFacts), []);

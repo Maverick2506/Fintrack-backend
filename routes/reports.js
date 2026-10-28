@@ -3,7 +3,7 @@ const authMiddleware = require("../middleware/authMiddleware");
 const { validateQuery, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const { getTodayString } = require("../services/accountBalanceService");
-const { buildMonthClose, getCachedCommentary, generateCommentary } = require("../services/monthCloseService");
+const { buildMonthClose, getCachedCommentary, generateCommentary, commentaryKeyOf } = require("../services/monthCloseService");
 const { reserveCall, releaseUnanswered, sendCapReached } = require("../services/aiUsageService");
 const gemini = require("./gemini");
 
@@ -30,7 +30,7 @@ router.get(
     const resolved = resolveMonth(req, res);
     if (!resolved) return;
     const close = await buildMonthClose(resolved.month, resolved.todayStr);
-    res.json({ ...close, commentary: await getCachedCommentary(close) });
+    res.json({ ...close, commentary: await getCachedCommentary(close), commentaryKey: commentaryKeyOf(close) });
   })
 );
 

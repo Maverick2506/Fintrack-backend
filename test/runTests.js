@@ -9492,6 +9492,14 @@ async function runTestSuite() {
   }
   // A goal: $500 saved today, $200 went in during May and $100 after it, so $400 at the end of May
   const s62Goal = await Account.create({ name: "Suite62 Trip", type: "SAVINGS_GOAL", initialBalance: 500, targetAmount: 1000, isActive: true });
+  await s45Opened(s62Goal, "2024-01-15");
+  // A goal opened after May isn't in May's close
+  const s62LaterGoal = await Account.create({ name: "Suite62 Later", type: "SAVINGS_GOAL", initialBalance: 50, targetAmount: 100, isActive: true });
+  // The subscription changed again in June: May's close still shows May's rise
+  await Transaction.create({
+    title: "Suite62 Stream", amount: 13, date: "2024-06-05", type: "EXPENSE", category: "S62 Subs", isCleared: true,
+    recurrence: "monthly", recurringGroupId: s62Series,
+  });
   await Transaction.create({ title: "Suite62 To Trip", amount: 200, date: `${s62Month}-10`, type: "TRANSFER", category: "Savings", isCleared: true, balanceApplied: true, toAccountId: s62Goal.id });
   await Transaction.create({ title: "Suite62 To Trip later", amount: 100, date: "2024-07-01", type: "TRANSFER", category: "Savings", isCleared: true, balanceApplied: true, toAccountId: s62Goal.id });
   // Net worth: $1,000 at the end of April, $1,350 at the end of May
@@ -9536,6 +9544,10 @@ async function runTestSuite() {
     `The $10 -> $12 subscription is listed as a price rise in May (got ${JSON.stringify(s62Rise)})`
   );
   const s62GoalRow = s62.goals.find((g) => g.id === s62Goal.id);
+  assert(
+    !s62.goals.some((g) => g.id === s62LaterGoal.id) && typeof s62.commentaryKey === "string" && s62.commentaryKey.length === 32,
+    `A goal opened after the month is left out; the response carries a commentary key (got ${s62.goals.map((g) => g.name).join(", ")})`
+  );
   assert(
     s62GoalRow?.saved === 400 && s62GoalRow.contributed === 200 && s62GoalRow.target === 1000 && s62GoalRow.percent === 40,
     `Goal at the end of May: $400 of $1,000 (40%), $200 put in during May (got ${JSON.stringify(s62GoalRow)})`
@@ -9595,6 +9607,17 @@ async function runTestSuite() {
       `(got ${JSON.stringify(s62First.lines)}, ${s62Calls} model call(s), GET ${JSON.stringify(s62WithText.body.commentary)})`
   );
 
+  // An answer whose every line is dropped isn't kept, so the next try can still write a note
+  const s62Cached = await Setting.findByPk(`${s62CommentaryKey}${s62Month}`);
+  await Setting.destroy({ where: { key: `${s62CommentaryKey}${s62Month}` } });
+  const s62MadeUp = await s62Generate(s62, { ...s62Helpers, ai: { models: { generateContent: async () => ({ text: JSON.stringify({ lines: ["You saved 999 dollars."] }) }) } } });
+  const s62AfterBad = await Setting.findByPk(`${s62CommentaryKey}${s62Month}`);
+  assert(
+    s62MadeUp.lines.length === 0 && s62AfterBad === null,
+    `An answer with only made-up numbers gives no lines and isn't cached (got ${JSON.stringify(s62MadeUp.lines)}, cached ${Boolean(s62AfterBad)})`
+  );
+  await Setting.create({ key: s62Cached.key, value: s62Cached.value });
+
   // The digest on the 1st sums up the month that just ended; other days don't
   const { buildMorningDigest: s62Digest } = require("../services/notificationService");
   const s62OnFirst = await s62Digest(null, { todayStr: "2024-06-01" });
@@ -9615,7 +9638,7 @@ async function runTestSuite() {
   );
 
   await Transaction.destroy({ where: { title: { [Op.like]: "Suite62 %" } }, force: true });
-  await Account.destroy({ where: { id: s62Goal.id } });
+  await Account.destroy({ where: { id: { [Op.in]: [s62Goal.id, s62LaterGoal.id] } } });
   await Budget.destroy({ where: { category: { [Op.in]: ["S62 Dining", "S62 Groceries"] } } });
   await Promise.all(s62Snaps.map((s) => s.destroy()));
   await Setting.destroy({ where: { key: `${s62CommentaryKey}${s62Month}` } });
@@ -9645,6 +9668,12 @@ async function runTestSuite() {
     s33("POST", "/api/expenses", { name: "Suite63 Bad", amount: 1, tags: ["x".repeat(31)] }),
     s33("PUT", `/api/expenses/${s63Lunch.body.id}`, { notes: "n".repeat(1001) }),
   ]);
+  const s63HashTag = await s33("PUT", `/api/expenses/${s63Plain.body.id}`, { tags: [`#${"y".repeat(30)}`] });
+  assert(
+    s63HashTag.status === 200 && JSON.stringify((await Transaction.findByPk(s63Plain.body.id)).tags) === JSON.stringify(["y".repeat(30)]),
+    `"#" plus 30 characters is a 30-character tag and is saved (got ${s63HashTag.status})`
+  );
+  await s33("PUT", `/api/expenses/${s63Plain.body.id}`, { tags: [] });
   assert(
     s63TooMany.status === 400 && s63TooLong.status === 400 && s63LongNote.status === 400,
     `11 tags, a 31-character tag and a 1,001-character note are refused (got ${s63TooMany.status}, ${s63TooLong.status}, ${s63LongNote.status})`
@@ -9704,6 +9733,90 @@ async function runTestSuite() {
     `Generated occurrences keep the "health" tag and have no note (got ${s63Next.map((t) => `${t.date} ${JSON.stringify(t.tags)} ${t.notes}`).join("; ")})`
   );
   await Transaction.destroy({ where: { title: { [Op.like]: "Suite63 %" } }, force: true });
+
+  console.log("\n--- Suite 64: Ledger CSV download (same filters as the Ledger, formula-safe), feed notes cut to 100 characters ---");
+  const s64Today = getTorontoToday();
+  const s64Card = await Account.create({ name: "Suite64 Visa", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 1000, isActive: true });
+  const s64Long = `Suite64 long note ${"x".repeat(150)}`;
+  const s64Made = [
+    await s33("POST", "/api/expenses", { name: "=HYPERLINK(\"http://evil.example\",\"Suite64 click\")", amount: 5, due_date: s64Today, category: "Other", is_paid: true, tags: ["s64"] }),
+    await s33("POST", "/api/expenses", { name: "Suite64 Work lunch", amount: 21.5, due_date: s64Today, category: "Dining Out", is_paid: true, tags: ["s64", "work"], notes: "+1 for Sam, \"split\"" }),
+    await s33("POST", "/api/expenses", { name: "Suite64 Card gas", amount: 40, due_date: getTorontoOffsetDate(-3), category: "Transportation", is_paid: true, creditCardId: s64Card.id, tags: ["s64"], notes: s64Long }),
+    await s33("POST", "/api/paycheques", { name: "Suite64 Pay", amount: 900, payment_date: getTorontoOffsetDate(-2), tags: ["s64"] }),
+  ];
+  assert(s64Made.every((r) => r.status === 200 || r.status === 201), `Suite 64 rows saved (got ${s64Made.map((r) => r.status).join(",")})`);
+  const s64Csv = (q) => s33("GET", `/api/expenses/export.csv?${q}`);
+  const s64Rows = (raw) => s36ParseCsv(raw.replace(/^﻿/, "").replace(/\r/g, "").trim());
+
+  // The download holds exactly the rows GET /expenses/all returns for the same filters, in order
+  const s64Queries = [
+    "tag=s64",
+    "tag=%23S64&type=expense",
+    `tag=s64&from=${getTorontoOffsetDate(-3)}&to=${getTorontoOffsetDate(-1)}`,
+    `tag=s64&accountId=${s64Card.id}`,
+    "tag=s64&search=sam",
+    "tag=s64&search=suite64%20visa",
+    "tag=s64&category=Dining%20Out",
+    "tag=s64&sort=amount:asc",
+  ];
+  const s64Mismatch = [];
+  for (const q of s64Queries) {
+    const [csv, all] = await Promise.all([s64Csv(q), s33("GET", `/api/expenses/all?${q}`)]);
+    const titles = s64Rows(csv.raw).slice(1).map((r) => r[1].replace(/^'/, ""));
+    if (csv.status !== 200 || all.status !== 200 || JSON.stringify(titles) !== JSON.stringify(all.body.map((r) => r.name))) {
+      s64Mismatch.push(`${q}: csv ${JSON.stringify(titles)} vs ledger ${JSON.stringify(all.body?.map?.((r) => r.name))}`);
+    }
+  }
+  assert(s64Mismatch.length === 0, `Each filtered download matches the Ledger query (${s64Mismatch.join(" | ") || "all 8 match"})`);
+  const s64Counts = await Promise.all(["tag=s64", "tag=s64&type=expense", "tag=work&search=suite64", "tag=s64&accountId=" + s64Card.id].map(async (q) => s64Rows((await s64Csv(q)).raw).length - 1));
+  assert(
+    JSON.stringify(s64Counts) === JSON.stringify([4, 3, 1, 1]),
+    `Tag filters: 4 rows tagged s64, 3 of them expenses, 1 tagged work, 1 on the card (got ${s64Counts.join(",")})`
+  );
+
+  const s64Res = await s64Csv("tag=s64&sort=amount:desc");
+  const s64Table = s64Rows(s64Res.raw);
+  const s64ByTitle = (t) => s64Table.find((r) => r[1].includes(t));
+  const s64Evil = s64ByTitle("Suite64 click");
+  const s64Lunch = s64ByTitle("Suite64 Work lunch");
+  const s64Gas = s64ByTitle("Suite64 Card gas");
+  assert(
+    s64Res.headers["content-type"].includes("text/csv") && /attachment; filename="fintrack-ledger-\d{4}-\d{2}-\d{2}\.csv"/.test(s64Res.headers["content-disposition"]) &&
+      s64Table[0].join(",") === "date,title,type,category,account,amount,paid,tags,notes",
+    `CSV download headers and columns (got ${s64Res.headers["content-disposition"]}; ${s64Table[0].join(",")})`
+  );
+  assert(
+    s64Evil?.[1] === "'=HYPERLINK(\"http://evil.example\",\"Suite64 click\")" && s64Lunch?.[8] === "'+1 for Sam, \"split\"",
+    `A title starting with = and a note starting with + get a leading ' so a spreadsheet won't run them (got ${s64Evil?.[1]} / ${s64Lunch?.[8]})`
+  );
+  assert(
+    s64Lunch?.[0] === s64Today && s64Lunch[2] === "expense" && s64Lunch[3] === "Dining Out" && s64Lunch[4] === "Checking" &&
+      s64Lunch[5] === "21.50" && s64Lunch[6] === "yes" && s64Lunch[7] === "s64; work" &&
+      s64Gas?.[4] === "Suite64 Visa" && s64Gas[8] === s64Long && s64ByTitle("Suite64 Pay")?.[2] === "income",
+    `Row cells: date, type, category, the Ledger's account text, amount, paid, tags and the full note (got ${s64Lunch?.join("|")})`
+  );
+  const [s64BadDate, s64BadType, s64NoAuth] = await Promise.all([
+    s64Csv("from=28-10-2026"),
+    s64Csv("type=refund"),
+    request({ hostname: "localhost", port: 8000, path: "/api/expenses/export.csv", method: "GET" }),
+  ]);
+  assert(
+    s64BadDate.status === 400 && s64BadType.status === 400 && s64NoAuth.status === 401,
+    `Bad filters are refused and the download needs a login (got ${s64BadDate.status}, ${s64BadType.status}, ${s64NoAuth.status})`
+  );
+
+  // The Gem feed's recent rows show the tags and the note cut to 100 characters
+  const s64Feed = s36ParseCsv((await s36(`/api/export/financial-feed.csv?key=${s63Key}`)).raw);
+  const s64FeedGas = s64Feed.find((r) => r[0] === "RECENT_TRANSACTIONS" && r[4] === "Suite64 Card gas");
+  const s64Md = (await s36(`/api/export/financial-feed.md?key=${s63Key}`)).raw;
+  assert(
+    s64FeedGas?.[7] === "s64" && s64FeedGas[8].length === 100 && s64FeedGas[8].endsWith("…") && s64FeedGas[8].startsWith("Suite64 long note xxx") &&
+      s64Md.includes(`| s64 | ${s64FeedGas[8]} |`),
+    `Feed TAGS and NOTES, the note cut to 100 characters in CSV and Markdown (got ${s64FeedGas?.[8]?.length} chars)`
+  );
+
+  await Transaction.destroy({ where: { [Op.or]: [{ title: { [Op.like]: "%Suite64%" } }, { fromAccountId: s64Card.id }] }, force: true });
+  await s64Card.destroy();
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

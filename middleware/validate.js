@@ -110,11 +110,13 @@ const notesField = z
   .nullable()
   .optional()
   .transform((v) => (v === undefined ? undefined : normalizeNotes(v)));
+// Lengths are checked on the stored form, so "#" + 30 characters is a 30-character tag
 const tagsField = z
-  .array(z.string().trim().max(MAX_TAG_LENGTH, `A tag can be up to ${MAX_TAG_LENGTH} characters`))
+  .array(z.string().max(200))
   .nullable()
   .optional()
   .transform((v) => (v === undefined ? undefined : normalizeTags(v)))
+  .refine((v) => !v || v.every((t) => t.length <= MAX_TAG_LENGTH), `A tag can be up to ${MAX_TAG_LENGTH} characters`)
   .refine((v) => !v || v.length <= MAX_TAGS, `Up to ${MAX_TAGS} tags`);
 
 // Card payments: each bill on the payment that a savings goal saves for, and whether its fund pays
@@ -436,6 +438,18 @@ const schemas = {
   // PUT /expenses/:id?dryRun=1 previews the change (e.g. ending a series) and saves nothing
   dryRunQuery: z.object({
     dryRun: z.enum(["0", "1", "true", "false"]).optional(),
+  }),
+
+  // The Ledger's filters, on GET /expenses/all and GET /expenses/export.csv (all optional)
+  ledgerQuery: z.object({
+    from: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").optional(),
+    to: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").optional(),
+    type: z.enum(["income", "expense", "transfer"]).optional(),
+    category: z.string().trim().max(100).optional(),
+    accountId: z.string().uuid("Invalid account").optional(),
+    tag: z.string().trim().max(60).optional(),
+    search: z.string().max(200).optional(),
+    sort: z.enum(["date:desc", "date:asc", "amount:desc", "amount:asc", "name:asc", "name:desc"]).optional(),
   }),
 
   // GET /reports/month-close?month=YYYY-MM (defaults to the current Toronto month)
