@@ -519,7 +519,7 @@ async function runGeminiUnitTests() {
 
   // --- Suite H: Month close commentary (F6): Gemini's lines may only quote the month's numbers ---
   console.log("\n--- Suite H: Month close commentary ---");
-  const { sanitizeCommentary, buildCommentaryPrompt } = require("../services/monthCloseService");
+  const { sanitizeCommentary, buildCommentaryPrompt, digestLines } = require("../services/monthCloseService");
   const hFacts = { spending: 1234.5, spendingChange: 80, biggestIncreases: [{ category: "Dining", change: 80, percent: 160 }], netWorthChange: -42.1 };
 
   test("At most 3 lines; bullets, numbering and markdown are stripped", () => {
@@ -559,6 +559,21 @@ async function runGeminiUnitTests() {
     const prompt = buildCommentaryPrompt(hFacts);
     assert(prompt.includes(JSON.stringify(hFacts)));
     assert(/at most 3 short lines/i.test(prompt) && /Use only the numbers above/.test(prompt));
+  });
+
+  test("The digest's month close writes thousands with a comma", () => {
+    const lines = digestLines(
+      {
+        label: "May 2024",
+        totals: { spending: 2000, income: 12345.5, previousSpending: 0, spendingChange: 0, budgeted: 0, spentInBudgeted: 0, overBudgetCount: 0 },
+        increases: [],
+        priceRises: [],
+        netWorth: { change: -1500 },
+      },
+      true
+    ).join("\n");
+    assert(lines.includes("Spent $2,000.00, income $12,345.50"), lines);
+    assert(lines.includes("Net worth −$1,500.00"), lines);
   });
 
   console.log("\n==================================================");

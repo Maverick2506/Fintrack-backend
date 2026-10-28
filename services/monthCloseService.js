@@ -265,7 +265,8 @@ const buildMonthClose = async (month, todayStr) => {
 
 // --- Commentary (Gemini writes the words; the numbers above are the server's) ---
 
-const money = (n) => `$${Math.abs(round2(n)).toFixed(2)}`;
+const money = (n) =>
+  `$${Math.abs(round2(n)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 /** The facts the model sees: only numbers from the month close */
 const commentaryFacts = (close) => ({
