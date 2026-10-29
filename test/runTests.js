@@ -10426,6 +10426,17 @@ async function runTestSuite() {
     `Hidden payload uses words and keeps percentages (got ${JSON.stringify(s70Words).slice(0, 400)})`
   );
 
+  // Status order: below the buffer reads "Low" even with no income (review item 6)
+  const s70Low = buildWidgetPayload(
+    { ...s70Facts, forecast: { ...s70Facts.forecast, incomeSource: "none", nextPayday: null, safeToSpend: 0, lowestPoint: { date: "2026-11-05", balance: 150 } } },
+    { hideAmounts: true }
+  );
+  const s70NoIncome = buildWidgetPayload({ ...s70Facts, forecast: { ...s70Facts.forecast, incomeSource: "none", nextPayday: null } });
+  assert(
+    s70Low.status === "Low" && s70Low.safe_to_spend === "Low" && s70Low.below_buffer === true && s70NoIncome.status === "No income",
+    `Below the buffer with no income reads Low; above it, No income (got ${s70Low.status}, ${s70NoIncome.status})`
+  );
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

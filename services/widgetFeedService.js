@@ -99,7 +99,8 @@ const buildWidgetPayload = (facts, { hideAmounts = false } = {}) => {
   const f = facts.forecast;
   const lastDay = f.days && f.days.length ? f.days[f.days.length - 1].date : f.today;
   const belowBuffer = Boolean(f.lowestPoint && f.lowestPoint.balance < f.buffer);
-  const status = f.incomeSource === "none" ? "No income" : belowBuffer || f.safeToSpend <= 0 ? "Low" : "On track";
+  // Low wins over No income: a balance heading under the buffer is the more urgent thing to show
+  const status = belowBuffer || f.safeToSpend <= 0 ? "Low" : f.incomeSource === "none" ? "No income" : "On track";
   // In hide mode the strings become words and the raw dollar numbers are left out (percentages stay)
   const amount = (n, word) => (hideAmounts ? word : widgetMoney(n));
   const raw = (n) => (hideAmounts ? null : round2(n));
