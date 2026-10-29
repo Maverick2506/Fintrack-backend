@@ -13,6 +13,14 @@ const { usesArchivedAccount } = require("../services/accountArchiveService");
 const { feedLimiter } = require("../middleware/rateLimit");
 const { tagsOf } = require("../utils/transactionTags");
 const { neutralizeFormula } = require("../utils/ledgerExport");
+const { validateBody, schemas } = require("../middleware/validate");
+const {
+  getOrCreateWidgetToken,
+  regenerateWidgetToken,
+  getWidgetHideAmounts,
+  setWidgetHideAmounts,
+  getWidgetFeed,
+} = require("../services/widgetFeedService");
 
 // Helper: Timing-safe token comparison
 const constantTimeCompare = (a, b) => {
@@ -681,7 +689,7 @@ You have continuous access to Maverick's live FinTrack financial data connected 
 `;
 };
 
-router.use(["/financial-feed.csv", "/financial-feed.md"], feedLimiter);
+router.use(["/financial-feed.csv", "/financial-feed.md", "/widget.json"], feedLimiter);
 
 // --- PUBLIC TOKEN-AUTHENTICATED CSV FEED ---
 router.get("/financial-feed.csv", async (req, res) => {
@@ -866,6 +874,79 @@ router.post("/regenerate-key", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("Key regeneration error:", err);
     res.status(500).json({ error: "Failed to regenerate feed key." });
+  }
+});
+
+// --- PUBLIC TOKEN-AUTHENTICATED WIDGET FEED (KWGT on Android) ---
+// Its own key (widget_feed_token, ft_wdg_...), so the widget URL never unlocks the Gem feed.
+router.get("/widget.json", async (req, res) => {
+  const token = req.query.key;
+  if (!token) {
+    return res.status(401).json({ error: "Missing widget key." });
+  }
+  const storedToken = await getOrCreateWidgetToken();
+  if (!constantTimeCompare(token, storedToken)) {
+    return res.status(401).json({ error: "Invalid or revoked widget key." });
+  }
+
+  try {
+    const feed = await getWidgetFeed();
+    res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate, max-age=0, s-maxage=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.status(200).json(feed);
+  } catch (err) {
+    console.error("Widget feed error:", err);
+    res.status(500).json({ error: "Error generating widget feed." });
+  }
+});
+
+const widgetUrlFor = (baseUrl, key) => `${baseUrl}/api/export/widget.json?key=${key}`;
+
+// --- JWT-AUTHENTICATED WIDGET SETTINGS (the Widgets page) ---
+router.get("/widget-config", authMiddleware, async (req, res) => {
+  try {
+    const baseUrl = getPublicBaseUrl(req);
+    if (!baseUrl) {
+      return res.status(503).json({ error: MISSING_PUBLIC_URL_ERROR });
+    }
+    const widgetKey = await getOrCreateWidgetToken();
+    res.json({
+      widgetKey,
+      widgetUrl: widgetUrlFor(baseUrl, widgetKey),
+      hideAmounts: await getWidgetHideAmounts(),
+    });
+  } catch (err) {
+    console.error("Widget config error:", err);
+    res.status(500).json({ error: "Failed to load widget settings." });
+  }
+});
+
+router.post("/regenerate-widget-key", authMiddleware, async (req, res) => {
+  try {
+    const baseUrl = getPublicBaseUrl(req);
+    if (!baseUrl) {
+      return res.status(503).json({ error: MISSING_PUBLIC_URL_ERROR });
+    }
+    const widgetKey = await regenerateWidgetToken();
+    res.json({
+      widgetKey,
+      widgetUrl: widgetUrlFor(baseUrl, widgetKey),
+      hideAmounts: await getWidgetHideAmounts(),
+      message: "Widget key regenerated. Update the URL in KWGT.",
+    });
+  } catch (err) {
+    console.error("Widget key regeneration error:", err);
+    res.status(500).json({ error: "Failed to regenerate widget key." });
+  }
+});
+
+router.put("/widget-settings", authMiddleware, validateBody(schemas.setWidgetSettings), async (req, res) => {
+  try {
+    res.json({ hideAmounts: await setWidgetHideAmounts(req.body.hideAmounts) });
+  } catch (err) {
+    console.error("Widget settings error:", err);
+    res.status(500).json({ error: "Failed to save widget settings." });
   }
 });
 
