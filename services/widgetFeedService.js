@@ -85,15 +85,37 @@ const cardWord = (balance, limit) => {
   const p = (balance / limit) * 100;
   return p > 100 ? "Over limit" : p >= 90 ? "Near limit" : "Owing";
 };
+const debtWord = (balance) => (balance <= 0 ? "Paid off" : "Owing");
 const goalWord = (saved, target) => {
   if (target > 0 && saved >= target) return "Reached";
   return saved > 0 ? "Saving" : "Not started";
 };
 
+/** 8.5 -> "8.5%", 19.99 -> "19.99%", none or 0 -> "" */
+const ratePct = (rate) => {
+  const r = parseFloat(rate);
+  return r > 0 ? `${Math.round(r * 100) / 100}%` : "";
+};
+
+/**
+ * How much of a debt is paid, 0-100. With an original amount: (original - balance) / original.
+ * Without one: cleared payments into the debt / (balance + those payments). 0 when neither gives a number.
+ */
+const debtPctPaid = ({ balance, original, paid }) => {
+  const owing = Math.max(0, Number(balance) || 0);
+  const start = Number(original) || 0;
+  const payments = Math.max(0, Number(paid) || 0);
+  let p = 0;
+  if (start > 0) p = ((start - owing) / start) * 100;
+  else if (payments > 0) p = (payments / (owing + payments)) * 100;
+  return Math.min(100, Math.max(0, Math.round(p)));
+};
+
 /**
  * The widget's flat JSON from plain facts (no database), so it can be unit tested.
  * facts: { forecast, bills: [{title, date, amount}], month: {spent, budget, topCategory},
- *          cards: [{name, balance, limit, due}], goals: [{name, saved, target}], todayStr, asOf }
+ *          cards: [{name, balance, limit, due}],
+ *          debts: [{name, balance, original, paid, payment, due, rate}], goals: [{name, saved, target}], todayStr, asOf }
  */
 const buildWidgetPayload = (facts, { hideAmounts = false } = {}) => {
   const f = facts.forecast;
@@ -145,6 +167,19 @@ const buildWidgetPayload = (facts, { hideAmounts = false } = {}) => {
     out[`card${n}_due`] = c ? shortDate(c.due) : "";
   }
 
+  // Debts, like cards: first 3 active by createdAt
+  for (let i = 0; i < SLOTS; i++) {
+    const d = (facts.debts || [])[i];
+    const n = i + 1;
+    out[`debt${n}_name`] = d ? d.name : "";
+    out[`debt${n}_balance`] = d ? amount(d.balance, debtWord(d.balance)) : "";
+    out[`debt${n}_balance_raw`] = d ? raw(d.balance) : hideAmounts ? null : 0;
+    out[`debt${n}_payment`] = d && d.payment > 0 ? amount(d.payment, "Payment set") : "";
+    out[`debt${n}_due`] = d ? shortDate(d.due) : "";
+    out[`debt${n}_rate`] = d ? ratePct(d.rate) : "";
+    out[`debt${n}_pct_paid`] = d ? debtPctPaid(d) : 0;
+  }
+
   for (let i = 0; i < SLOTS; i++) {
     const g = facts.goals[i];
     const n = i + 1;
@@ -182,7 +217,7 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
   const [, monthEnd] = monthRange(ym);
   const [prevStart] = monthRange(prevYm);
 
-  const [forecast, billRows, totals, budgets, cards, goals, hideAmounts] = await Promise.all([
+  const [forecast, billRows, totals, budgets, cards, goals, debts, hideAmounts] = await Promise.all([
     // Same call as the Dashboard's Safe to Spend card (GET /api/forecast)
     getForecast(FORECAST_DAYS),
     // Unpaid bills, overdue first. Card and debt payments are TRANSFERs but still due, like the Dashboard.
@@ -211,6 +246,12 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
       order: [["createdAt", "ASC"]],
       limit: SLOTS,
     }),
+    // Active debts in the Debts page order
+    Account.findAll({
+      where: { type: "DEBT", isActive: { [Op.ne]: false } },
+      order: [["createdAt", "ASC"]],
+      limit: SLOTS,
+    }),
     getWidgetHideAmounts(),
   ]);
 
@@ -235,6 +276,26 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
     }))
   );
 
+  // Cleared payments into each debt, for % paid when a debt has no original amount
+  const paidRows = debts.length
+    ? await Transaction.findAll({
+        where: { type: "TRANSFER", isCleared: true, toAccountId: { [Op.in]: debts.map((d) => d.id) } },
+        attributes: ["toAccountId", "amount"],
+        raw: true,
+      })
+    : [];
+  const debtFacts = debts.map((d) => ({
+    name: d.name,
+    balance: parseFloat(d.initialBalance) || 0,
+    // The Debts form's "Original Amount" (total_amount), the same number the Debts page progress bar uses
+    original: parseFloat(d.targetAmount) || 0,
+    paid: round2(paidRows.filter((r) => r.toAccountId === d.id).reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0)),
+    payment: parseFloat(d.minimumPayment) || 0,
+    // The next due date the Debts page shows (next_due_date); the daily sweep moves it forward
+    due: d.dueDate || null,
+    rate: d.interestRate,
+  }));
+
   // A sinking fund with no target of its own saves for its bill's amount (as on the Dashboard)
   const sinking = await getSinkingFunds(todayStr, null, goals);
   const goalFacts = goals.map((g) => {
@@ -252,6 +313,7 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
       bills,
       month: { spent: round2(current.spending), budget: round2(budget), topCategory: top ? top[0] : "" },
       cards: cardFacts,
+      debts: debtFacts,
       goals: goalFacts,
       todayStr,
       asOf: asOfLabel(now),
@@ -267,6 +329,7 @@ module.exports = {
   getWidgetHideAmounts,
   setWidgetHideAmounts,
   buildWidgetPayload,
+  debtPctPaid,
   getWidgetFeed,
   widgetMoney,
   asOfLabel,
