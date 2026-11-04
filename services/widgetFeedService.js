@@ -167,7 +167,7 @@ const buildWidgetPayload = (facts, { hideAmounts = false } = {}) => {
     out[`card${n}_due`] = c ? shortDate(c.due) : "";
   }
 
-  // Debts, like cards: first 3 active by createdAt
+  // Debts: owing ones first, then paid-off, each by createdAt (picked in getWidgetFeed)
   for (let i = 0; i < SLOTS; i++) {
     const d = (facts.debts || [])[i];
     const n = i + 1;
