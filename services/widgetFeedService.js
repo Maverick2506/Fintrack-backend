@@ -174,7 +174,7 @@ const buildWidgetPayload = (facts, { hideAmounts = false } = {}) => {
     out[`debt${n}_name`] = d ? d.name : "";
     out[`debt${n}_balance`] = d ? amount(d.balance, debtWord(d.balance)) : "";
     out[`debt${n}_balance_raw`] = d ? raw(d.balance) : hideAmounts ? null : 0;
-    out[`debt${n}_payment`] = d && d.payment > 0 ? amount(d.payment, "Payment set") : "";
+    out[`debt${n}_payment`] = d && d.balance > 0 && d.payment > 0 ? amount(d.payment, "Payment set") : "";
     out[`debt${n}_due`] = d ? shortDate(d.due) : "";
     out[`debt${n}_rate`] = d ? ratePct(d.rate) : "";
     out[`debt${n}_pct_paid`] = d ? debtPctPaid(d) : 0;
@@ -217,7 +217,7 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
   const [, monthEnd] = monthRange(ym);
   const [prevStart] = monthRange(prevYm);
 
-  const [forecast, billRows, totals, budgets, cards, goals, debts, hideAmounts] = await Promise.all([
+  const [forecast, billRows, totals, budgets, cards, goals, allDebts, hideAmounts] = await Promise.all([
     // Same call as the Dashboard's Safe to Spend card (GET /api/forecast)
     getForecast(FORECAST_DAYS),
     // Unpaid bills, overdue first. Card and debt payments are TRANSFERs but still due, like the Dashboard.
@@ -246,11 +246,10 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
       order: [["createdAt", "ASC"]],
       limit: SLOTS,
     }),
-    // Active debts in the Debts page order
+    // Active debts by createdAt; paying one to $0 doesn't archive it, so owing ones are picked first below
     Account.findAll({
       where: { type: "DEBT", isActive: { [Op.ne]: false } },
       order: [["createdAt", "ASC"]],
-      limit: SLOTS,
     }),
     getWidgetHideAmounts(),
   ]);
@@ -275,6 +274,10 @@ const getWidgetFeed = async ({ now = new Date() } = {}) => {
       due: cardDueDate(c, await getCardStatement(c, todayStr), todayStr),
     }))
   );
+
+  // Owing debts first (the Debts page's active list), then paid-off ones fill any spare slots
+  const owes = (d) => (parseFloat(d.initialBalance) || 0) > 0;
+  const debts = [...allDebts.filter(owes), ...allDebts.filter((d) => !owes(d))].slice(0, SLOTS);
 
   // Cleared payments into each debt, for % paid when a debt has no original amount
   const paidRows = debts.length
