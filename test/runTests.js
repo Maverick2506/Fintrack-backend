@@ -781,6 +781,11 @@ async function runTestSuite() {
       headers: authHeaders,
     });
   }
+  // Once today is past Nov 1 2026 the generator also adds Dec 1 and later; remove the rest of the series
+  // (unpaid, so no balance to undo) or Suite 30 sees it as a 4th subscription
+  if (rentRes.body.recurringGroupId) {
+    await Transaction.destroy({ where: { recurringGroupId: rentRes.body.recurringGroupId, isCleared: false }, force: true });
+  }
 
   // 10. Gemini Gem & Live Feed Export
   console.log("\n--- Suite 10: Gemini Gem & Live Feed Export ---");
@@ -10435,6 +10440,99 @@ async function runTestSuite() {
   assert(
     s70Low.status === "Low" && s70Low.safe_to_spend === "Low" && s70Low.below_buffer === true && s70NoIncome.status === "No income",
     `Below the buffer with no income reads Low; above it, No income (got ${s70Low.status}, ${s70NoIncome.status})`
+  );
+
+  // --- Suite 71: debts on the widget feed ---
+  console.log("\n--- Suite 71: Widget feed debts: 3 slots, % paid from the original amount or payments, hide amounts ---");
+  const s71Get = (path) => request({ hostname: "localhost", port: 8000, path, method: "GET", headers: {} });
+  const s71Key = (await request({ hostname: "localhost", port: 8000, path: "/api/export/widget-config", method: "GET", headers: authHeaders })).body?.widgetKey;
+  // Park other active debts so these three take the slots, in createdAt order
+  const s71Parked = await Account.findAll({ where: { type: "DEBT", isActive: { [Op.ne]: false } } });
+  for (const d of s71Parked) await d.update({ isActive: false });
+  // Paid to $0 but not archived (Pay never archives), and older than the rest: it must not take a slot from an owing debt
+  const s71PaidOff = await Account.create({ name: "Suite71 Old Phone Plan", type: "DEBT", initialBalance: 0, targetAmount: 300, minimumPayment: 50, isActive: true });
+  await new Promise((r) => setTimeout(r, 15));
+  const s71Loan = await Account.create({ name: "Suite71 Car Loan", type: "DEBT", initialBalance: 7500, targetAmount: 10000, minimumPayment: 350, dueDate: "2026-11-15", interestRate: 8.5, isActive: true });
+  await new Promise((r) => setTimeout(r, 15));
+  const s71Family = await Account.create({ name: "Suite71 Family Loan", type: "DEBT", initialBalance: 600, targetAmount: null, minimumPayment: null, dueDate: null, interestRate: null, isActive: true });
+  await new Promise((r) => setTimeout(r, 15));
+  const s71Fresh = await Account.create({ name: "Suite71 Fresh Loan", type: "DEBT", initialBalance: 900, targetAmount: null, isActive: true });
+  await new Promise((r) => setTimeout(r, 15));
+  const s71Fourth = await Account.create({ name: "Suite71 Fourth Loan", type: "DEBT", initialBalance: 50, targetAmount: 100, isActive: true });
+  const s71Checking = await Account.findOne({ where: { name: "Primary Checking" } });
+  const s71Rows = [];
+  // Family loan: $400 paid in two cleared TRANSFERs; an unpaid one and an EXPENSE don't count
+  s71Rows.push(await Transaction.create({ title: "Suite71 Pay 1", amount: 250, date: getTorontoOffsetDate(-20), type: "TRANSFER", fromAccountId: s71Checking.id, toAccountId: s71Family.id, isCleared: true, balanceApplied: true }));
+  s71Rows.push(await Transaction.create({ title: "Suite71 Pay 2", amount: 150, date: getTorontoOffsetDate(-5), type: "TRANSFER", fromAccountId: s71Checking.id, toAccountId: s71Family.id, isCleared: true, balanceApplied: true }));
+  s71Rows.push(await Transaction.create({ title: "Suite71 Pay later", amount: 999, date: getTorontoOffsetDate(400), type: "TRANSFER", fromAccountId: s71Checking.id, toAccountId: s71Family.id, isCleared: false }));
+  s71Rows.push(await Transaction.create({ title: "Suite71 Interest", amount: 30, date: getTorontoOffsetDate(-4), type: "EXPENSE", category: "Interest", fromAccountId: s71Family.id, isCleared: true, balanceApplied: true }));
+  const f71 = (await s71Get(`/api/export/widget.json?key=${s71Key}`)).body || {};
+  assert(
+    f71.debt1_name === "Suite71 Car Loan" && f71.debt1_balance === "$7,500" && f71.debt1_balance_raw === 7500 && f71.debt1_payment === "$350" &&
+      f71.debt1_due === "Nov 15" && f71.debt1_rate === "8.5%" && f71.debt1_pct_paid === 25,
+    `Debt with an original amount: % paid = (10,000 - 7,500) / 10,000 (got ${JSON.stringify(f71).match(/"debt1_[^}]*?"debt2_/)?.[0]})`
+  );
+  assert(
+    f71.debt2_name === "Suite71 Family Loan" && f71.debt2_pct_paid === 40 && f71.debt2_payment === "" && f71.debt2_due === "" && f71.debt2_rate === "",
+    `No original amount: % paid = 400 paid / (600 + 400), blanks for no payment, due date or rate (got ${f71.debt2_pct_paid}, "${f71.debt2_payment}", "${f71.debt2_due}", "${f71.debt2_rate}")`
+  );
+  assert(
+    f71.debt3_name === "Suite71 Fresh Loan" && f71.debt3_pct_paid === 0 && !("debt4_name" in f71),
+    `Neither original nor payments: 0% paid; only 3 debt slots (got ${f71.debt3_pct_paid}, debt4 ${"debt4_name" in f71})`
+  );
+  assert(
+    !/Suite71 Old Phone Plan/.test(JSON.stringify(f71)),
+    `An older paid-off debt doesn't push an owing debt off the widget (got ${f71.debt1_name}, ${f71.debt2_name}, ${f71.debt3_name})`
+  );
+  await s71Fourth.update({ isActive: false });
+  await s71Fresh.update({ isActive: false });
+  const g71 = (await s71Get(`/api/export/widget.json?key=${s71Key}`)).body || {};
+  assert(
+    g71.debt1_name === "Suite71 Car Loan" && g71.debt2_name === "Suite71 Family Loan" && g71.debt3_name === "Suite71 Old Phone Plan" &&
+      g71.debt3_balance === "$0" && g71.debt3_pct_paid === 100 && g71.debt3_payment === "",
+    `With fewer than 3 owing, a paid-off debt fills the spare slot at $0, 100%, no payment (got ${g71.debt3_name}, ${g71.debt3_balance}, ${g71.debt3_pct_paid}, "${g71.debt3_payment}")`
+  );
+  await s71Fresh.update({ isActive: true });
+  await s71Fourth.update({ isActive: true });
+  assert(
+    ["safe_to_spend", "bill1_title", "card1_name", "card1_pct", "goal1_pct", "month_pct", "as_of"].every((k) => k in f71),
+    "Existing widget keys are still there"
+  );
+  await request({ hostname: "localhost", port: 8000, path: "/api/export/widget-settings", method: "PUT", headers: authHeaders }, { hideAmounts: true });
+  const h71 = (await s71Get(`/api/export/widget.json?key=${s71Key}`)).body || {};
+  await request({ hostname: "localhost", port: 8000, path: "/api/export/widget-settings", method: "PUT", headers: authHeaders }, { hideAmounts: false });
+  assert(
+    h71.debt1_balance === "Owing" && h71.debt1_balance_raw === null && h71.debt1_payment === "Payment set" && h71.debt1_pct_paid === 25 &&
+      h71.debt2_pct_paid === 40 && h71.debt1_rate === "8.5%" && !/\$/.test(JSON.stringify(h71)),
+    `Hidden debts: words, null raw, % paid kept, no $ (got ${h71.debt1_balance}, ${h71.debt1_balance_raw}, ${h71.debt1_payment}, ${h71.debt1_pct_paid})`
+  );
+  const s71Route = await s71Get("/api/export/widget.json");
+  assert(s71Route.status === 401, `Widget feed still needs its key (got ${s71Route.status})`);
+  for (const t of s71Rows) await t.destroy({ force: true });
+  for (const d of [s71PaidOff, s71Loan, s71Family, s71Fresh, s71Fourth]) await d.destroy();
+  for (const d of s71Parked) await d.update({ isActive: true });
+
+  // Pure payload: empty slots, paid off, hide mode, fallbacks
+  const { buildWidgetPayload: s71Build, debtPctPaid } = require("../services/widgetFeedService");
+  const s71Base = {
+    forecast: { today: "2026-10-28", safeToSpend: 412.37, buffer: 200, nextPayday: "2026-11-06", lowestPoint: { date: "2026-11-05", balance: 612.37 }, incomeSource: "recurring", days: [] },
+    bills: [], month: { spent: 0, budget: 0, topCategory: "" }, cards: [], goals: [], todayStr: "2026-10-28", asOf: "Oct 28, 9:14 am",
+  };
+  const s71None = s71Build(s71Base);
+  const s71NoneHidden = s71Build(s71Base, { hideAmounts: true });
+  assert(
+    [1, 2, 3].every((n) => s71None[`debt${n}_name`] === "" && s71None[`debt${n}_balance`] === "" && s71None[`debt${n}_payment`] === "" && s71None[`debt${n}_due`] === "" &&
+      s71None[`debt${n}_rate`] === "" && s71None[`debt${n}_pct_paid`] === 0 && s71None[`debt${n}_balance_raw`] === 0 && s71NoneHidden[`debt${n}_balance_raw`] === null),
+    "Empty debt slots: empty strings, 0% paid, raw 0 (null when hidden), like cards"
+  );
+  const s71Paid = s71Build({ ...s71Base, debts: [{ name: "Done", balance: 0, original: 2000, paid: 0, payment: 0, due: null, rate: 19.99 }] }, { hideAmounts: true });
+  const s71PaidShown = s71Build({ ...s71Base, debts: [{ name: "Done", balance: 0, original: 2000, paid: 0, payment: 50, due: null, rate: 0 }] });
+  assert(s71PaidShown.debt1_payment === "" && s71PaidShown.debt1_balance === "$0", `A paid-off debt shows no payment (got "${s71PaidShown.debt1_payment}")`);
+  assert(s71Paid.debt1_balance === "Paid off" && s71Paid.debt1_pct_paid === 100 && s71Paid.debt1_rate === "19.99%", `Paid-off debt reads "Paid off" at 100% (got ${s71Paid.debt1_balance}, ${s71Paid.debt1_pct_paid})`);
+  assert(
+    debtPctPaid({ balance: 12000, original: 10000, paid: 0 }) === 0 && debtPctPaid({ balance: 7500, original: 10000, paid: 9999 }) === 25 &&
+      debtPctPaid({ balance: 300, original: 0, paid: 100 }) === 25 && debtPctPaid({ balance: 0, original: 0, paid: 0 }) === 0,
+    "% paid: interest above the original is 0, the original beats payments, payments fall back, nothing gives 0"
   );
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
