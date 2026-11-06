@@ -1102,7 +1102,7 @@ async function runTestSuite() {
     {
       name: "Compounding Tax Test",
       amount: 100.0,
-      category: "Utilities",
+      category: "Essentials",
       isTaxExclusive: true,
       taxRate: 13,
       date: "2099-12-01",
@@ -1200,7 +1200,7 @@ async function runTestSuite() {
     {
       name: "Due Bill 1",
       amount: 10.0,
-      category: "Bills & Utilities",
+      category: "Essentials",
       creditCardId: sweepCardId,
       due_date: todayStr,
       is_paid: false,
@@ -1217,7 +1217,7 @@ async function runTestSuite() {
     {
       name: "Due Bill 2",
       amount: 15.0,
-      category: "Bills & Utilities",
+      category: "Essentials",
       creditCardId: sweepCardId,
       due_date: todayStr,
       is_paid: false,
@@ -1289,7 +1289,7 @@ async function runTestSuite() {
     {
       name: "Tax New Amount Test",
       amount: 100.0,
-      category: "Utilities",
+      category: "Essentials",
       isTaxExclusive: true,
       taxRate: 13,
       date: "2099-12-01",
@@ -6057,8 +6057,8 @@ async function runTestSuite() {
   const s40Rows = [
     await s33("POST", "/api/expenses", { name: "Suite 40 Card Lunch", amount: 23.45, category: "Food & Drink", creditCardId: s40CardId, due_date: s40Today, is_paid: true }),
     await s33("POST", "/api/expenses", { name: "Payment for Suite 40 Visa", amount: 120.1, category: "Debt", targetAccountId: s40CardId, due_date: s40Today, is_paid: true }),
-    await s33("POST", "/api/expenses", { name: "Suite 40 Trip Saving", amount: 75.55, category: "Savings", targetAccountId: s40GoalId, due_date: s40Today, is_paid: true }),
-    await s33("POST", "/api/expenses", { name: "Suite 40 Groceries", amount: 41.2, category: "Groceries", due_date: s40Today, is_paid: true }),
+    await s33("POST", "/api/expenses", { name: "Suite 40 Trip Saving", amount: 75.55, category: "Savings Transfer", targetAccountId: s40GoalId, due_date: s40Today, is_paid: true }),
+    await s33("POST", "/api/expenses", { name: "Suite 40 Groceries", amount: 41.2, category: "Food & Drink", due_date: s40Today, is_paid: true }),
   ];
   assert(s40Rows.every((r) => r.status === 201), "Records a card purchase, a card payment, a goal contribution and a Checking expense");
   // A past-dated card purchase entered after the fact never touched the card balance
@@ -6118,8 +6118,11 @@ async function runTestSuite() {
 
   // 40.2 Deleted rows are left out of the forecast, subscriptions, export feed, Gemini context and backup
   const s40Bill = await s33("POST", "/api/expenses", { name: "Suite 40 Upcoming Bill", amount: 66.6, category: "Essentials", due_date: getTorontoOffsetDate(4), is_paid: false });
-  const s40Sub = await s33("POST", "/api/expenses", { name: "Suite 40 Streamflix", amount: 13.13, category: "Suite40Cat", due_date: s40Today, is_paid: true, recurrence: "monthly" });
+  const s40Sub = await s33("POST", "/api/expenses", { name: "Suite 40 Streamflix", amount: 13.13, category: "Subscription", due_date: s40Today, is_paid: true, recurrence: "monthly" });
   const s40SubGroup = s40Sub.body.recurringGroupId;
+  // A category no other row uses, so Gemini's spending total counts only this series (set in the
+  // table: POST /expenses accepts only the app's categories)
+  await Transaction.update({ category: "Suite40Cat" }, { where: { recurringGroupId: s40SubGroup } });
   const s40Forecast = async () => ((await s33("GET", "/api/forecast?days=30")).body.days || []).flatMap((d) => (d.items || []).map((i) => i.title));
   const s40Subs = async () => ((await s33("GET", "/api/subscriptions")).body.subscriptions || []).map((s) => s.name || s.title);
   const s40Config = await s33("GET", "/api/export/gemini-config");
@@ -6421,7 +6424,7 @@ async function runTestSuite() {
   );
 
   // 41.3 Cancelling a subscription whose newest row is One-time: nothing more
-  const s41Stream = await s33("POST", "/api/expenses", { name: "Suite 41 Streaming", amount: 20, category: "Subscriptions", due_date: getTorontoOffsetDate(0), is_paid: true, recurrence: "weekly" });
+  const s41Stream = await s33("POST", "/api/expenses", { name: "Suite 41 Streaming", amount: 20, category: "Subscription", due_date: getTorontoOffsetDate(0), is_paid: true, recurrence: "weekly" });
   const s41StreamGroup = s41Stream.body.recurringGroupId;
   const s41StreamRows = await s41Rows(s41StreamGroup);
   await s33("PUT", `/api/expenses/${s41StreamRows[s41StreamRows.length - 1].id}`, { recurrence: "none" });
@@ -6658,7 +6661,7 @@ async function runTestSuite() {
   assert((await s42End("not-a-uuid")).status === 400 && (await s42End(require("crypto").randomUUID())).status === 404, "A bad id is 400 and an unknown series is 404");
 
   // 42.5 Subscriptions cancel still works, now through the shared path
-  const s42Sub = await s33("POST", "/api/expenses", { name: "Suite 42 Music", amount: 11, category: "Subscriptions", due_date: s42Today, is_paid: true, recurrence: "weekly" });
+  const s42Sub = await s33("POST", "/api/expenses", { name: "Suite 42 Music", amount: 11, category: "Subscription", due_date: s42Today, is_paid: true, recurrence: "weekly" });
   const s42SubGroup = s42Sub.body.recurringGroupId;
   const s42SubUpcoming = (await s42Rows({ recurringGroupId: s42SubGroup })).filter((r) => r.date > s42Today).length;
   const s42Cancel = await s33("POST", `/api/subscriptions/${s42SubGroup}/cancel`);
@@ -9652,7 +9655,7 @@ async function runTestSuite() {
   console.log("\n--- Suite 63: Notes and tags on transactions (save, edit, Ledger filter, Gem feed) ---");
   const s63Today = getTorontoToday();
   const s63Lunch = await s33("POST", "/api/expenses", {
-    name: "Suite63 Lunch", amount: 18.25, due_date: s63Today, category: "Dining Out", is_paid: true,
+    name: "Suite63 Lunch", amount: 18.25, due_date: s63Today, category: "Food & Drink", is_paid: true,
     tags: ["#Work", "work", "  Trip   2026 "], notes: "  Client lunch, with Sam\nsplit later  ",
   });
   const s63Pay = await s33("POST", "/api/paycheques", { name: "Suite63 Bonus", amount: 500, payment_date: s63Today, tags: ["Work"] });
@@ -9730,7 +9733,7 @@ async function runTestSuite() {
 
   // A recurring bill's next occurrences keep its tags but not its note
   const s63Bill = await s33("POST", "/api/expenses", {
-    name: "Suite63 Gym", amount: 40, due_date: getTorontoOffsetDate(-1), category: "Health", is_paid: true, recurrence: "monthly",
+    name: "Suite63 Gym", amount: 40, due_date: getTorontoOffsetDate(-1), category: "Essentials", is_paid: true, recurrence: "monthly",
     tags: ["health"], notes: "Paid in cash this time",
   });
   const s63Next = await Transaction.findAll({ where: { recurringGroupId: s63Bill.body.recurringGroupId, id: { [Op.ne]: s63Bill.body.id } } });
@@ -9746,7 +9749,7 @@ async function runTestSuite() {
   const s64Long = `Suite64 long note ${"x".repeat(150)}`;
   const s64Made = [
     await s33("POST", "/api/expenses", { name: "=HYPERLINK(\"http://evil.example\",\"Suite64 click\")", amount: 5, due_date: s64Today, category: "Other", is_paid: true, tags: ["s64"] }),
-    await s33("POST", "/api/expenses", { name: "Suite64 Work lunch", amount: 21.5, due_date: s64Today, category: "Dining Out", is_paid: true, tags: ["s64", "work"], notes: "+1 for Sam, \"split\"" }),
+    await s33("POST", "/api/expenses", { name: "Suite64 Work lunch", amount: 21.5, due_date: s64Today, category: "Food & Drink", is_paid: true, tags: ["s64", "work"], notes: "+1 for Sam, \"split\"" }),
     await s33("POST", "/api/expenses", { name: "Suite64 Card gas", amount: 40, due_date: getTorontoOffsetDate(-3), category: "Transportation", is_paid: true, creditCardId: s64Card.id, tags: ["s64"], notes: s64Long }),
     await s33("POST", "/api/paycheques", { name: "Suite64 Pay", amount: 900, payment_date: getTorontoOffsetDate(-2), tags: ["s64"] }),
   ];
@@ -9796,7 +9799,7 @@ async function runTestSuite() {
     `A title starting with = and a note starting with + get a leading ' so a spreadsheet won't run them (got ${s64Evil?.[1]} / ${s64Lunch?.[8]})`
   );
   assert(
-    s64Lunch?.[0] === s64Today && s64Lunch[2] === "expense" && s64Lunch[3] === "Dining Out" && s64Lunch[4] === "Checking" &&
+    s64Lunch?.[0] === s64Today && s64Lunch[2] === "expense" && s64Lunch[3] === "Food & Drink" && s64Lunch[4] === "Checking" &&
       s64Lunch[5] === "21.50" && s64Lunch[6] === "yes" && s64Lunch[7] === "s64; work" &&
       s64Gas?.[4] === "Suite64 Visa" && s64Gas[8] === s64Long && s64ByTitle("Suite64 Pay")?.[2] === "income",
     `Row cells: date, type, category, the Ledger's account text, amount, paid, tags and the full note (got ${s64Lunch?.join("|")})`
@@ -10771,6 +10774,54 @@ async function runTestSuite() {
   else await Setting.destroy({ where: { key: s72StartKey } });
   if (s72EnabledBefore) await Setting.upsert({ key: s72EnabledKey, value: s72EnabledBefore.value });
   else await Setting.destroy({ where: { key: s72EnabledKey } });
+
+  // --- Suite 73: POST /expenses takes payment_date as the date and only known categories ---
+  console.log("\n--- Suite 73: New expenses: payment_date is the date, unknown categories get a 400 ---");
+  const s73Send = (method, path, body) => request({ hostname: "localhost", port: 8000, path, method, headers: authHeaders }, body);
+  const s73Ids = [];
+  const s73Post = async (body) => {
+    const res = await s73Send("POST", "/api/expenses", body);
+    if (res.body?.id) s73Ids.push(res.body.id);
+    return res;
+  };
+  const s73Date = getTorontoOffsetDate(-3);
+  const s73Paid = await s73Post({ name: "Suite73 payment_date only", amount: 12.5, payment_date: s73Date, category: "Shopping", is_paid: false });
+  const s73PaidRow = s73Paid.body?.id ? await Transaction.findByPk(s73Paid.body.id) : null;
+  assert(
+    s73Paid.status === 201 && s73PaidRow?.date === s73Date,
+    `An expense sent with only payment_date is saved on that day, not today (status ${s73Paid.status}, date ${s73PaidRow?.date})`
+  );
+  const s73Both = await s73Post({ name: "Suite73 both dates", amount: 3, due_date: getTorontoOffsetDate(-1), payment_date: s73Date, category: "Other", is_paid: false });
+  const s73BothRow = s73Both.body?.id ? await Transaction.findByPk(s73Both.body.id) : null;
+  assert(s73BothRow?.date === getTorontoOffsetDate(-1), `due_date wins when both dates are sent (got ${s73BothRow?.date})`);
+  const s73None = await s73Post({ name: "Suite73 no date", amount: 3, category: "Other", is_paid: false });
+  const s73NoneRow = s73None.body?.id ? await Transaction.findByPk(s73None.body.id) : null;
+  assert(s73NoneRow?.date === getTorontoToday(), `With no date the expense is today in Toronto (got ${s73NoneRow?.date})`);
+
+  for (const bad of ["Groceries", "Not a category", "Savings", 42]) {
+    const res = await s73Post({ name: "Suite73 bad category", amount: 5, category: bad, is_paid: false });
+    assert(
+      res.status === 400 && (res.body?.details || []).some((d) => d.field === "category"),
+      `Category ${JSON.stringify(bad)} is refused with a 400 on the category field (status ${res.status})`
+    );
+  }
+  const s73Allowed = [
+    "Essentials", "Food & Drink", "Shopping", "Subscription", "Transportation", "Entertainment", "Debt", "Other",
+    "Income", "Interest", "Adjustment", "Savings Transfer", "Refund", "Credit Card Payment", "Debt Payment",
+  ];
+  const s73Results = [];
+  for (const category of s73Allowed) {
+    const res = await s73Post({ name: `Suite73 ${category}`, amount: 1, category, due_date: getTorontoOffsetDate(30) });
+    s73Results.push(`${category}:${res.status}`);
+  }
+  assert(s73Results.every((r) => r.endsWith(":201")), `Every expense and system category is accepted (${s73Results.join(", ")})`);
+  const s73Case = await s73Post({ name: "Suite73 lower case", amount: 1, category: "  food &  drink ", due_date: getTorontoOffsetDate(30) });
+  const s73CaseRow = s73Case.body?.id ? await Transaction.findByPk(s73Case.body.id) : null;
+  assert(s73Case.status === 201 && s73CaseRow?.category === "Food & Drink", `Case and spacing are forgiven and saved as "Food & Drink" (got ${s73CaseRow?.category})`);
+  const s73Blank = await s73Post({ name: "Suite73 blank category", amount: 1, category: "", due_date: getTorontoOffsetDate(30) });
+  const s73BlankRow = s73Blank.body?.id ? await Transaction.findByPk(s73Blank.body.id) : null;
+  assert(s73Blank.status === 201 && s73BlankRow?.category === "Other", `A blank category still falls back to the rules, then Other (got ${s73Blank.status} ${s73BlankRow?.category})`);
+  await Transaction.destroy({ where: { id: { [Op.in]: s73Ids } }, force: true });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
