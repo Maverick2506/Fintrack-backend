@@ -10805,23 +10805,55 @@ async function runTestSuite() {
       `Category ${JSON.stringify(bad)} is refused with a 400 on the category field (status ${res.status})`
     );
   }
+  // Payment, interest and adjustment rows are posted with their card or debt
+  const s73Card = await Account.create({ name: "Suite73 Card", type: "CREDIT_CARD", initialBalance: 0, creditLimit: 1000, isActive: true });
+  const s73Debt = await Account.create({ name: "Suite73 Loan", type: "DEBT", initialBalance: 500, targetAmount: 500, isActive: true });
+  const s73With = {
+    Interest: { creditCardId: s73Card.id },
+    Adjustment: { creditCardId: s73Card.id },
+    "Credit Card Payment": { targetAccountId: s73Card.id },
+    "Debt Payment": { targetAccountId: s73Debt.id },
+  };
   const s73Allowed = [
     "Essentials", "Food & Drink", "Shopping", "Subscription", "Transportation", "Entertainment", "Debt", "Other",
     "Income", "Interest", "Adjustment", "Savings Transfer", "Refund", "Credit Card Payment", "Debt Payment",
   ];
   const s73Results = [];
   for (const category of s73Allowed) {
-    const res = await s73Post({ name: `Suite73 ${category}`, amount: 1, category, due_date: getTorontoOffsetDate(30) });
+    const res = await s73Post({ name: `Suite73 ${category}`, amount: 1, category, due_date: getTorontoOffsetDate(30), ...(s73With[category] || {}) });
     s73Results.push(`${category}:${res.status}`);
   }
   assert(s73Results.every((r) => r.endsWith(":201")), `Every expense and system category is accepted (${s73Results.join(", ")})`);
+  // Without their card or debt they'd be a plain Checking expense counted as spending: refused
+  const s73Plain = [];
+  for (const category of Object.keys(s73With)) {
+    const res = await s73Post({ name: "Suite73 plain", amount: 4, category: category.toLowerCase(), due_date: getTorontoOffsetDate(30) });
+    s73Plain.push(`${category}:${res.status}:${(res.body?.details || []).some((d) => d.field === "category")}`);
+  }
+  assert(
+    s73Plain.every((r) => r.endsWith(":400:true")),
+    `Card/debt payments, Interest and Adjustment with no card or debt get a 400 on category (${s73Plain.join(", ")})`
+  );
   const s73Case = await s73Post({ name: "Suite73 lower case", amount: 1, category: "  food &  drink ", due_date: getTorontoOffsetDate(30) });
   const s73CaseRow = s73Case.body?.id ? await Transaction.findByPk(s73Case.body.id) : null;
   assert(s73Case.status === 201 && s73CaseRow?.category === "Food & Drink", `Case and spacing are forgiven and saved as "Food & Drink" (got ${s73CaseRow?.category})`);
   const s73Blank = await s73Post({ name: "Suite73 blank category", amount: 1, category: "", due_date: getTorontoOffsetDate(30) });
   const s73BlankRow = s73Blank.body?.id ? await Transaction.findByPk(s73Blank.body.id) : null;
-  assert(s73Blank.status === 201 && s73BlankRow?.category === "Other", `A blank category still falls back to the rules, then Other (got ${s73Blank.status} ${s73BlankRow?.category})`);
+  assert(s73Blank.status === 201 && s73BlankRow?.category === "Other", `A blank category with no matching rule is Other (got ${s73Blank.status} ${s73BlankRow?.category})`);
+  const { Rule: s73RuleModel } = require("../models");
+  const s73Rule = await s73RuleModel.create({ match: "suite73probe", category: "Entertainment", priority: 0 });
+  const s73Ruled = await s73Post({ name: "Suite73Probe tickets", amount: 1, category: "", due_date: getTorontoOffsetDate(30) });
+  const s73RuledRow = s73Ruled.body?.id ? await Transaction.findByPk(s73Ruled.body.id) : null;
+  const s73Missing = await s73Post({ name: "Suite73Probe again", amount: 1, due_date: getTorontoOffsetDate(30) });
+  const s73MissingRow = s73Missing.body?.id ? await Transaction.findByPk(s73Missing.body.id) : null;
+  assert(
+    s73RuledRow?.category === "Entertainment" && s73MissingRow?.category === "Entertainment",
+    `A blank or missing category still lets a rule pick it (got ${s73RuledRow?.category}, ${s73MissingRow?.category})`
+  );
+  await s73Rule.destroy();
   await Transaction.destroy({ where: { id: { [Op.in]: s73Ids } }, force: true });
+  await s73Card.destroy({ force: true });
+  await s73Debt.destroy({ force: true });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

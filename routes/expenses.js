@@ -37,6 +37,15 @@ const {
   restoreTransactions,
   listTrash,
 } = require("../services/trashService");
+
+// Categories POST /expenses takes only with an account: "target" = a card or debt being paid,
+// "any" = charged to a card or posted on a card/debt (not a plain Checking expense)
+const ACCOUNT_ONLY_CATEGORIES = {
+  "Credit Card Payment": "target",
+  "Debt Payment": "target",
+  Interest: "any",
+  Adjustment: "any",
+};
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -378,6 +387,24 @@ router.post(
           transaction: dbTx,
         });
         if (cardAccount) fromAccount = cardAccount;
+      }
+
+      // The app's payment, interest and adjustment categories describe money moving on a card or
+      // debt. On a plain Checking expense they'd count as everyday spending, so they need one.
+      const needsAccount = ACCOUNT_ONLY_CATEGORIES[finalCategory];
+      if (needsAccount === "target" && !resolvedToAccountId) {
+        await dbTx.rollback();
+        return res.status(400).json({
+          error: `A ${finalCategory} needs the card or debt it pays.`,
+          details: [{ field: "category", message: `${finalCategory} needs targetAccountId or toAccountId` }],
+        });
+      }
+      if (needsAccount === "any" && !resolvedToAccountId && fromAccount.type === "CHECKING") {
+        await dbTx.rollback();
+        return res.status(400).json({
+          error: `${finalCategory} is recorded on a card or debt, not on Checking.`,
+          details: [{ field: "category", message: `${finalCategory} needs creditCardId, targetAccountId or toAccountId` }],
+        });
       }
 
       // Default to cleared (paid) if expense date is today or in the past, unless explicitly specified
