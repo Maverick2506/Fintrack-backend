@@ -29,6 +29,7 @@ const { usesArchivedAccount } = require("../services/accountArchiveService");
 const { setBalanceAnchor } = require("../services/balanceAnchorService");
 const { getClearedMonthTotals } = require("../services/trendsService");
 const { getSinkingFunds } = require("../services/sinkingFundService");
+const { getNextManualDebtPayments } = require("../services/forecastService");
 
 router.get(
   "/dashboard",
@@ -181,6 +182,14 @@ router.get(
 
     const checkingCurrentBalance = balancesSummary.checking;
 
+    // The next payment of each debt paid by hand, as the forecast projects it, within the same
+    // window as the bills (an overdue one is due today)
+    const upcomingDebtPayments = isPastMonth
+      ? []
+      : (await getNextManualDebtPayments({ todayStr, endDateStr: endOfMonth })).filter(
+          (p) => p.date >= upcomingStartDate && p.date <= endOfMonth
+        );
+
     const spendingSummary = (spendingByCategoryRaw || []).map((item) => ({
       name: item.category,
       value: parseFloat(item.total_amount),
@@ -203,6 +212,7 @@ router.get(
         currentBalance: checkingCurrentBalance,
       },
       upcomingBills: upcomingBills.filter((b) => !usesArchivedAccount(b)),
+      upcomingDebtPayments,
       debtSummary,
       savingsSummary,
       creditCardSummary,
