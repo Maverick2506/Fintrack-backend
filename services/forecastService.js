@@ -1,5 +1,6 @@
 const { Account, Transaction, Setting } = require("../models");
 const { Op } = require("sequelize");
+const { toZonedTime, format } = require("date-fns-tz");
 const { getTodayString } = require("./accountBalanceService");
 const { getBalancesSummary } = require("./netWorthService");
 const { getPrimaryCheckingAccount } = require("./checkingService");
@@ -15,6 +16,9 @@ const {
   interestClientRef,
   isDebtInterestEnabled,
   projectDebtSchedule,
+  getDebtAnchorDay,
+  getNextDebtDueDate,
+  getPreviousDebtDueDate,
 } = require("./debtInterestService");
 const { getCardStatement, getPendingCardCharges } = require("./statementService");
 const { getSinkingFunds, getCardFundBills, getChargeStatementDate } = require("./sinkingFundService");
@@ -115,6 +119,164 @@ const addExpectedPay = ({ daysMap, todayStr, endDateStr, expectedPay }) => {
 // "$1,200" or "$1,150.50", for forecast line titles
 const formatMoney = (n) =>
   `$${n.toLocaleString("en-US", Number.isInteger(n) ? {} : { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+// A debt paid by hand: auto-pay off, a minimum payment and a due date
+const isManualDebt = (debt) =>
+  !debt.autoPay && (parseFloat(debt.minimumPayment) || 0) > 0 && Boolean(debt.dueDate);
+
+// Rows paid to a debt that are not payments (an old mislabelled statement sync)
+const NOT_A_PAYMENT_CATEGORIES = ["Interest"];
+
+/**
+ * Manual debt payments: each due date of a debt paid by hand is a planned Checking outflow of
+ * min(balance, minimum payment), with interest first, exactly like an auto-pay
+ * (debtInterestService.projectDebtSchedule). A due date is skipped when a TRANSFER to the debt
+ * already falls in its cycle (previous due date, due date]; an overdue due date's cycle runs to
+ * today. Each payment covers one due date. Nothing is projected past a $0 balance.
+ *
+ * The daily sweep moves a manual debt's due date on once it passes, so the due date before the
+ * stored one is still owed when nothing was paid in its cycle (the missed payment the Debts page
+ * flags): it is projected as overdue, paid today. A debt added after that date never had it.
+ *
+ * plannedTransfers: [{ debtId, date }] payments projected from recurring series (not rows yet).
+ * Returns { schedule, payments: [{ dueDate, date, amount, overdue }] }.
+ */
+const projectManualDebt = async (
+  debt,
+  { todayStr, endDateStr, interestEnabled, interestStartDate, plannedTransfers = [], dbTx = null }
+) => {
+  const frequency = debt.paymentFrequency || "monthly";
+  const anchorDay = getDebtAnchorDay(debt);
+  const prevDue = (d) => getPreviousDebtDueDate(d, frequency, anchorDay);
+  const payDateOf = (d) => (d < todayStr ? todayStr : d);
+  const createdStr = debt.createdAt
+    ? format(toZonedTime(new Date(debt.createdAt), "America/Toronto"), "yyyy-MM-dd")
+    : null;
+
+  // The due date before the stored one, while it has passed (or is today) and the debt existed
+  let fromDate = debt.dueDate;
+  const lastDue = debt.dueDate > todayStr ? prevDue(debt.dueDate) : null;
+  if (lastDue && lastDue <= todayStr && (!createdStr || lastDue >= createdStr)) fromDate = lastDue;
+  // A stored due date several periods back (edited to the past, or a restored debt the sweep skipped)
+  // owes one overdue payment, like the Debts page's missed-payment flag: the latest due date by today
+  for (let next = getNextDebtDueDate(fromDate, frequency, anchorDay), guard = 0; next && next <= todayStr && guard < 600; next = getNextDebtDueDate(next, frequency, anchorDay), guard++) {
+    fromDate = next;
+  }
+  const lowerBound = prevDue(fromDate) || fromDate;
+
+  const rows = await Transaction.findAll({
+    where: {
+      type: "TRANSFER",
+      toAccountId: debt.id,
+      date: { [Op.gt]: lowerBound },
+      [Op.or]: [{ category: null }, { category: { [Op.notIn]: NOT_A_PAYMENT_CATEGORIES } }],
+    },
+    attributes: ["date"],
+    raw: true,
+    transaction: dbTx,
+  });
+  const payments = [
+    ...rows.map((r) => r.date),
+    ...plannedTransfers.filter((p) => p.debtId === debt.id).map((p) => p.date),
+  ]
+    .sort()
+    .map((date) => ({ date, used: false }));
+
+  // Interest the sweep already recorded (also a deleted one: it is not charged again)
+  const dueDates = [];
+  for (let d = fromDate, guard = 0; d && d <= endDateStr && guard < 600; d = getNextDebtDueDate(d, frequency, anchorDay), guard++) {
+    dueDates.push(d);
+  }
+  const recorded = dueDates.length
+    ? await Transaction.findAll({
+        where: { clientRef: { [Op.in]: dueDates.map((d) => interestClientRef(debt.id, d)) } },
+        attributes: ["clientRef"],
+        paranoid: false,
+        raw: true,
+        transaction: dbTx,
+      })
+    : [];
+  const recordedRefs = new Set(recorded.map((r) => r.clientRef));
+
+  const schedule = projectDebtSchedule({
+    balance: debt.initialBalance,
+    apr: debt.interestRate,
+    minimumPayment: debt.minimumPayment,
+    // Projected like an auto-pay: the minimum payment on each due date, the last one capped at the balance
+    autoPay: true,
+    dueDate: fromDate,
+    dueDay: debt.dueDay,
+    frequency,
+    fromDate,
+    toDate: endDateStr,
+    interestEnabled,
+    interestStartDate,
+    handledFor: (dueDate) => {
+      const start = prevDue(dueDate);
+      const end = payDateOf(dueDate);
+      const paid = payments.find((p) => !p.used && (!start || p.date > start) && p.date <= end);
+      if (paid) paid.used = true;
+      // A due date before the stored one has passed the sweep, which recorded its interest then
+      const interest = dueDate < debt.dueDate || recordedRefs.has(interestClientRef(debt.id, dueDate));
+      return { interest, payment: Boolean(paid) };
+    },
+  });
+
+  return {
+    schedule,
+    payments: schedule
+      .filter((step) => step.payment > 0)
+      .map((step) => ({
+        dueDate: step.date,
+        date: payDateOf(step.date),
+        amount: step.payment,
+        overdue: step.date < todayStr,
+      })),
+  };
+};
+
+/**
+ * Manual debt payments for the Dashboard's Upcoming Bills, read from the forecast itself (so a payment
+ * a recurring transfer already covers is never offered): each debt's first projected payment dated
+ * between fromStr and toStr. An overdue payment is dated today.
+ * Returns [{ debtId, name, title, dueDate, date, amount, overdue, balance, minimumPayment }].
+ */
+const getManualDebtPaymentsBetween = async ({ todayStr, fromStr, toStr, dbTx = null }) => {
+  if (toStr < todayStr) return [];
+  const horizon = Math.min(dayDiff(toStr, todayStr) + 1, 365);
+  const forecast = await getForecast(horizon, dbTx, [], { todayStr });
+  const debts = await Account.findAll({
+    where: { id: { [Op.in]: (forecast.debts || []).filter((d) => d.manual).map((d) => d.id) } },
+    transaction: dbTx,
+  });
+  const rows = [];
+  for (const debt of debts.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))) {
+    let found = null;
+    for (const day of forecast.days) {
+      if (day.date < fromStr || day.date > toStr) continue;
+      const item = day.items.find((it) => it.debtId === debt.id);
+      if (item) {
+        found = { day, item };
+        break;
+      }
+    }
+    if (!found) continue;
+    rows.push({
+      debtId: debt.id,
+      name: debt.name,
+      title: found.item.title,
+      dueDate: found.item.dueDate,
+      date: found.day.date,
+      amount: Math.round(-found.item.amount * 100) / 100,
+      overdue: Boolean(found.item.overdue),
+      balance: parseFloat(debt.initialBalance) || 0,
+      minimumPayment: parseFloat(debt.minimumPayment) || 0,
+    });
+  }
+  return rows;
+};
+
+const manualDebtTitle = (name) => `${name} payment`;
 
 /**
  * Computes a day-by-day cashflow forecast for checking account over N days.
@@ -543,9 +705,11 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     sinkingFunds.push({ id: goalId, name: fund.name, monthly: fund.monthly, dueDate: fund.dueDate, plannedDates, billInWindow: false });
   }
 
-  // 4. Debts: interest on each due date, then auto-pay, projected exactly as the daily sweep runs them
-  //    (debtInterestService.projectDebtSchedule). Only auto-pay leaves Checking; interest changes how
-  //    much is owed, and so the size of the last payment. Non-auto-pay debts are projected for `debts`.
+  // 4. Debts: interest on each due date, then the payment, projected exactly as the daily sweep runs
+  //    them (debtInterestService.projectDebtSchedule). Interest changes how much is owed, and so the
+  //    size of the last payment. Auto-pay and manual payments (a debt paid by hand with a minimum
+  //    payment and a due date, projectManualDebt) leave Checking; a manual one is skipped when the
+  //    debt was already paid in that cycle. Debts with no minimum payment are projected for `debts`.
   const [interestEnabled, interestStartSetting, activeDebts] = await Promise.all([
     isDebtInterestEnabled(Setting, dbTx),
     Setting.findByPk(DEBT_INTEREST_START_KEY, { transaction: dbTx }),
@@ -564,8 +728,35 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   const interestStartDate = interestStartSetting ? interestStartSetting.value : todayStr;
   const debtProjections = [];
 
+  // Payments to a debt projected from a recurring series (step 3); rows are read by projectManualDebt
+  const plannedDebtTransfers = Object.values(daysMap).flatMap((day) =>
+    day.items.filter((it) => it.virtual && it.toAccountId).map((it) => ({ debtId: it.toAccountId, date: day.date }))
+  );
+  const manualDebtPayments = [];
+
   for (const debt of activeDebts) {
     const minPay = parseFloat(debt.minimumPayment) || 0;
+    if (isManualDebt(debt)) {
+      const { schedule, payments } = await projectManualDebt(debt, {
+        todayStr, endDateStr, interestEnabled, interestStartDate, plannedTransfers: plannedDebtTransfers, dbTx,
+      });
+      for (const p of payments) {
+        if (!daysMap[p.date]) continue;
+        daysMap[p.date].items.push({
+          title: manualDebtTitle(debt.name),
+          amount: -p.amount,
+          type: "debt",
+          debtId: debt.id,
+          dueDate: p.dueDate,
+          ...(p.overdue ? { overdue: true } : {}),
+        });
+      }
+      if (payments.length) {
+        manualDebtPayments.push({ debtId: debt.id, name: debt.name, title: manualDebtTitle(debt.name), ...payments[0] });
+      }
+      debtProjections.push({ id: debt.id, name: debt.name, manual: true, schedule });
+      continue;
+    }
     const autoPay = Boolean(debt.autoPay) && minPay > 0;
     const schedule = projectDebtSchedule({
       balance: debt.initialBalance,
@@ -648,6 +839,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         ...(it.type === "card" ? { statement: true } : {}),
         ...(it.capped ? { capped: true, scheduledAmount: it.scheduledAmount } : {}),
         ...(it.fundCovers ? { fundCovers: it.fundCovers, billAmount: it.billAmount } : {}),
+        ...(it.debtId ? { debtId: it.debtId, dueDate: it.dueDate } : {}),
+        ...(it.overdue ? { overdue: true } : {}),
       })),
     };
     days.push(dayObj);
@@ -728,6 +921,8 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
     // A pay_title that doesn't form a valid series is ignored for now (automatic detection runs instead)
     payOverrideIgnored: payContext.overrideIgnored,
     debts: debtProjections,
+    // The next payment of each debt paid by hand (in the days above): { debtId, name, title, dueDate, date, amount, overdue }
+    manualDebtPayments,
     cardPayments,
     sinkingFunds,
   };
@@ -735,5 +930,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
 module.exports = {
   getForecast,
+  getManualDebtPaymentsBetween,
+  isManualDebt,
   addCalendarDays,
 };

@@ -83,8 +83,13 @@ const findMissedPayment = (debt, payments, todayStr) => {
   }
   const frequency = debt.paymentFrequency || "monthly";
   const anchorDay = getDebtAnchorDay(debt);
-  const lastDue =
+  let lastDue =
     debt.dueDate < todayStr ? debt.dueDate : getPreviousDebtDueDate(debt.dueDate, frequency, anchorDay);
+  // A due date stored several periods back (edited to the past, or a restored debt the sweep skipped):
+  // the latest one before today is the missed one, as the forecast counts it
+  for (let next = lastDue && getNextDebtDueDate(lastDue, frequency, anchorDay), guard = 0; next && next < todayStr && guard < 600; next = getNextDebtDueDate(next, frequency, anchorDay), guard++) {
+    lastDue = next;
+  }
   // On the due day itself the payment may still come; a debt added after it never had that due date
   if (!lastDue || lastDue >= todayStr) return null;
   const createdStr = debt.createdAt

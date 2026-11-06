@@ -1598,6 +1598,12 @@ Upcoming Unpaid Bills:
 ${
   upcomingBills.map((b) => `  * ${b.date}: ${b.title} ($${parseFloat(b.amount).toFixed(2)})`).join("\n") || "  None"
 }
+Upcoming Manual Debt Payments (not auto-pay; already in Safe to Spend):
+${
+  (forecast.manualDebtPayments || [])
+    .map((p) => `  * ${p.date}: ${p.title} ($${p.amount.toFixed(2)})${p.overdue ? ` (overdue since ${p.dueDate})` : ""}`)
+    .join("\n") || "  None"
+}
 Budgets:
 ${
   budgets.map((b) => `  * ${b.category}: $${parseFloat(b.monthlyLimit).toFixed(2)} limit`).join("\n") || "  None"
