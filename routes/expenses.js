@@ -37,6 +37,17 @@ const {
   restoreTransactions,
   listTrash,
 } = require("../services/trashService");
+
+// Categories POST /expenses takes only with an account: "target" = a card or debt being paid
+// (targetAccountId/toAccountId); "card" = charged to a credit card (creditCardId) with no target,
+// since a target would make it a payment that lowers the card or debt instead of raising it.
+// Interest and adjustments on a debt come from the daily sweep and Sync with statement.
+const ACCOUNT_ONLY_CATEGORIES = {
+  "Credit Card Payment": "target",
+  "Debt Payment": "target",
+  Interest: "card",
+  Adjustment: "card",
+};
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -378,6 +389,24 @@ router.post(
           transaction: dbTx,
         });
         if (cardAccount) fromAccount = cardAccount;
+      }
+
+      // The app's payment, interest and adjustment categories describe money moving on a card or
+      // debt. On a plain Checking expense they'd count as everyday spending, so they need one.
+      const needsAccount = ACCOUNT_ONLY_CATEGORIES[finalCategory];
+      if (needsAccount === "target" && !resolvedToAccountId) {
+        await dbTx.rollback();
+        return res.status(400).json({
+          error: `A ${finalCategory} needs the card or debt it pays.`,
+          details: [{ field: "category", message: `${finalCategory} needs targetAccountId or toAccountId` }],
+        });
+      }
+      if (needsAccount === "card" && (resolvedToAccountId || fromAccount.type !== "CREDIT_CARD")) {
+        await dbTx.rollback();
+        return res.status(400).json({
+          error: `${finalCategory} is charged to a credit card. Send the card as creditCardId, with no target account.`,
+          details: [{ field: "category", message: `${finalCategory} needs creditCardId and no targetAccountId/toAccountId` }],
+        });
       }
 
       // Default to cleared (paid) if expense date is today or in the past, unless explicitly specified

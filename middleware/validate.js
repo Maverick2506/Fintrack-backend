@@ -69,12 +69,27 @@ const optionalSeriesId = z.preprocess(
   z.string().uuid("Invalid bill").nullable().optional()
 );
 
-const { EXPENSE_CATEGORIES } = require("../constants/categories");
+const { EXPENSE_CATEGORIES, TRANSACTION_CATEGORIES, canonicalCategory } = require("../constants/categories");
 const { DATE_FORMATS, MAX_IMPORT_ROWS } = require("../utils/csvImport");
 
 const ruleCategory = z.preprocess(
   (v) => (v === "" ? null : v),
   z.enum(EXPENSE_CATEGORIES, { message: "Pick one of the expense categories" }).nullable().optional()
+);
+
+// A new transaction's category: one of the expense categories or the app's own ones, in any case.
+// Empty means "let the rules pick".
+const transactionCategory = z.preprocess(
+  (v) => {
+    if (v === "" || v === null || v === undefined) return undefined;
+    if (typeof v !== "string") return v;
+    return canonicalCategory(v) || v;
+  },
+  z
+    .enum(TRANSACTION_CATEGORIES, {
+      message: `Category must be one of: ${TRANSACTION_CATEGORIES.join(", ")}`,
+    })
+    .optional()
 );
 
 const columnIndex = z.coerce.number().int().min(0).max(49);
@@ -131,7 +146,7 @@ const schemas = {
     amount: z.coerce.number().positive("Amount must be greater than 0"),
     due_date: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").optional(),
     payment_date: z.string().regex(dateRegex, "Invalid date format (YYYY-MM-DD)").optional(),
-    category: z.string().trim().max(100).optional(),
+    category: transactionCategory,
     is_paid: z.boolean().optional(),
     creditCardId: optionalAccountId,
     targetAccountId: optionalAccountId,
@@ -149,7 +164,10 @@ const schemas = {
     clientRef: z.string().uuid().nullable().optional(),
     notes: notesField,
     tags: tagsField,
-  }),
+  })
+    // An expense's date is due_date; a client that sends payment_date (the income field) alone
+    // means that day, not today
+    .transform(({ payment_date, ...body }) => ({ ...body, due_date: body.due_date || payment_date })),
 
   updateExpense: z.object({
     name: z.string().trim().min(1).max(255).optional(),
