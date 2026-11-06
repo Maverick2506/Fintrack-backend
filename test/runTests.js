@@ -10748,6 +10748,20 @@ async function runTestSuite() {
     `Next month's Dashboard lists the payment due then, even though an earlier one is due first (got ${JSON.stringify(s72LiveNext)}, forecast ${s72LiveFcNext?.date})`
   );
 
+  // A due date stored several periods back: the Debts page flags the same missed due date the Dashboard shows overdue
+  const s72OldDue = getTorontoOffsetDate(-75);
+  const s72Old = await s72Debt({ name: "Suite72 Old Due", initialBalance: 800, targetAmount: 800, minimumPayment: 40, dueDate: s72OldDue, dueDay: parseInt(s72OldDue.slice(8), 10) });
+  await sequelize.query("UPDATE Accounts SET createdAt = :c WHERE id = :id", { replacements: { c: `${getTorontoOffsetDate(-200)} 12:00:00.000 +00:00`, id: s72Old.id } });
+  const s72OldRow = ((await s72Send("GET", `/api/dashboard?year=${s72Y}&month=${s72M}`)).body?.upcomingDebtPayments || []).find((p) => p.debtId === s72Old.id);
+  const s72OldFlag = ((await s72Send("GET", "/api/debts")).body || []).find((d) => d.id === s72Old.id)?.missed_payment_due_date;
+  assert(
+    s72OldRow && s72OldRow.dueDate > getTorontoOffsetDate(-45) &&
+      (s72OldRow.dueDate === s72RealToday
+        ? s72OldRow.overdue === false && s72OldFlag < s72RealToday
+        : s72OldRow.overdue === true && s72OldRow.dueDate === s72OldFlag),
+    `One overdue payment, and the Debts page flags the same due date (Dashboard ${s72OldRow?.dueDate}, Debts page ${s72OldFlag})`
+  );
+
   const s72PastDash = (await s72Send("GET", `/api/dashboard?year=${s72Y - 1}&month=${s72M}`)).body || {};
   assert(Array.isArray(s72PastDash.upcomingDebtPayments) && s72PastDash.upcomingDebtPayments.length === 0, "A past month lists no manual debt payments");
 
