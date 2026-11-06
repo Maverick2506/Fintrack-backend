@@ -10834,6 +10834,31 @@ async function runTestSuite() {
     s73Plain.every((r) => r.endsWith(":400:true")),
     `Card/debt payments, Interest and Adjustment with no card or debt get a 400 on category (${s73Plain.join(", ")})`
   );
+  // Interest and Adjustment are charged to a card; sent with a debt or card as the target they'd be
+  // a payment that lowers it instead
+  const s73DebtBefore = parseFloat((await Account.findByPk(s73Debt.id)).initialBalance);
+  const s73Targeted = [];
+  for (const [category, extra] of [
+    ["Interest", { targetAccountId: s73Debt.id }],
+    ["Adjustment", { toAccountId: s73Debt.id }],
+    ["Interest", { targetAccountId: s73Card.id }],
+    ["Interest", { creditCardId: s73Card.id, targetAccountId: s73Debt.id }],
+  ]) {
+    const res = await s73Post({ name: "Suite73 targeted", amount: 10, category, is_paid: true, ...extra });
+    s73Targeted.push(`${category}:${res.status}:${/creditCardId/.test(res.body?.details?.[0]?.message || "")}`);
+  }
+  const s73DebtAfter = parseFloat((await Account.findByPk(s73Debt.id)).initialBalance);
+  assert(
+    s73Targeted.every((r) => r.endsWith(":400:true")) && s73DebtAfter === s73DebtBefore,
+    `Interest/Adjustment with a target account get a 400 that asks for creditCardId, and the debt is unchanged (${s73Targeted.join(", ")}; debt ${s73DebtBefore} -> ${s73DebtAfter})`
+  );
+  const s73CardBefore = parseFloat((await Account.findByPk(s73Card.id)).initialBalance);
+  const s73CardInterest = await s73Post({ name: "Suite73 card interest", amount: 10, category: "Interest", creditCardId: s73Card.id, is_paid: true });
+  const s73CardAfter = parseFloat((await Account.findByPk(s73Card.id)).initialBalance);
+  assert(
+    s73CardInterest.status === 201 && Math.round((s73CardAfter - s73CardBefore) * 100) === 1000,
+    `Interest charged to a card raises what the card owes by $10 (${s73CardBefore} -> ${s73CardAfter})`
+  );
   const s73Case = await s73Post({ name: "Suite73 lower case", amount: 1, category: "  food &  drink ", due_date: getTorontoOffsetDate(30) });
   const s73CaseRow = s73Case.body?.id ? await Transaction.findByPk(s73Case.body.id) : null;
   assert(s73Case.status === 201 && s73CaseRow?.category === "Food & Drink", `Case and spacing are forgiven and saved as "Food & Drink" (got ${s73CaseRow?.category})`);
