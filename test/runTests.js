@@ -10621,6 +10621,15 @@ async function runTestSuite() {
     `Last payment capped at the balance, none after $0 (got ${s72Items(s72F, "Suite72 Small payment").map((i) => `${i.date}:${i.amount}`).join(",")})`
   );
 
+  // 72.5b A stored due date several periods back (edited to the past) owes one overdue payment today, not three
+  const s72Stale = await s72Debt({ name: "Suite72 Stale", initialBalance: 2000, minimumPayment: 100, dueDate: "2027-03-20", dueDay: 20 });
+  s72F = await s72Fc();
+  assert(
+    s72Items(s72F, "Suite72 Stale payment").map((i) => `${i.date}:${i.amount}:${i.dueDate}`).join(",") ===
+      "2027-06-10:-100:2027-05-20,2027-06-20:-100:2027-06-20,2027-07-20:-100:2027-07-20",
+    `Only the latest passed due date (May 20) is overdue today (got ${s72Items(s72F, "Suite72 Stale payment").map((i) => `${i.date}:${i.dueDate}`).join(",")})`
+  );
+
   // 72.6 Bi-weekly: every 14 days; the payment on Jun 5 covers the Jun 3 due date
   const s72Bi = await s72Debt({ name: "Suite72 Biweekly", initialBalance: 1000, minimumPayment: 60, paymentFrequency: "bi-weekly", dueDate: "2027-06-17", dueDay: 17 });
   await s72Pay(s72Bi, "2027-06-05", 60);
@@ -10708,6 +10717,37 @@ async function runTestSuite() {
     "After paying, the overdue payment leaves Upcoming Bills and the forecast"
   );
   assert((await Account.findByPk(s72Overdue.id)).dueDate === getTorontoOffsetDate(-1), "Paying doesn't move the due date (the sweep does)");
+  // A recurring transfer to the debt in the cycle covers it: neither the forecast nor Upcoming Bills offers it
+  const s72Gym = await s72Debt({ name: "Suite72 Gym", initialBalance: 500, targetAmount: 500, minimumPayment: 50, dueDate: getTorontoOffsetDate(12), dueDay: parseInt(getTorontoOffsetDate(12).slice(8), 10) });
+  s72Rows.push(await Transaction.create({
+    title: "Payment for Suite72 Gym", amount: 50, date: getTorontoOffsetDate(-20), type: "TRANSFER", category: "Debt",
+    fromAccountId: s72Checking.id, toAccountId: s72Gym.id, isCleared: true, balanceApplied: true,
+    recurrence: "monthly", recurringGroupId: crypto.randomUUID(),
+  }));
+  const s72GymFc = (await s72Send("GET", "/api/forecast?days=60")).body;
+  const s72GymRecurring = s72Items(s72GymFc, "Payment for Suite72 Gym");
+  const s72GymManual = s72Items(s72GymFc, "Suite72 Gym payment");
+  const s72NextYM = (() => { const d = new Date(Date.UTC(s72Y, s72M, 1)); return [d.getUTCFullYear(), d.getUTCMonth() + 1]; })();
+  const s72DashNext = (await s72Send("GET", `/api/dashboard?year=${s72NextYM[0]}&month=${s72NextYM[1]}`)).body || {};
+  const s72DashNow = (await s72Send("GET", `/api/dashboard?year=${s72Y}&month=${s72M}`)).body || {};
+  assert(
+    s72GymRecurring.length >= 1 && s72GymRecurring[0].date <= getTorontoOffsetDate(12) && !s72GymManual.some((i) => i.date <= getTorontoOffsetDate(12)),
+    `The recurring payment covers the due date in the forecast (recurring ${s72GymRecurring.map((i) => i.date).join(",")}, manual ${s72GymManual.map((i) => i.date).join(",")})`
+  );
+  const s72GymRows = [...(s72DashNow.upcomingDebtPayments || []), ...(s72DashNext.upcomingDebtPayments || [])].filter((p) => p.debtId === s72Gym.id);
+  assert(
+    s72GymRows.every((p) => s72GymManual.some((i) => i.date === p.date)) && !s72GymRows.some((p) => p.dueDate === getTorontoOffsetDate(12)),
+    `Upcoming Bills doesn't offer Pay for a due date a recurring transfer covers (got ${JSON.stringify(s72GymRows)})`
+  );
+
+  // A future month lists each debt's first payment in that month, the one the forecast counts
+  const s72LiveNext = (s72DashNext.upcomingDebtPayments || []).find((p) => p.debtId === s72Live.id);
+  const s72LiveFcNext = s72Items(s72GymFc, "Suite72 Live payment").find((i) => i.date.slice(0, 7) === `${s72NextYM[0]}-${String(s72NextYM[1]).padStart(2, "0")}`);
+  assert(
+    s72LiveFcNext && s72LiveNext && s72LiveNext.date === s72LiveFcNext.date && s72LiveNext.amount === 75,
+    `Next month's Dashboard lists the payment due then, even though an earlier one is due first (got ${JSON.stringify(s72LiveNext)}, forecast ${s72LiveFcNext?.date})`
+  );
+
   const s72PastDash = (await s72Send("GET", `/api/dashboard?year=${s72Y - 1}&month=${s72M}`)).body || {};
   assert(Array.isArray(s72PastDash.upcomingDebtPayments) && s72PastDash.upcomingDebtPayments.length === 0, "A past month lists no manual debt payments");
 

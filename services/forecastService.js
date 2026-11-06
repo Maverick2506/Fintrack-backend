@@ -157,6 +157,11 @@ const projectManualDebt = async (
   let fromDate = debt.dueDate;
   const lastDue = debt.dueDate > todayStr ? prevDue(debt.dueDate) : null;
   if (lastDue && lastDue <= todayStr && (!createdStr || lastDue >= createdStr)) fromDate = lastDue;
+  // A stored due date several periods back (edited to the past, or a restored debt the sweep skipped)
+  // owes one overdue payment, like the Debts page's missed-payment flag: the latest due date by today
+  for (let next = getNextDebtDueDate(fromDate, frequency, anchorDay), guard = 0; next && next <= todayStr && guard < 600; next = getNextDebtDueDate(next, frequency, anchorDay), guard++) {
+    fromDate = next;
+  }
   const lowerBound = prevDue(fromDate) || fromDate;
 
   const rows = await Transaction.findAll({
@@ -231,39 +236,44 @@ const projectManualDebt = async (
 };
 
 /**
- * The next payment of each manual debt (Upcoming Bills), projected as the forecast does.
+ * Manual debt payments for the Dashboard's Upcoming Bills, read from the forecast itself (so a payment
+ * a recurring transfer already covers is never offered): each debt's first projected payment dated
+ * between fromStr and toStr. An overdue payment is dated today.
  * Returns [{ debtId, name, title, dueDate, date, amount, overdue, balance, minimumPayment }].
  */
-const getNextManualDebtPayments = async ({ todayStr, endDateStr, dbTx = null }) => {
-  const [interestEnabled, interestStartSetting, debts] = await Promise.all([
-    isDebtInterestEnabled(Setting, dbTx),
-    Setting.findByPk(DEBT_INTEREST_START_KEY, { transaction: dbTx }),
-    Account.findAll({
-      where: {
-        type: "DEBT",
-        isActive: { [Op.ne]: false },
-        initialBalance: { [Op.gt]: 0 },
-        dueDate: { [Op.ne]: null },
-      },
-      order: [["createdAt", "ASC"]],
-      transaction: dbTx,
-    }),
-  ]);
-  const interestStartDate = interestStartSetting ? interestStartSetting.value : todayStr;
-  const next = [];
-  for (const debt of debts.filter(isManualDebt)) {
-    const { payments } = await projectManualDebt(debt, { todayStr, endDateStr, interestEnabled, interestStartDate, dbTx });
-    if (!payments.length) continue;
-    next.push({
+const getManualDebtPaymentsBetween = async ({ todayStr, fromStr, toStr, dbTx = null }) => {
+  if (toStr < todayStr) return [];
+  const horizon = Math.min(dayDiff(toStr, todayStr) + 1, 365);
+  const forecast = await getForecast(horizon, dbTx, [], { todayStr });
+  const debts = await Account.findAll({
+    where: { id: { [Op.in]: (forecast.debts || []).filter((d) => d.manual).map((d) => d.id) } },
+    transaction: dbTx,
+  });
+  const rows = [];
+  for (const debt of debts.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))) {
+    let found = null;
+    for (const day of forecast.days) {
+      if (day.date < fromStr || day.date > toStr) continue;
+      const item = day.items.find((it) => it.debtId === debt.id);
+      if (item) {
+        found = { day, item };
+        break;
+      }
+    }
+    if (!found) continue;
+    rows.push({
       debtId: debt.id,
       name: debt.name,
-      title: manualDebtTitle(debt.name),
-      ...payments[0],
+      title: found.item.title,
+      dueDate: found.item.dueDate,
+      date: found.day.date,
+      amount: Math.round(-found.item.amount * 100) / 100,
+      overdue: Boolean(found.item.overdue),
       balance: parseFloat(debt.initialBalance) || 0,
       minimumPayment: parseFloat(debt.minimumPayment) || 0,
     });
   }
-  return next;
+  return rows;
 };
 
 const manualDebtTitle = (name) => `${name} payment`;
@@ -737,6 +747,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
           amount: -p.amount,
           type: "debt",
           debtId: debt.id,
+          dueDate: p.dueDate,
           ...(p.overdue ? { overdue: true } : {}),
         });
       }
@@ -828,7 +839,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
         ...(it.type === "card" ? { statement: true } : {}),
         ...(it.capped ? { capped: true, scheduledAmount: it.scheduledAmount } : {}),
         ...(it.fundCovers ? { fundCovers: it.fundCovers, billAmount: it.billAmount } : {}),
-        ...(it.debtId ? { debtId: it.debtId } : {}),
+        ...(it.debtId ? { debtId: it.debtId, dueDate: it.dueDate } : {}),
         ...(it.overdue ? { overdue: true } : {}),
       })),
     };
@@ -919,7 +930,7 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
 
 module.exports = {
   getForecast,
-  getNextManualDebtPayments,
+  getManualDebtPaymentsBetween,
   isManualDebt,
   addCalendarDays,
 };
