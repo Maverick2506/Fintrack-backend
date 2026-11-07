@@ -4973,7 +4973,9 @@ async function runTestSuite() {
   const s35Server = await new Promise((resolve) => {
     const srv = s35App.listen(0, () => resolve(srv));
   });
-  const s35Token = require("jsonwebtoken").sign({ user: "Maverick" }, JWT_SECRET, { expiresIn: "5m" });
+  // Carry the current token_version, so the token still works after an earlier run used Sign out all devices (Suite 75)
+  const s35Tv = await require("../services/tokenVersionService").getTokenVersion();
+  const s35Token = require("jsonwebtoken").sign({ user: "Maverick", tv: s35Tv }, JWT_SECRET, { expiresIn: "5m" });
   const s35RaceRef = crypto.randomUUID();
   const s35Winner = await Transaction.create({
     ...s35Row, title: "Suite 35 Race Coffee", isCleared: true, clientRef: s35RaceRef,
@@ -10879,6 +10881,72 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { id: { [Op.in]: s73Ids } }, force: true });
   await s73Card.destroy({ force: true });
   await s73Debt.destroy({ force: true });
+
+  // --- Suite 74: security headers on every API response ---
+  console.log("\n--- Suite 74: API responses say nosniff and don't name Express ---");
+  const s74Health = await request({ hostname: "localhost", port: 8000, path: "/api/health", method: "GET" });
+  assert(
+    s74Health.status === 200 && s74Health.headers["x-content-type-options"] === "nosniff" && s74Health.headers["x-powered-by"] === undefined,
+    `/api/health has X-Content-Type-Options: nosniff and no X-Powered-By (got ${s74Health.headers["x-content-type-options"]}, ${s74Health.headers["x-powered-by"]})`
+  );
+  const s74Missing = await request({ hostname: "localhost", port: 8000, path: "/api/no-such-route", method: "GET", headers: authHeaders });
+  const s74NoLogin = await request({ hostname: "localhost", port: 8000, path: "/api/expenses", method: "GET" });
+  assert(
+    [s74Missing, s74NoLogin].every((r) => r.headers["x-content-type-options"] === "nosniff" && r.headers["x-powered-by"] === undefined),
+    `404 and 401 responses carry the same headers (got ${s74Missing.status}/${s74Missing.headers["x-content-type-options"]}, ${s74NoLogin.status}/${s74NoLogin.headers["x-content-type-options"]})`
+  );
+
+  // --- Suite 75: Sign out all devices (token_version in the JWT). Runs last: it signs out the suite's token ---
+  console.log("\n--- Suite 75: Sign out all devices: older tokens get 401, a new login works, feed and widget keys keep working ---");
+  const s75Jwt = require("jsonwebtoken");
+  const { JWT_SECRET: s75Secret } = require("../config/auth");
+  const s75Get = (path, bearer) =>
+    request({ hostname: "localhost", port: 8000, path, method: "GET", headers: bearer ? { Authorization: `Bearer ${bearer}` } : {} });
+  const s75Login = async () =>
+    (await request({ hostname: "localhost", port: 8000, path: "/api/auth/login", method: "POST", headers: { "Content-Type": "application/json" } }, { devBypass: true })).body?.token;
+  const s75Before = s75Jwt.decode(token)?.tv;
+  const s75GemKey = (await s75Get("/api/export/gemini-config", token)).body?.feedKey;
+  const s75WidgetKey = (await s75Get("/api/export/widget-config", token)).body?.widgetKey;
+  const s75Second = await s75Login(); // "another device"
+  // A token from before this change has no tv; it only works while the version is still 0
+  const s75Legacy = s75Jwt.sign({ user: "Maverick" }, s75Secret, { expiresIn: "1h" });
+  const s75LegacyBefore = await s75Get("/api/export/widget-config", s75Legacy);
+  assert(
+    Number.isInteger(s75Before) && (await s75Get("/api/export/widget-config", s75Second)).status === 200 &&
+      s75LegacyBefore.status === (s75Before === 0 ? 200 : 401),
+    `Login tokens carry tv (got ${s75Before}); a token without tv works only at version 0 (got ${s75LegacyBefore.status})`
+  );
+
+  const s75Bump = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: authHeaders }, {});
+  assert(
+    s75Bump.status === 200 && s75Bump.body?.signedOut === true && s75Bump.body.tokenVersion === s75Before + 1,
+    `POST /api/auth/sign-out-all bumps the version (got ${s75Bump.status} ${JSON.stringify(s75Bump.body)})`
+  );
+  const s75Old = await s75Get("/api/export/widget-config", token);
+  const s75OldOther = await s75Get("/api/export/widget-config", s75Second);
+  const s75LegacyAfter = await s75Get("/api/export/widget-config", s75Legacy);
+  const s75OldCron = await s75Get("/api/daily-check", token);
+  assert(
+    s75Old.status === 401 && s75OldOther.status === 401 && s75LegacyAfter.status === 401 && s75OldCron.status === 401,
+    `Every older token is refused, cron routes too (got ${s75Old.status}, ${s75OldOther.status}, ${s75LegacyAfter.status}, ${s75OldCron.status})`
+  );
+  const s75Again = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: authHeaders }, {});
+  assert(s75Again.status === 401, `A signed-out token can't sign out again (got ${s75Again.status})`);
+
+  const s75New = await s75Login();
+  const s75NewRes = await s75Get("/api/export/widget-config", s75New);
+  assert(
+    s75NewRes.status === 200 && s75Jwt.decode(s75New)?.tv === s75Before + 1,
+    `A new login works and carries the new version (got ${s75NewRes.status}, tv ${s75Jwt.decode(s75New)?.tv})`
+  );
+  const s75Feed = await s75Get(`/api/export/financial-feed.csv?key=${s75GemKey}`);
+  const s75Widget = await s75Get(`/api/export/widget.json?key=${s75WidgetKey}`);
+  assert(
+    s75Feed.status === 200 && s75Widget.status === 200,
+    `The Gem feed key and widget key still work after signing out everywhere (got ${s75Feed.status}, ${s75Widget.status})`
+  );
+  const s75BadBody = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${s75New}` } }, { everything: true });
+  assert(s75BadBody.status === 400, `sign-out-all takes no fields (got ${s75BadBody.status})`);
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

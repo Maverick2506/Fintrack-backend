@@ -1,7 +1,8 @@
 const jwt = require("jsonwebtoken");
 const { JWT_SECRET, isDevBypassAllowed } = require("../config/auth");
+const { isTokenVersionCurrent } = require("../services/tokenVersionService");
 
-const cronAuthMiddleware = (req, res, next) => {
+const cronAuthMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   const cronSecret = process.env.CRON_SECRET;
 
@@ -19,13 +20,21 @@ const cronAuthMiddleware = (req, res, next) => {
       return next();
     }
 
+    let decoded;
     try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      req.user = decoded;
-      return next();
+      decoded = jwt.verify(token, JWT_SECRET);
     } catch {
       return res.status(401).json({ error: "Invalid or expired token" });
     }
+    try {
+      if (!(await isTokenVersionCurrent(decoded))) {
+        return res.status(401).json({ error: "Signed out. Please log in again." });
+      }
+    } catch (error) {
+      return next(error);
+    }
+    req.user = decoded;
+    return next();
   }
 
   // 3. In local dev without Authorization header, allow triggering if CRON_SECRET is not configured

@@ -62,6 +62,12 @@ const {
 
 const app = express();
 app.set("trust proxy", 1);
+// Don't advertise Express, and stop browsers guessing a response's type (S-headers)
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  next();
+});
 app.use(compression());
 
 // --- CORS CONFIGURATION ---
