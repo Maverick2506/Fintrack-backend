@@ -4973,7 +4973,7 @@ async function runTestSuite() {
   const s35Server = await new Promise((resolve) => {
     const srv = s35App.listen(0, () => resolve(srv));
   });
-  // Carry the current token_version, so the token still works after an earlier run used Sign out all devices (Suite 75)
+  // Carry the current token_version, so the token still works after an earlier run used Sign out all devices (Suite 76)
   const s35Tv = await require("../services/tokenVersionService").getTokenVersion();
   const s35Token = require("jsonwebtoken").sign({ user: "Maverick", tv: s35Tv }, JWT_SECRET, { expiresIn: "5m" });
   const s35RaceRef = crypto.randomUUID();
@@ -10896,57 +10896,85 @@ async function runTestSuite() {
     `404 and 401 responses carry the same headers (got ${s74Missing.status}/${s74Missing.headers["x-content-type-options"]}, ${s74NoLogin.status}/${s74NoLogin.headers["x-content-type-options"]})`
   );
 
-  // --- Suite 75: Sign out all devices (token_version in the JWT). Runs last: it signs out the suite's token ---
-  console.log("\n--- Suite 75: Sign out all devices: older tokens get 401, a new login works, feed and widget keys keep working ---");
-  const s75Jwt = require("jsonwebtoken");
-  const { JWT_SECRET: s75Secret } = require("../config/auth");
-  const s75Get = (path, bearer) =>
+  // --- Suite 75: Quick Add's payee list (your spelling and usual category per payee) ---
+  console.log("\n--- Suite 75: GET /expenses/payees: one entry per payee, most-used spelling and category, no transfers ---");
+  const s75Made = [];
+  const s75Row = (title, category, daysAgo, type = "EXPENSE") =>
+    Transaction.create({ title, amount: 5, date: getTorontoOffsetDate(-daysAgo), type, category, isCleared: true, balanceApplied: true });
+  s75Made.push(await s75Row("suite75 bean co", "Other", 1)); // newest, typed in lowercase once
+  s75Made.push(await s75Row("Suite75 Bean Co #4521", "Food & Drink", 5));
+  s75Made.push(await s75Row("Suite75 Bean Co", "Food & Drink", 9));
+  s75Made.push(await s75Row("Suite75 Payroll Oct", "Income", 3, "INCOME"));
+  s75Made.push(await s75Row("Suite75 Old Shop", "Shopping", 400)); // older than 12 months
+  s75Made.push(await Transaction.create({ title: "Suite75 Card Payment", amount: 50, date: getTorontoOffsetDate(-2), type: "TRANSFER", category: "Credit Card Payment", isCleared: true }));
+  const s75Res = await request({ hostname: "localhost", port: 8000, path: "/api/expenses/payees", method: "GET", headers: authHeaders });
+  const s75List = Array.isArray(s75Res.body) ? s75Res.body : [];
+  const s75Bean = s75List.find((p) => p.key === "suite75 bean co");
+  const s75Pay = s75List.find((p) => p.key === "suite75 payroll");
+  assert(
+    s75Res.status === 200 && s75Bean?.name === "Suite75 Bean Co" && s75Bean.category === "Food & Drink" && s75Bean.count === 3 && s75Bean.type === "expense",
+    `A payee keeps its most-used spelling and category (got ${JSON.stringify(s75Bean)})`
+  );
+  assert(
+    s75Pay?.type === "income" && s75Pay.name === "Suite75 Payroll" &&
+      !s75List.some((p) => /suite75 (old shop|card payment)/.test(p.key)),
+    `Income is listed as income; transfers and rows over 12 months old are left out (got ${JSON.stringify(s75List.filter((p) => /suite75/.test(p.key)))})`
+  );
+  const s75NoLogin = await request({ hostname: "localhost", port: 8000, path: "/api/expenses/payees", method: "GET" });
+  assert(s75NoLogin.status === 401, `The payee list needs a login (got ${s75NoLogin.status})`);
+  for (const t of s75Made) await t.destroy({ force: true });
+
+  // --- Suite 76: Sign out all devices (token_version in the JWT). Runs last: it signs out the suite's token ---
+  console.log("\n--- Suite 76: Sign out all devices: older tokens get 401, a new login works, feed and widget keys keep working ---");
+  const s76Jwt = require("jsonwebtoken");
+  const { JWT_SECRET: s76Secret } = require("../config/auth");
+  const s76Get = (path, bearer) =>
     request({ hostname: "localhost", port: 8000, path, method: "GET", headers: bearer ? { Authorization: `Bearer ${bearer}` } : {} });
-  const s75Login = async () =>
+  const s76Login = async () =>
     (await request({ hostname: "localhost", port: 8000, path: "/api/auth/login", method: "POST", headers: { "Content-Type": "application/json" } }, { devBypass: true })).body?.token;
-  const s75Before = s75Jwt.decode(token)?.tv;
-  const s75GemKey = (await s75Get("/api/export/gemini-config", token)).body?.feedKey;
-  const s75WidgetKey = (await s75Get("/api/export/widget-config", token)).body?.widgetKey;
-  const s75Second = await s75Login(); // "another device"
+  const s76Before = s76Jwt.decode(token)?.tv;
+  const s76GemKey = (await s76Get("/api/export/gemini-config", token)).body?.feedKey;
+  const s76WidgetKey = (await s76Get("/api/export/widget-config", token)).body?.widgetKey;
+  const s76Second = await s76Login(); // "another device"
   // A token from before this change has no tv; it only works while the version is still 0
-  const s75Legacy = s75Jwt.sign({ user: "Maverick" }, s75Secret, { expiresIn: "1h" });
-  const s75LegacyBefore = await s75Get("/api/export/widget-config", s75Legacy);
+  const s76Legacy = s76Jwt.sign({ user: "Maverick" }, s76Secret, { expiresIn: "1h" });
+  const s76LegacyBefore = await s76Get("/api/export/widget-config", s76Legacy);
   assert(
-    Number.isInteger(s75Before) && (await s75Get("/api/export/widget-config", s75Second)).status === 200 &&
-      s75LegacyBefore.status === (s75Before === 0 ? 200 : 401),
-    `Login tokens carry tv (got ${s75Before}); a token without tv works only at version 0 (got ${s75LegacyBefore.status})`
+    Number.isInteger(s76Before) && (await s76Get("/api/export/widget-config", s76Second)).status === 200 &&
+      s76LegacyBefore.status === (s76Before === 0 ? 200 : 401),
+    `Login tokens carry tv (got ${s76Before}); a token without tv works only at version 0 (got ${s76LegacyBefore.status})`
   );
 
-  const s75Bump = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: authHeaders }, {});
+  const s76Bump = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: authHeaders }, {});
   assert(
-    s75Bump.status === 200 && s75Bump.body?.signedOut === true && s75Bump.body.tokenVersion === s75Before + 1,
-    `POST /api/auth/sign-out-all bumps the version (got ${s75Bump.status} ${JSON.stringify(s75Bump.body)})`
+    s76Bump.status === 200 && s76Bump.body?.signedOut === true && s76Bump.body.tokenVersion === s76Before + 1,
+    `POST /api/auth/sign-out-all bumps the version (got ${s76Bump.status} ${JSON.stringify(s76Bump.body)})`
   );
-  const s75Old = await s75Get("/api/export/widget-config", token);
-  const s75OldOther = await s75Get("/api/export/widget-config", s75Second);
-  const s75LegacyAfter = await s75Get("/api/export/widget-config", s75Legacy);
-  const s75OldCron = await s75Get("/api/daily-check", token);
+  const s76Old = await s76Get("/api/export/widget-config", token);
+  const s76OldOther = await s76Get("/api/export/widget-config", s76Second);
+  const s76LegacyAfter = await s76Get("/api/export/widget-config", s76Legacy);
+  const s76OldCron = await s76Get("/api/daily-check", token);
   assert(
-    s75Old.status === 401 && s75OldOther.status === 401 && s75LegacyAfter.status === 401 && s75OldCron.status === 401,
-    `Every older token is refused, cron routes too (got ${s75Old.status}, ${s75OldOther.status}, ${s75LegacyAfter.status}, ${s75OldCron.status})`
+    s76Old.status === 401 && s76OldOther.status === 401 && s76LegacyAfter.status === 401 && s76OldCron.status === 401,
+    `Every older token is refused, cron routes too (got ${s76Old.status}, ${s76OldOther.status}, ${s76LegacyAfter.status}, ${s76OldCron.status})`
   );
-  const s75Again = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: authHeaders }, {});
-  assert(s75Again.status === 401, `A signed-out token can't sign out again (got ${s75Again.status})`);
+  const s76Again = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: authHeaders }, {});
+  assert(s76Again.status === 401, `A signed-out token can't sign out again (got ${s76Again.status})`);
 
-  const s75New = await s75Login();
-  const s75NewRes = await s75Get("/api/export/widget-config", s75New);
+  const s76New = await s76Login();
+  const s76NewRes = await s76Get("/api/export/widget-config", s76New);
   assert(
-    s75NewRes.status === 200 && s75Jwt.decode(s75New)?.tv === s75Before + 1,
-    `A new login works and carries the new version (got ${s75NewRes.status}, tv ${s75Jwt.decode(s75New)?.tv})`
+    s76NewRes.status === 200 && s76Jwt.decode(s76New)?.tv === s76Before + 1,
+    `A new login works and carries the new version (got ${s76NewRes.status}, tv ${s76Jwt.decode(s76New)?.tv})`
   );
-  const s75Feed = await s75Get(`/api/export/financial-feed.csv?key=${s75GemKey}`);
-  const s75Widget = await s75Get(`/api/export/widget.json?key=${s75WidgetKey}`);
+  const s76Feed = await s76Get(`/api/export/financial-feed.csv?key=${s76GemKey}`);
+  const s76Widget = await s76Get(`/api/export/widget.json?key=${s76WidgetKey}`);
   assert(
-    s75Feed.status === 200 && s75Widget.status === 200,
-    `The Gem feed key and widget key still work after signing out everywhere (got ${s75Feed.status}, ${s75Widget.status})`
+    s76Feed.status === 200 && s76Widget.status === 200,
+    `The Gem feed key and widget key still work after signing out everywhere (got ${s76Feed.status}, ${s76Widget.status})`
   );
-  const s75BadBody = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${s75New}` } }, { everything: true });
-  assert(s75BadBody.status === 400, `sign-out-all takes no fields (got ${s75BadBody.status})`);
+  const s76BadBody = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${s76New}` } }, { everything: true });
+  assert(s76BadBody.status === 400, `sign-out-all takes no fields (got ${s76BadBody.status})`);
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

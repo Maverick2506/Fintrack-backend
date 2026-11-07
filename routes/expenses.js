@@ -22,6 +22,7 @@ const {
 } = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
 const { tagsOf } = require("../utils/transactionTags");
+const { buildPayeeList, PAYEE_HISTORY_MONTHS } = require("../services/payeeListService");
 const { filterLedgerRows, ledgerCsv, ledgerWindow } = require("../utils/ledgerExport");
 const {
   snapshotArchivedBalances,
@@ -287,6 +288,23 @@ const hasRowsBefore = async (from, filters) => {
 // needsReview=true, the Review inbox) reads all history. The other filters (type, category, accountId,
 // tag, search, sort) run here too, because JSON columns (tags) can't be filtered the same way on
 // SQLite and Postgres. hasMore says rows older than from pass the same filters.
+// Payees you've used in the last 12 months, for Quick Add: your spelling and usual category per payee
+router.get(
+  "/expenses/payees",
+  asyncHandler(async (req, res) => {
+    const today = getTodayString();
+    const [y, m, d] = today.split("-").map(Number);
+    const since = new Date(Date.UTC(y, m - 1 - PAYEE_HISTORY_MONTHS, d)).toISOString().slice(0, 10);
+    const rows = await Transaction.findAll({
+      where: { type: { [Op.in]: ["EXPENSE", "INCOME"] }, date: { [Op.gte]: since } },
+      attributes: ["title", "type", "category", "date", "createdAt"],
+      order: [["date", "DESC"], ["createdAt", "DESC"]],
+      raw: true,
+    });
+    res.json(buildPayeeList(rows));
+  })
+);
+
 router.get(
   "/expenses/all",
   validateQuery(schemas.ledgerQuery),
