@@ -10906,6 +10906,7 @@ async function runTestSuite() {
   s75Made.push(await s75Row("Suite75 Bean Co", "Food & Drink", 9));
   s75Made.push(await s75Row("Suite75 Payroll Oct", "Income", 3, "INCOME"));
   s75Made.push(await s75Row("Suite75 Old Shop", "Shopping", 400)); // older than 12 months
+  s75Made.push(await s75Row("Suite75 Bean Co", "Food & Drink", -20)); // upcoming (a series' next row): not a use yet
   const s75Trashed = await s75Row("Suite75 Trashed Cafe", "Food & Drink", 4);
   await s75Trashed.destroy(); // soft delete: in the Trash
   s75Made.push(s75Trashed);
@@ -10980,12 +10981,14 @@ async function runTestSuite() {
   assert(s76BadBody.status === 400, `sign-out-all takes no fields (got ${s76BadBody.status})`);
 
   // Two sign-outs at the same moment both count (one UPDATE adds 1 each time)
-  const s76PairHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${s76New}` };
-  const s76Pair = await Promise.all([1, 2].map(() => request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: s76PairHeaders }, {})));
+  // Two devices, each with its own fresh token, so both requests are always let in
+  const s76PairTokens = [s76New, await s76Login()];
+  const s76Pair = await Promise.all(
+    s76PairTokens.map((t) => request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}` } }, {}))
+  );
   const s76AfterPair = s76Jwt.decode(await s76Login())?.tv;
-  const s76PairOk = s76Pair.filter((r) => r.status === 200).length;
   assert(
-    s76PairOk >= 1 && s76AfterPair === s76Before + 1 + s76PairOk,
+    s76Pair.every((r) => r.status === 200) && s76AfterPair === s76Before + 3,
     `Simultaneous sign-outs each add 1 (got ${s76Pair.map((r) => r.status).join(",")}, version ${s76Before} -> ${s76AfterPair})`
   );
 

@@ -291,7 +291,8 @@ router.get(
     const [y, m, d] = today.split("-").map(Number);
     const since = new Date(Date.UTC(y, m - 1 - PAYEE_HISTORY_MONTHS, d)).toISOString().slice(0, 10);
     const rows = await Transaction.findAll({
-      where: { type: { [Op.in]: ["EXPENSE", "INCOME"] }, date: { [Op.gte]: since } },
+      // Up to today: generated upcoming rows of a series aren't uses yet
+      where: { type: { [Op.in]: ["EXPENSE", "INCOME"] }, date: { [Op.gte]: since, [Op.lte]: today } },
       attributes: ["title", "type", "category", "date", "createdAt"],
       order: [["date", "DESC"], ["createdAt", "DESC"]],
       raw: true,
