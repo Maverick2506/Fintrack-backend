@@ -283,11 +283,6 @@ const hasRowsBefore = async (from, filters) => {
   return filterLedgerRows(await loadLedgerRows(older), { ...filters, from: null, to: null }).length > 0;
 };
 
-// The Ledger, a page at a time: { rows, hasMore, from, to, reviewCount }. Without from= it is the last
-// 3 months plus every upcoming row; "Load older" asks again with an earlier from=. A search (or
-// needsReview=true, the Review inbox) reads all history. The other filters (type, category, accountId,
-// tag, search, sort) run here too, because JSON columns (tags) can't be filtered the same way on
-// SQLite and Postgres. hasMore says rows older than from pass the same filters.
 // Payees you've used in the last 12 months, for Quick Add: your spelling and usual category per payee
 router.get(
   "/expenses/payees",
@@ -305,6 +300,11 @@ router.get(
   })
 );
 
+// The Ledger, a page at a time: { rows, hasMore, from, to, reviewCount }. Without from= it is the last
+// 3 months plus every upcoming row; "Load older" asks again with an earlier from=. A search (or
+// needsReview=true, the Review inbox) reads all history. The other filters (type, category, accountId,
+// tag, search, sort) run here too, because JSON columns (tags) can't be filtered the same way on
+// SQLite and Postgres. hasMore says rows older than from pass the same filters.
 router.get(
   "/expenses/all",
   validateQuery(schemas.ledgerQuery),

@@ -10906,6 +10906,9 @@ async function runTestSuite() {
   s75Made.push(await s75Row("Suite75 Bean Co", "Food & Drink", 9));
   s75Made.push(await s75Row("Suite75 Payroll Oct", "Income", 3, "INCOME"));
   s75Made.push(await s75Row("Suite75 Old Shop", "Shopping", 400)); // older than 12 months
+  const s75Trashed = await s75Row("Suite75 Trashed Cafe", "Food & Drink", 4);
+  await s75Trashed.destroy(); // soft delete: in the Trash
+  s75Made.push(s75Trashed);
   s75Made.push(await Transaction.create({ title: "Suite75 Card Payment", amount: 50, date: getTorontoOffsetDate(-2), type: "TRANSFER", category: "Credit Card Payment", isCleared: true }));
   const s75Res = await request({ hostname: "localhost", port: 8000, path: "/api/expenses/payees", method: "GET", headers: authHeaders });
   const s75List = Array.isArray(s75Res.body) ? s75Res.body : [];
@@ -10917,12 +10920,12 @@ async function runTestSuite() {
   );
   assert(
     s75Pay?.type === "income" && s75Pay.name === "Suite75 Payroll" &&
-      !s75List.some((p) => /suite75 (old shop|card payment)/.test(p.key)),
-    `Income is listed as income; transfers and rows over 12 months old are left out (got ${JSON.stringify(s75List.filter((p) => /suite75/.test(p.key)))})`
+      !s75List.some((p) => /suite75 (old shop|card payment|trashed cafe)/.test(p.key)),
+    `Income is listed as income; transfers, rows in the Trash and rows over 12 months old are left out (got ${JSON.stringify(s75List.filter((p) => /suite75/.test(p.key)))})`
   );
   const s75NoLogin = await request({ hostname: "localhost", port: 8000, path: "/api/expenses/payees", method: "GET" });
   assert(s75NoLogin.status === 401, `The payee list needs a login (got ${s75NoLogin.status})`);
-  for (const t of s75Made) await t.destroy({ force: true });
+  await Transaction.destroy({ where: { id: { [Op.in]: s75Made.map((t) => t.id) } }, force: true, paranoid: false });
 
   // --- Suite 76: Sign out all devices (token_version in the JWT). Runs last: it signs out the suite's token ---
   console.log("\n--- Suite 76: Sign out all devices: older tokens get 401, a new login works, feed and widget keys keep working ---");
@@ -10975,6 +10978,16 @@ async function runTestSuite() {
   );
   const s76BadBody = await request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${s76New}` } }, { everything: true });
   assert(s76BadBody.status === 400, `sign-out-all takes no fields (got ${s76BadBody.status})`);
+
+  // Two sign-outs at the same moment both count (one UPDATE adds 1 each time)
+  const s76PairHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${s76New}` };
+  const s76Pair = await Promise.all([1, 2].map(() => request({ hostname: "localhost", port: 8000, path: "/api/auth/sign-out-all", method: "POST", headers: s76PairHeaders }, {})));
+  const s76AfterPair = s76Jwt.decode(await s76Login())?.tv;
+  const s76PairOk = s76Pair.filter((r) => r.status === 200).length;
+  assert(
+    s76PairOk >= 1 && s76AfterPair === s76Before + 1 + s76PairOk,
+    `Simultaneous sign-outs each add 1 (got ${s76Pair.map((r) => r.status).join(",")}, version ${s76Before} -> ${s76AfterPair})`
+  );
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
