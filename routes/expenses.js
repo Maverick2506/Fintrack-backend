@@ -22,6 +22,7 @@ const {
 } = require("../services/sinkingFundService");
 const { loadRules, applyRules } = require("../services/ruleService");
 const { tagsOf } = require("../utils/transactionTags");
+const { buildPayeeList, PAYEE_HISTORY_MONTHS } = require("../services/payeeListService");
 const { filterLedgerRows, ledgerCsv, ledgerWindow } = require("../utils/ledgerExport");
 const {
   snapshotArchivedBalances,
@@ -281,6 +282,24 @@ const hasRowsBefore = async (from, filters) => {
   }
   return filterLedgerRows(await loadLedgerRows(older), { ...filters, from: null, to: null }).length > 0;
 };
+
+// Payees you've used in the last 12 months, for Quick Add: your spelling and usual category per payee
+router.get(
+  "/expenses/payees",
+  asyncHandler(async (req, res) => {
+    const today = getTodayString();
+    const [y, m, d] = today.split("-").map(Number);
+    const since = new Date(Date.UTC(y, m - 1 - PAYEE_HISTORY_MONTHS, d)).toISOString().slice(0, 10);
+    const rows = await Transaction.findAll({
+      // Up to today: generated upcoming rows of a series aren't uses yet
+      where: { type: { [Op.in]: ["EXPENSE", "INCOME"] }, date: { [Op.gte]: since, [Op.lte]: today } },
+      attributes: ["title", "type", "category", "date", "createdAt"],
+      order: [["date", "DESC"], ["createdAt", "DESC"]],
+      raw: true,
+    });
+    res.json(buildPayeeList(rows));
+  })
+);
 
 // The Ledger, a page at a time: { rows, hasMore, from, to, reviewCount }. Without from= it is the last
 // 3 months plus every upcoming row; "Load older" asks again with an earlier from=. A search (or
