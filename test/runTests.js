@@ -21,6 +21,35 @@ const getTorontoOffsetDate = (days) => {
   const dt = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
 };
+// The 1st of a month counted from Toronto's current month (-1 = last month)
+const getTorontoMonthStart = (monthOffset) => {
+  const [y, m] = getTorontoToday().split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1 + monthOffset, 1, 12, 0, 0));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-01`;
+};
+// For suites that need a fixed calendar (Jan 31 -> Feb 28 and so on): a year at least two years ahead
+// of Toronto's today and never a leap year, so its dates are always in the future and month ends never change
+const FUTURE_YEAR = (() => {
+  let y = Number(getTorontoToday().slice(0, 4)) + 2;
+  while ((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) y++;
+  return y;
+})();
+// On the 1st every digest also carries last month's close ("🗓️ October 2026 close:" and its "  " lines).
+// Tests that check what else a digest says drop that section, so they mean the same on the 1st.
+const withoutMonthClose = (message) => {
+  const kept = [];
+  let inClose = false;
+  for (const line of String(message || "").split("\n")) {
+    if (/^🗓️ .* close:$/.test(line)) inClose = true;
+    else if (!(inClose && line.startsWith("  "))) {
+      inClose = false;
+      kept.push(line);
+    }
+  }
+  return kept.join("\n").trim();
+};
+const digestHasNothingElse = (res) =>
+  res.status === 204 || (res.status === 200 && withoutMonthClose(res.body?.message) === "");
 
 
 
@@ -723,7 +752,9 @@ async function runTestSuite() {
   assert(getNextOccurrenceDate("2026-01-31", "monthly", 2) === "2026-03-31", "Multi-step monthly recurrence restores day 31 after short month (Jan 31 -> Mar 31)");
   assert(getNextOccurrenceDate("2024-02-29", "yearly", 4) === "2028-02-29", "Yearly recurrence preserves leap day after full 4-year cycle");
 
-  // End-to-end Rent test: create rent on 2026-10-01 with monthly recurrence
+  // End-to-end Rent test: create rent on the 1st of last month with monthly recurrence
+  const rentStart = getTorontoMonthStart(-1);
+  const rentNext = getTorontoMonthStart(0);
   const rentRes = await request({
     hostname: "localhost",
     port: 8000,
@@ -734,11 +765,11 @@ async function runTestSuite() {
     name: "Automated Suite Rent",
     amount: 500.0,
     category: "Essentials",
-    due_date: "2026-10-01",
+    due_date: rentStart,
     recurrence: "monthly",
     is_paid: true,
   });
-  assert(rentRes.status === 201 && rentRes.body.id, "Creates monthly rent expense on Oct 1st");
+  assert(rentRes.status === 201 && rentRes.body.id, "Creates monthly rent expense on the 1st of last month");
   const rentId = rentRes.body.id;
 
   // Trigger recurring generation
@@ -758,11 +789,11 @@ async function runTestSuite() {
     headers: authHeaders,
   });
   const allTxs = allLedgerRes.body?.rows || [];
-  const bad30thRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === "2026-10-30");
-  assert(!bad30thRent, "No duplicate rent transaction generated for 30th of current month");
+  const bad30thRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === `${rentStart.slice(0, 8)}30`);
+  assert(!bad30thRent, "No duplicate rent transaction generated for the 30th of that month");
 
-  const nov1stRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === "2026-11-01");
-  assert(nov1stRent, "Next recurring rent instance generated on exactly November 1st (2026-11-01)");
+  const nextRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === rentNext);
+  assert(nextRent, `Next recurring rent instance generated on exactly the 1st of this month (${rentNext})`);
 
   // Clean up recurring rent test transactions
   await request({
@@ -772,16 +803,16 @@ async function runTestSuite() {
     method: "DELETE",
     headers: authHeaders,
   });
-  if (nov1stRent) {
+  if (nextRent) {
     await request({
       hostname: "localhost",
       port: 8000,
-      path: `/api/expenses/${nov1stRent.id}`,
+      path: `/api/expenses/${nextRent.id}`,
       method: "DELETE",
       headers: authHeaders,
     });
   }
-  // Once today is past Nov 1 2026 the generator also adds Dec 1 and later; remove the rest of the series
+  // The generator also adds the 1st of next month and later ones; remove the rest of the series
   // (unpaid, so no balance to undo) or Suite 30 sees it as a 4th subscription
   if (rentRes.body.recurringGroupId) {
     await Transaction.destroy({ where: { recurringGroupId: rentRes.body.recurringGroupId, isCleared: false }, force: true });
@@ -1659,7 +1690,7 @@ async function runTestSuite() {
       name: "Suite 15 Sapphire Card",
       currentBalance: 1000.0,
       creditLimit: 5000.0,
-      dueDate: "2026-11-15",
+      dueDate: getTorontoOffsetDate(28),
     }
   );
   assert(s15CardRes.status === 201 && s15CardRes.body.id, "Creates test credit card with balance $1,000");
@@ -1886,7 +1917,7 @@ async function runTestSuite() {
       name: "Student Loan 15",
       total_amount: 1000.0,
       monthly_payment: 50.0,
-      next_due_date: "2026-11-01",
+      next_due_date: getTorontoOffsetDate(14),
     }
   );
   assert(s15DebtRes.status === 201 && s15DebtRes.body.id, "Creates test debt for paydown target resolution");
@@ -1959,7 +1990,7 @@ async function runTestSuite() {
   // Setup: card at 800 (1000 minus 200 already applied in pre-fix state)
   const s16CardA = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Card A", currentBalance: 800.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+    { name: "Suite 16 Card A", currentBalance: 800.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
   );
   assert(s16CardA.status === 201 && s16CardA.body.id, "Creates test card at $800 balance");
   const s16CardAId = s16CardA.body.id;
@@ -1996,7 +2027,7 @@ async function runTestSuite() {
   // Scenario A2: Pre-6b06ed2 transfer (balanceApplied: false, but prematurely applied at creation)
   const s16CardA2 = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Card A2", currentBalance: 800.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+    { name: "Suite 16 Card A2", currentBalance: 800.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
   );
   assert(s16CardA2.status === 201 && s16CardA2.body.id, "Creates test card A2 at $800 balance");
   const s16CardA2Id = s16CardA2.body.id;
@@ -2010,7 +2041,7 @@ async function runTestSuite() {
     isCleared: false,
     balanceApplied: false, // pre-6b06ed2 rows had balanceApplied: false
     toAccountId: s16CardA2Id,
-    createdAt: new Date("2026-10-18T12:00:00Z"), // before LEGACY_CUTOFF
+    createdAt: new Date("2026-10-18T12:00:00Z"), // before LEGACY_CUTOFF (a fixed past instant, safe on any run date)
   });
 
   // Verify atomic concurrency claim mechanism on this row
@@ -2071,7 +2102,7 @@ async function runTestSuite() {
   // Scenario A3: A payment scheduled under the new code is untouched by the cleanup
   const s16CardA3 = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Card A3", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+    { name: "Suite 16 Card A3", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
   );
   assert(s16CardA3.status === 201 && s16CardA3.body.id, "Creates test card A3 at $1,000 balance");
   const s16CardA3Id = s16CardA3.body.id;
@@ -2097,6 +2128,7 @@ async function runTestSuite() {
   assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 starts at $1,000 balance upon payment scheduling");
 
   const newTrxInDb = await DBTransaction.findByPk(s16NewPaymentId);
+  // The cleanup's fixed cutoff from the code's history: a past instant, so it never moves with today
   const LEGACY_CUTOFF = new Date("2026-10-20T06:00:00Z");
   assert(newTrxInDb.balanceApplied === false, "Payment scheduled under new code has balanceApplied = false");
   assert(new Date(newTrxInDb.createdAt) >= LEGACY_CUTOFF, "Payment scheduled under new code has createdAt >= LEGACY_CUTOFF");
@@ -2162,7 +2194,7 @@ async function runTestSuite() {
   // 1. Mark a scheduled $200 card payment paid: card 1,000 -> 800, still linked
   const s16CardB = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Card B", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+    { name: "Suite 16 Card B", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
   );
   const s16CardBId = s16CardB.body.id;
 
@@ -2220,7 +2252,7 @@ async function runTestSuite() {
   // 3. Edit debt payment to "Food & Drink" unlinks toAccountId
   const s16DebtB = await request(
     { hostname: "localhost", port: 8000, path: "/api/debts", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Debt Unlink", total_amount: 500.0, monthly_payment: 25.0, next_due_date: "2026-11-01" }
+    { name: "Suite 16 Debt Unlink", total_amount: 500.0, monthly_payment: 25.0, next_due_date: getTorontoOffsetDate(14) }
   );
   const s16DebtBId = s16DebtB.body.id;
 
@@ -2277,7 +2309,7 @@ async function runTestSuite() {
   // 1. Debt PUT validation and atomic pay
   const s17Debt = await request(
     { hostname: "localhost", port: 8000, path: "/api/debts", method: "POST", headers: authHeaders },
-    { name: "Suite 17 Debt", total_amount: 1000.0, monthly_payment: 100.0, next_due_date: "2026-11-01" }
+    { name: "Suite 17 Debt", total_amount: 1000.0, monthly_payment: 100.0, next_due_date: getTorontoOffsetDate(14) }
   );
   assert(s17Debt.status === 201 && s17Debt.body.id, "Creates test debt for Suite 17");
   const s17DebtId = s17Debt.body.id;
@@ -2384,7 +2416,7 @@ async function runTestSuite() {
   // 3. Atomic credit card payment
   const s17Card = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 17 Card", currentBalance: 500.0, creditLimit: 2000.0, dueDate: "2026-11-15" }
+    { name: "Suite 17 Card", currentBalance: 500.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
   );
   assert(s17Card.status === 201 && s17Card.body.id, "Creates test credit card for Suite 17");
   const s17CardId = s17Card.body.id;
@@ -2520,7 +2552,17 @@ async function runTestSuite() {
 
   // Clean up Suite 18 records
   await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s18TrxId}`, method: "DELETE", headers: authHeaders });
-  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s18CardId}`, method: "DELETE", headers: authHeaders });
+  // The card still owes $300 and a card with a balance can't be removed (409), so zero it and delete it for good;
+  // otherwise it stays active and its due date shows up in later suites' digests and forecasts
+  await Account.update({ initialBalance: 0 }, { where: { id: s18CardId } });
+  const s18CardDelete = await request(
+    { hostname: "localhost", port: 8000, path: `/api/credit-cards/${s18CardId}`, method: "DELETE", headers: authHeaders },
+    { mode: "delete" }
+  );
+  assert(
+    s18CardDelete.status === 204 && (await Account.findByPk(s18CardId)) === null,
+    `The Suite 18 card is deleted at the end of the suite (got ${s18CardDelete.status})`
+  );
   await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s18DebtId}`, method: "DELETE", headers: authHeaders });
   await request({ hostname: "localhost", port: 8000, path: `/api/debts/${s18PayoffDebtId}`, method: "DELETE", headers: authHeaders });
 
@@ -3680,7 +3722,7 @@ async function runTestSuite() {
     method: "GET",
     headers: cronHeaders,
   });
-  assert(emptyDigestRes.status === 204, "GET /api/cron/digest returns HTTP 204 when there is nothing to report");
+  assert(digestHasNothingElse(emptyDigestRes), "GET /api/cron/digest returns HTTP 204 when there is nothing to report (on the 1st, only last month's close)");
 
   // 3. Verify 3-day boundary: Bill on Day 4 is excluded (returns 204), Bill on Day 3 is included (returns 200)
   const d3Str = getTorontoOffsetDate(3);
@@ -3706,7 +3748,7 @@ async function runTestSuite() {
     method: "GET",
     headers: cronHeaders,
   });
-  assert(digestWithDay4Res.status === 204, "Digest strictly ignores bills due on Day 4 (returns HTTP 204)");
+  assert(digestHasNothingElse(digestWithDay4Res), "Digest strictly ignores bills due on Day 4 (returns HTTP 204; on the 1st, only last month's close)");
 
   const billDay3Res = await request({
     hostname: "localhost",
@@ -3921,7 +3963,7 @@ async function runTestSuite() {
       name: "Emergency Pacing Fund",
       target_amount: 5000,
       current_amount: 1000,
-      target_date: "2027-10-01",
+      target_date: getTorontoOffsetDate(320),
     }
   );
   assert(pacingGoalRes.status === 201 && pacingGoalRes.body.id, "Creates test savings goal with target date");
@@ -4030,7 +4072,7 @@ async function runTestSuite() {
       current_amount: 10000,
       registeredType: "TFSA",
       contributionRoom: 7000,
-      roomYear: 2026,
+      roomYear: 2026, // pins the contribution year, so the 2026 rows below count the same on any run date
     }
   );
   assert(tfsaRes.status === 201 && tfsaRes.body.id, "Creates registered TFSA savings goal with room 7000");
@@ -4156,6 +4198,7 @@ async function runTestSuite() {
   const primeGroupId = crypto.randomUUID();
   const cancelledGroupId = crypto.randomUUID();
 
+  // Fixed past dates on purpose: subscriptions read each series' rows and amounts, which stay valid as time passes
   // Netflix occurrences (price hike from 16.49 to 18.99)
   const netflix1 = await Transaction.create({
     title: "Netflix Standard",
@@ -4290,6 +4333,7 @@ async function runTestSuite() {
 
   // Test Fix #2: Dedicated POST /api/subscriptions/:recurringGroupId/cancel
   const cancelTestGroupId = crypto.randomUUID();
+  // A fixed past (paid) row: cancel keeps history, and a past date stays past
   const subCancelPast = await Transaction.create({
     title: "Spotify Family",
     amount: 18.99,
@@ -4367,6 +4411,7 @@ async function runTestSuite() {
   const testClientRef2 = crypto.randomUUID();
 
   // 1. First expense submission with clientRef
+  // Fixed past dates: these check clientRef idempotency, which doesn't depend on the date
   const expRes1 = await request(
     {
       hostname: "localhost",
@@ -4674,7 +4719,7 @@ async function runTestSuite() {
   };
 
   // C5: debt payments are TRANSFERs and do not count as spending
-  const s33Debt = await s33("POST", "/api/debts", { name: "Suite 33 Loan", total_amount: 400.0, monthly_payment: 20.0, next_due_date: "2026-12-01" });
+  const s33Debt = await s33("POST", "/api/debts", { name: "Suite 33 Loan", total_amount: 400.0, monthly_payment: 20.0, next_due_date: getTorontoOffsetDate(14) });
   assert(s33Debt.status === 201, "Creates Suite 33 debt");
   const s33DebtId = s33Debt.body.id;
   const s33SpendBefore = await s33Spending();
@@ -4899,6 +4944,7 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { recurringGroupId: s34Monthly.body.recurringGroupId } });
 
   console.log("\n--- Suite 35: Simultaneous Retries With the Same clientRef ---");
+  // Fixed past dates (2026-04-15): retries are matched by clientRef, not by date
   const { isClientRefConflict } = require("../services/clientRefService");
   const s35Post = (path, body) =>
     request({ hostname: "localhost", port: 8000, path, method: "POST", headers: authHeaders }, body);
@@ -5600,9 +5646,10 @@ async function runTestSuite() {
   const { getPrimaryCheckingAccount: s39GetCheckingForS38 } = require("../services/checkingService");
   const s38InterestRows = (id) =>
     Transaction.findAll({ where: { fromAccountId: id, category: "Interest" }, order: [["date", "ASC"]] });
-  // Fixed future dates so the sweep's checks do not depend on the run date. Interest starts 2027-01-01.
+  // A fixed calendar in FUTURE_YEAR (always ahead of today, never a leap year), so the month-end checks
+  // mean the same on any run date. Interest starts Jan 1 of that year.
   const s38StartBefore = await Setting.findByPk(s38StartKey);
-  await Setting.upsert({ key: s38StartKey, value: "2027-01-01" });
+  await Setting.upsert({ key: s38StartKey, value: `${FUTURE_YEAR}-01-01` });
 
   // 38.1 Interest math: round(balance × APR/100 / 12, 2), scaled for other frequencies
   assert(s38Interest(12000, 6.9, "monthly") === 69, "Monthly interest on $12,000 at 6.9% is $69.00");
@@ -5614,64 +5661,64 @@ async function runTestSuite() {
   );
 
   // 38.2 Due-date anchor: 31st -> Feb 28 -> Mar 31 (R3)
-  assert(s38NextDue("2027-01-31", "monthly", 31) === "2027-02-28", "Jan 31 advances to Feb 28");
-  assert(s38NextDue("2027-02-28", "monthly", 31) === "2027-03-31", "Feb 28 with anchor day 31 advances to Mar 31");
-  assert(s38NextDue("2027-04-30", "monthly", 31) === "2027-05-31", "Apr 30 with anchor day 31 advances to May 31");
-  assert(s38NextDue("2027-02-28", "monthly", null) === "2027-03-28", "Without an anchor day Feb 28 stays on the 28th (old behaviour)");
+  assert(s38NextDue(`${FUTURE_YEAR}-01-31`, "monthly", 31) === `${FUTURE_YEAR}-02-28`, "Jan 31 advances to Feb 28");
+  assert(s38NextDue(`${FUTURE_YEAR}-02-28`, "monthly", 31) === `${FUTURE_YEAR}-03-31`, "Feb 28 with anchor day 31 advances to Mar 31");
+  assert(s38NextDue(`${FUTURE_YEAR}-04-30`, "monthly", 31) === `${FUTURE_YEAR}-05-31`, "Apr 30 with anchor day 31 advances to May 31");
+  assert(s38NextDue(`${FUTURE_YEAR}-02-28`, "monthly", null) === `${FUTURE_YEAR}-03-28`, "Without an anchor day Feb 28 stays on the 28th (old behaviour)");
 
   // 38.3 POST /debts stores dueDay; PUT with a new due date moves the anchor
   const s38Loan = await s33("POST", "/api/debts", {
     name: "Suite 38 Car Loan", total_amount: 12000, monthly_payment: 350, auto_pay: true,
-    next_due_date: "2027-01-31", payment_frequency: "monthly", interest_rate: 6.9,
+    next_due_date: `${FUTURE_YEAR}-01-31`, payment_frequency: "monthly", interest_rate: 6.9,
   });
   assert(s38Loan.status === 201 && s38Loan.body.dueDay === 31, `POST /debts stores dueDay 31 (got ${s38Loan.body?.dueDay})`);
   const s38LoanId = s38Loan.body.id;
-  const s38Moved = await s33("POST", "/api/debts", { name: "Suite 38 Moved", total_amount: 100, next_due_date: "2027-01-31" });
-  const s38MovedPut = await s33("PUT", `/api/debts/${s38Moved.body.id}`, { next_due_date: "2027-02-15" });
+  const s38Moved = await s33("POST", "/api/debts", { name: "Suite 38 Moved", total_amount: 100, next_due_date: `${FUTURE_YEAR}-01-31` });
+  const s38MovedPut = await s33("PUT", `/api/debts/${s38Moved.body.id}`, { next_due_date: `${FUTURE_YEAR}-02-15` });
   assert(s38MovedPut.status === 200 && s38MovedPut.body.dueDay === 15, "PUT /debts with a new due date sets dueDay 15");
-  const s38SamePut = await s33("PUT", `/api/debts/${s38LoanId}`, { next_due_date: "2027-01-31", name: "Suite 38 Car Loan" });
+  const s38SamePut = await s33("PUT", `/api/debts/${s38LoanId}`, { next_due_date: `${FUTURE_YEAR}-01-31`, name: "Suite 38 Car Loan" });
   assert(s38SamePut.body.dueDay === 31, "PUT /debts with the same due date keeps dueDay");
 
-  // 38.4 Forecast projection made before the sweeps (today = 2027-01-30, 3 months ahead)
-  const s38Fc = await s38Forecast(70, null, [], { todayStr: "2027-01-30" });
+  // 38.4 Forecast projection made before the sweeps (today = Jan 30, 3 months ahead)
+  const s38Fc = await s38Forecast(70, null, [], { todayStr: `${FUTURE_YEAR}-01-30` });
   const s38FcLoan = (s38Fc.debts || []).find((d) => d.id === s38LoanId);
   assert(
-    s38FcLoan && s38FcLoan.schedule.map((s) => s.date).join(",") === "2027-01-31,2027-02-28,2027-03-31",
-    `Forecast projects due dates 2027-01-31, 02-28, 03-31 (got ${s38FcLoan?.schedule.map((s) => s.date).join(",")})`
+    s38FcLoan && s38FcLoan.schedule.map((s) => s.date).join(",") === `${FUTURE_YEAR}-01-31,${FUTURE_YEAR}-02-28,${FUTURE_YEAR}-03-31`,
+    `Forecast projects due dates ${FUTURE_YEAR}-01-31, 02-28, 03-31 (got ${s38FcLoan?.schedule.map((s) => s.date).join(",")})`
   );
   const s38FcPays = s38Fc.days.flatMap((d) => d.items.filter((i) => i.title === "Auto-Pay for Suite 38 Car Loan").map((i) => [d.date, i.amount]));
   assert(s38FcPays.length === 3 && s38FcPays.every(([, a]) => a === -350), "Forecast shows three -$350 auto-pays from Checking");
 
   // 38.5 Sweep on the due date: interest first, then auto-pay
-  await s38Sweep({ todayStr: "2027-01-31" });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-01-31` });
   let s38Rows = await s38InterestRows(s38LoanId);
   assert(s38Rows.length === 1, `Sweep records one interest row on the due date (got ${s38Rows.length})`);
   const s38Row = s38Rows[0];
   assert(
     s38Row && s38Row.title === "Interest – Suite 38 Car Loan" && s38Row.type === "EXPENSE" && s38Row.isCleared &&
-      parseFloat(s38Row.amount) === 69 && s38Row.date === "2027-01-31" && s38Row.balanceApplied &&
-      s38Row.clientRef === s38Ref(s38LoanId, "2027-01-31"),
+      parseFloat(s38Row.amount) === 69 && s38Row.date === `${FUTURE_YEAR}-01-31` && s38Row.balanceApplied &&
+      s38Row.clientRef === s38Ref(s38LoanId, `${FUTURE_YEAR}-01-31`),
     "Interest row: 'Interest – <debt>', cleared EXPENSE of $69.00 on the due date, balance applied, clientRef from debt + date"
   );
   assert((await s38Bal(s38LoanId)) === 11719, `Auto-pay after interest leaves $12,000 + $69 - $350 = $11,719.00 (got ${await s38Bal(s38LoanId)})`);
-  const s38Pay = await Transaction.findOne({ where: { title: "Auto-Pay for Suite 38 Car Loan", date: "2027-01-31" } });
+  const s38Pay = await Transaction.findOne({ where: { title: "Auto-Pay for Suite 38 Car Loan", date: `${FUTURE_YEAR}-01-31` } });
   assert(s38Pay && parseFloat(s38Pay.amount) === 350, "Auto-pay of $350 recorded on the due date");
-  assert((await Account.findByPk(s38LoanId)).dueDate === "2027-02-28", "Due date advances from Jan 31 to Feb 28");
+  assert((await Account.findByPk(s38LoanId)).dueDate === `${FUTURE_YEAR}-02-28`, "Due date advances from Jan 31 to Feb 28");
 
   // 38.6 Running the sweep twice records interest once per due date
-  await s38Sweep({ todayStr: "2027-01-31" });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-01-31` });
   assert((await s38InterestRows(s38LoanId)).length === 1 && (await s38Bal(s38LoanId)) === 11719, "A second sweep the same day adds no interest and no payment");
   // Even if the due date were put back (a retry after a crash), the clientRef keeps it to one row
-  await Account.update({ dueDate: "2027-01-31", autoPay: false }, { where: { id: s38LoanId } });
-  await s38Sweep({ todayStr: "2027-01-31" });
+  await Account.update({ dueDate: `${FUTURE_YEAR}-01-31`, autoPay: false }, { where: { id: s38LoanId } });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-01-31` });
   assert((await s38InterestRows(s38LoanId)).length === 1 && (await s38Bal(s38LoanId)) === 11719, "Re-running a due date that already has interest adds nothing");
-  await Account.update({ dueDate: "2027-02-28", autoPay: true }, { where: { id: s38LoanId } });
+  await Account.update({ dueDate: `${FUTURE_YEAR}-02-28`, autoPay: true }, { where: { id: s38LoanId } });
 
   // 38.7 Forecast matches the sweep for 3 months, and the due date goes 31 -> 28 -> 31
-  await s38Sweep({ todayStr: "2027-02-28" });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-02-28` });
   const s38Feb = await s38Bal(s38LoanId);
-  assert((await Account.findByPk(s38LoanId)).dueDate === "2027-03-31", "After Feb 28 the due date returns to Mar 31");
-  await s38Sweep({ todayStr: "2027-03-31" });
+  assert((await Account.findByPk(s38LoanId)).dueDate === `${FUTURE_YEAR}-03-31`, "After Feb 28 the due date returns to Mar 31");
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-03-31` });
   const s38Mar = await s38Bal(s38LoanId);
   const s38Actual = [11719, s38Feb, s38Mar];
   const s38Projected = s38FcLoan.schedule.map((s) => s.balance);
@@ -5680,12 +5727,12 @@ async function runTestSuite() {
     `Forecast balances match the sweep for 3 months (forecast ${s38Projected.join(", ")} vs sweep ${s38Actual.join(", ")})`
   );
   assert(s38Mar === 11152.14, `Balance after 3 months with interest is $11,152.14 (got ${s38Mar})`);
-  assert((await Account.findByPk(s38LoanId)).dueDate === "2027-04-30", "After Mar 31 the due date is Apr 30");
+  assert((await Account.findByPk(s38LoanId)).dueDate === `${FUTURE_YEAR}-04-30`, "After Mar 31 the due date is Apr 30");
   assert((await s38InterestRows(s38LoanId)).map((r) => parseFloat(r.amount)).join(",") === "69,67.38,65.76", "Interest rows are $69.00, $67.38, $65.76");
 
   // 38.8 The payoff planner projects the same interest as the sweep
   const s38Plan = s38Simulate([{ id: "p", name: "P", initialBalance: 12000, minimumPayment: 350, interestRate: 6.9 }], 0, "avalanche", new Date(2027, 0, 31));
-  const s38Full = s38Project({ balance: 12000, apr: 6.9, minimumPayment: 350, autoPay: true, dueDate: "2027-01-31", frequency: "monthly", fromDate: "2027-01-31", toDate: "2040-01-01" });
+  const s38Full = s38Project({ balance: 12000, apr: 6.9, minimumPayment: 350, autoPay: true, dueDate: `${FUTURE_YEAR}-01-31`, frequency: "monthly", fromDate: `${FUTURE_YEAR}-01-31`, toDate: `${FUTURE_YEAR + 13}-01-01` });
   const s38FullInterest = Math.round(s38Full.reduce((s, x) => s + x.interest, 0) * 100) / 100;
   assert(
     s38Plan.totalInterest === s38FullInterest && s38Plan.perDebt[0].payoffMonth === s38Full.length,
@@ -5693,9 +5740,9 @@ async function runTestSuite() {
   );
 
   // 38.9 Interest whether or not auto-pay is on; manual debts move to the next due date
-  const s38Manual = await s33("POST", "/api/debts", { name: "Suite 38 Manual", total_amount: 1000, monthly_payment: 50, auto_pay: false, next_due_date: "2027-01-15", interest_rate: 12 });
+  const s38Manual = await s33("POST", "/api/debts", { name: "Suite 38 Manual", total_amount: 1000, monthly_payment: 50, auto_pay: false, next_due_date: `${FUTURE_YEAR}-01-15`, interest_rate: 12 });
   const s38ManualId = s38Manual.body.id;
-  await s38Sweep({ todayStr: "2027-04-20" });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-04-20` });
   const s38ManualRows = await s38InterestRows(s38ManualId);
   // Catches up Jan 15, Feb 15, Mar 15 and Apr 15 at 1% a month, compounding
   assert(
@@ -5703,29 +5750,29 @@ async function runTestSuite() {
     `Manual debt gets interest on each missed due date (got ${s38ManualRows.map((r) => r.amount).join(",")})`
   );
   assert((await s38Bal(s38ManualId)) === 1040.6, `Manual debt balance includes interest, no payment ($1,040.60, got ${await s38Bal(s38ManualId)})`);
-  assert((await Account.findByPk(s38ManualId)).dueDate === "2027-05-15", "Manual debt's due date moves to the next one (May 15)");
+  assert((await Account.findByPk(s38ManualId)).dueDate === `${FUTURE_YEAR}-05-15`, "Manual debt's due date moves to the next one (May 15)");
   assert(!(await Transaction.findOne({ where: { toAccountId: s38ManualId } })), "No payment is recorded for a debt without auto-pay");
 
   // 38.10 Skips: APR 0, APR empty, archived debt, credit cards, due dates before interest started
-  const s38Zero = await s33("POST", "/api/debts", { name: "Suite 38 Zero", total_amount: 500, next_due_date: "2027-01-10", interest_rate: 0 });
-  const s38NoApr = await s33("POST", "/api/debts", { name: "Suite 38 No APR", total_amount: 500, next_due_date: "2027-01-10" });
-  const s38Archived = await s33("POST", "/api/debts", { name: "Suite 38 Archived", total_amount: 500, next_due_date: "2027-01-10", interest_rate: 20 });
+  const s38Zero = await s33("POST", "/api/debts", { name: "Suite 38 Zero", total_amount: 500, next_due_date: `${FUTURE_YEAR}-01-10`, interest_rate: 0 });
+  const s38NoApr = await s33("POST", "/api/debts", { name: "Suite 38 No APR", total_amount: 500, next_due_date: `${FUTURE_YEAR}-01-10` });
+  const s38Archived = await s33("POST", "/api/debts", { name: "Suite 38 Archived", total_amount: 500, next_due_date: `${FUTURE_YEAR}-01-10`, interest_rate: 20 });
   await Account.update({ isActive: false }, { where: { id: s38Archived.body.id } });
-  const s38Old = await s33("POST", "/api/debts", { name: "Suite 38 Old Due", total_amount: 600, next_due_date: "2026-12-10", interest_rate: 12 });
-  const s38Card = await s33("POST", "/api/credit-cards", { name: "Suite 38 Card", creditLimit: 1000, currentBalance: 300, dueDate: "2027-01-10" });
-  await s38Sweep({ todayStr: "2027-01-10" });
+  const s38Old = await s33("POST", "/api/debts", { name: "Suite 38 Old Due", total_amount: 600, next_due_date: `${FUTURE_YEAR - 1}-12-10`, interest_rate: 12 });
+  const s38Card = await s33("POST", "/api/credit-cards", { name: "Suite 38 Card", creditLimit: 1000, currentBalance: 300, dueDate: `${FUTURE_YEAR}-01-10` });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-01-10` });
   assert((await s38InterestRows(s38Zero.body.id)).length === 0 && (await s38Bal(s38Zero.body.id)) === 500, "No interest when APR is 0");
   assert((await s38InterestRows(s38NoApr.body.id)).length === 0 && (await s38Bal(s38NoApr.body.id)) === 500, "No interest when APR is empty");
   const s38ArchivedAcc = await Account.findByPk(s38Archived.body.id);
   assert(
-    (await s38InterestRows(s38Archived.body.id)).length === 0 && parseFloat(s38ArchivedAcc.initialBalance) === 500 && s38ArchivedAcc.dueDate === "2027-01-10",
+    (await s38InterestRows(s38Archived.body.id)).length === 0 && parseFloat(s38ArchivedAcc.initialBalance) === 500 && s38ArchivedAcc.dueDate === `${FUTURE_YEAR}-01-10`,
     "Archived debt: no interest, balance and due date unchanged"
   );
   assert((await s38InterestRows(s38Card.body.id)).length === 0, "Credit cards get no interest rows");
   const s38OldRows = await s38InterestRows(s38Old.body.id);
   assert(
-    s38OldRows.length === 1 && s38OldRows[0].date === "2027-01-10",
-    `A due date before interest started (2026-12-10) is skipped, the next one (2027-01-10) is charged (got ${s38OldRows.map((r) => r.date).join(",")})`
+    s38OldRows.length === 1 && s38OldRows[0].date === `${FUTURE_YEAR}-01-10`,
+    `A due date before interest started (${FUTURE_YEAR - 1}-12-10) is skipped, the next one (${FUTURE_YEAR}-01-10) is charged (got ${s38OldRows.map((r) => r.date).join(",")})`
   );
 
   // 38.11 Setting toggle: debt_interest_enabled
@@ -5735,10 +5782,10 @@ async function runTestSuite() {
   assert(s38Off.status === 200 && s38Off.body.enabled === false, "PUT /settings/debt-interest turns it off");
   const s38BadToggle = await s33("PUT", "/api/settings/debt-interest", { enabled: "maybe" });
   assert(s38BadToggle.status === 400, "PUT /settings/debt-interest rejects a non-boolean with 400");
-  const s38OffDebt = await s33("POST", "/api/debts", { name: "Suite 38 Off", total_amount: 800, next_due_date: "2027-01-12", interest_rate: 10 });
-  await s38Sweep({ todayStr: "2027-01-12" });
+  const s38OffDebt = await s33("POST", "/api/debts", { name: "Suite 38 Off", total_amount: 800, next_due_date: `${FUTURE_YEAR}-01-12`, interest_rate: 10 });
+  await s38Sweep({ todayStr: `${FUTURE_YEAR}-01-12` });
   assert((await s38InterestRows(s38OffDebt.body.id)).length === 0 && (await s38Bal(s38OffDebt.body.id)) === 800, "No interest while the setting is off");
-  const s38FcOff = await s38Forecast(60, null, [], { todayStr: "2027-04-30" });
+  const s38FcOff = await s38Forecast(60, null, [], { todayStr: `${FUTURE_YEAR}-04-30` });
   const s38FcOffLoan = s38FcOff.debts.find((d) => d.id === s38LoanId);
   assert(s38FcOffLoan && s38FcOffLoan.schedule.every((s) => s.interest === 0), "Forecast projects no interest while the setting is off");
   await s33("PUT", "/api/settings/debt-interest", { enabled: true });
@@ -5761,19 +5808,19 @@ async function runTestSuite() {
     "uuidV5 matches the RFC 4122 test vector (www.example.com in the DNS namespace)"
   );
   assert(s38Ns === "3f6c2b8e-5d4a-4e1b-9c7f-2a8d6e0b4c91", "Interest clientRefs use the fixed hard-coded FinTrack namespace");
-  const s38RefA = s38Ref("11111111-1111-4111-8111-111111111111", "2027-01-31");
+  const s38RefA = s38Ref("11111111-1111-4111-8111-111111111111", `${FUTURE_YEAR}-01-31`);
   assert(
-    s38RefA === s38V5("interest:11111111-1111-4111-8111-111111111111:2027-01-31", s38Ns) &&
+    s38RefA === s38V5(`interest:11111111-1111-4111-8111-111111111111:${FUTURE_YEAR}-01-31`, s38Ns) &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(s38RefA) &&
-      s38RefA === s38Ref("11111111-1111-4111-8111-111111111111", "2027-01-31") &&
-      s38RefA !== s38Ref("11111111-1111-4111-8111-111111111111", "2027-02-28"),
+      s38RefA === s38Ref("11111111-1111-4111-8111-111111111111", `${FUTURE_YEAR}-01-31`) &&
+      s38RefA !== s38Ref("11111111-1111-4111-8111-111111111111", `${FUTURE_YEAR}-02-28`),
     "interestClientRef is UUIDv5 of interest:<debtId>:<dueDate>, stable per key and different per due date"
   );
   const s38Idx = await sequelize.getQueryInterface().showIndex("Transactions");
   assert(s38Idx.some((i) => i.name === "transactions_client_ref_unique" && i.unique), "Unique index transactions_client_ref_unique exists on Transactions(clientRef)");
   let s38DupError = null;
   try {
-    await Transaction.create({ title: "Suite 38 dup", amount: 1, date: "2027-01-31", type: "EXPENSE", category: "Interest", clientRef: s38Row.clientRef });
+    await Transaction.create({ title: "Suite 38 dup", amount: 1, date: `${FUTURE_YEAR}-01-31`, type: "EXPENSE", category: "Interest", clientRef: s38Row.clientRef });
   } catch (err) {
     s38DupError = err;
   }
@@ -5804,13 +5851,15 @@ async function runTestSuite() {
   assert((await s38MissFlag()) === s38MissLast, "An unpaid (scheduled) payment does not clear the flag");
   await s38AdjRow.destroy();
   await Transaction.destroy({ where: { toAccountId: s38MissId } });
-  await Account.update({ dueDate: getTorontoToday() }, { where: { id: s38MissId } });
-  const s38TodayLast = s38Prev(getTorontoToday(), "monthly", s38Miss.body.dueDay);
+  // Move the due date through the API so dueDay follows it, as in the app. Writing only dueDate left
+  // dueDay on the old day, and whenever today + 10 fell in the next month the two disagreed
+  const s38MoveToToday = await s33("PUT", `/api/debts/${s38MissId}`, { next_due_date: getTorontoToday() });
+  const s38TodayLast = s38Prev(getTorontoToday(), "monthly", s38MoveToToday.body.dueDay);
   assert((await s38MissFlag()) === s38TodayLast, "On the due day itself, the earlier due date is the one checked");
 
   // 38.13 dueDay backfill on boot (one-off, behind a Setting flag; server initialize() calls it)
   const { backfillDebtDueDays: s38Backfill, DUE_DAY_BACKFILL_KEY: s38BackfillKey } = require("../services/debtInterestService");
-  const s38Legacy = await Account.create({ name: "Suite 38 Legacy", type: "DEBT", initialBalance: 50, dueDate: "2027-05-31", dueDay: null });
+  const s38Legacy = await Account.create({ name: "Suite 38 Legacy", type: "DEBT", initialBalance: 50, dueDate: `${FUTURE_YEAR}-05-31`, dueDay: null });
   await Setting.destroy({ where: { key: s38BackfillKey } });
   await s38Backfill(Account, Setting);
   assert((await Account.findByPk(s38Legacy.id)).dueDay === 31, "Backfill sets dueDay from the due date");
@@ -5834,7 +5883,7 @@ async function runTestSuite() {
   const s39Bal = async (id) => parseFloat((await Account.findByPk(id)).initialBalance);
   const s39Count = () => Transaction.count();
   const s39Reconcile = (id, body) => s33("POST", `/api/accounts/${id}/reconcile`, body);
-  const s39Debt = await s33("POST", "/api/debts", { name: "Suite 39 Loan", total_amount: 1000, next_due_date: "2027-06-01", interest_rate: 5 });
+  const s39Debt = await s33("POST", "/api/debts", { name: "Suite 39 Loan", total_amount: 1000, next_due_date: getTorontoOffsetDate(180), interest_rate: 5 });
   const s39DebtId = s39Debt.body.id;
   const s39Card = await s33("POST", "/api/credit-cards", { name: "Suite 39 Card", creditLimit: 2000, currentBalance: 200 });
   const s39CardId = s39Card.body.id;
@@ -5859,12 +5908,13 @@ async function runTestSuite() {
   const s39CheckingBefore = await s39CheckingBal(s39Checking, s39Today);
   s39Before = await s39Count();
   // The statement is dated before today's $12.34 of interest, so it is compared with the $1,000 owed then
-  const s39Down = await s39Reconcile(s39DebtId, { actualBalance: 990, reason: "adjustment", date: "2026-10-01" });
+  const s39StatementDate = getTorontoOffsetDate(-45);
+  const s39Down = await s39Reconcile(s39DebtId, { actualBalance: 990, reason: "adjustment", date: s39StatementDate });
   s39Row = await Transaction.findByPk(s39Down.body.transactionId);
   assert(s39Down.status === 201 && (await s39Count()) === s39Before + 1, "Debt down: exactly one row");
   assert(
     s39Row.type === "TRANSFER" && s39Row.category === "Adjustment" && s39Row.title === "Statement sync – Suite 39 Loan" &&
-      parseFloat(s39Row.amount) === 10 && s39Row.toAccountId === s39DebtId && !s39Row.fromAccountId && s39Row.date === "2026-10-01",
+      parseFloat(s39Row.amount) === 10 && s39Row.toAccountId === s39DebtId && !s39Row.fromAccountId && s39Row.date === s39StatementDate,
     `Debt down: a past statement is compared with the balance on its date ($1,000), so $10 towards the debt (got ${s39Row.amount})`
   );
   assert(s39Down.body.balanceOnDate === 1000 && s39Down.body.difference === -10, "Response shows the balance on the statement date and the difference");
@@ -5949,7 +5999,7 @@ async function runTestSuite() {
       net: (await getBalancesSummary()).netWorth,
     };
   };
-  const s39Debt2 = await s33("POST", "/api/debts", { name: "Suite 39 Spend Loan", total_amount: 1000, next_due_date: "2027-06-01" });
+  const s39Debt2 = await s33("POST", "/api/debts", { name: "Suite 39 Spend Loan", total_amount: 1000, next_due_date: getTorontoOffsetDate(180) });
   const s39Card2 = await s33("POST", "/api/credit-cards", { name: "Suite 39 Spend Card", creditLimit: 2000, currentBalance: 100 });
   const s39T0 = await s39Totals();
   const s39Adj = [
@@ -5994,7 +6044,7 @@ async function runTestSuite() {
   await Budget.destroy({ where: { category: ["Interest", "Adjustment"] } });
 
   // 39.8 A past statement date on Checking, and a double submit
-  const s39Past = "2026-09-15";
+  const s39Past = getTorontoOffsetDate(-60);
   const { getBalanceAsOf: s39AsOf } = require("../services/reconcileService");
   const s39ThenBefore = await s39AsOf(await s39GetChecking(), s39Past, s39Today);
   const s39CNow = await s39CheckingBal(await s39GetChecking(), s39Today);
@@ -6198,19 +6248,19 @@ async function runTestSuite() {
   assert((await s40Purge()) >= 1 && (await Transaction.findByPk(s40Placeholder.id, { paranoid: false })) === null, "It is purged once the series has moved past it");
 
   // 40.5 A deleted interest row is not charged again and does not break the sweep
-  const s40Loan = await s33("POST", "/api/debts", { name: "Suite 40 Loan", total_amount: 1200, monthly_payment: 0, next_due_date: "2027-06-15", interest_rate: 12 });
+  const s40Loan = await s33("POST", "/api/debts", { name: "Suite 40 Loan", total_amount: 1200, monthly_payment: 0, next_due_date: `${FUTURE_YEAR}-06-15`, interest_rate: 12 });
   const s40LoanId = s40Loan.body.id;
   const s40StartSetting = await Setting.findByPk("debt_interest_start_date");
-  await Setting.upsert({ key: "debt_interest_start_date", value: "2027-01-01" });
-  await s40Sweep({ todayStr: "2027-06-15" });
-  const s40Interest = await Transaction.findOne({ where: { clientRef: s40InterestRef(s40LoanId, "2027-06-15") } });
+  await Setting.upsert({ key: "debt_interest_start_date", value: `${FUTURE_YEAR}-01-01` });
+  await s40Sweep({ todayStr: `${FUTURE_YEAR}-06-15` });
+  const s40Interest = await Transaction.findOne({ where: { clientRef: s40InterestRef(s40LoanId, `${FUTURE_YEAR}-06-15`) } });
   assert(s40Interest && parseFloat(s40Interest.amount) === 12 && (await s40Bal(s40LoanId)) === 1212, "The sweep charges $12.00 interest on the loan");
   await s33("DELETE", `/api/expenses/${s40Interest.id}`);
   assert((await s40Bal(s40LoanId)) === 1200, "Deleting the interest row takes it off the loan");
-  await Account.update({ dueDate: "2027-06-15" }, { where: { id: s40LoanId } });
+  await Account.update({ dueDate: `${FUTURE_YEAR}-06-15` }, { where: { id: s40LoanId } });
   let s40SweepErr = null;
   try {
-    await s40Sweep({ todayStr: "2027-06-15" });
+    await s40Sweep({ todayStr: `${FUTURE_YEAR}-06-15` });
   } catch (err) {
     s40SweepErr = err;
   }
@@ -6457,18 +6507,19 @@ async function runTestSuite() {
   // 41.4 The anchor day is kept: a month-end series whose newest row is One-time
   const s41RentGroup = require("crypto").randomUUID();
   await Transaction.bulkCreate([
-    { title: "Suite 41 Month-End Rent", amount: 100, date: "2027-01-31", type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s41RentGroup },
-    { title: "Suite 41 Month-End Rent", amount: 130, date: "2027-02-28", type: "EXPENSE", category: "Essentials", isCleared: false, recurrence: "none", recurringGroupId: s41RentGroup },
+    { title: "Suite 41 Month-End Rent", amount: 100, date: `${FUTURE_YEAR}-01-31`, type: "EXPENSE", category: "Essentials", isCleared: true, recurrence: "monthly", recurringGroupId: s41RentGroup },
+    { title: "Suite 41 Month-End Rent", amount: 130, date: `${FUTURE_YEAR}-02-28`, type: "EXPENSE", category: "Essentials", isCleared: false, recurrence: "none", recurringGroupId: s41RentGroup },
   ]);
-  await s41Generate(null, { todayStr: "2027-03-05" });
+  await s41Generate(null, { todayStr: `${FUTURE_YEAR}-03-05` });
   const s41RentRows = await s41Rows(s41RentGroup);
   assert(
-    s41RentRows.length === 3 && s41RentRows[2].date === "2027-03-31" && parseFloat(s41RentRows[2].amount) === 100 &&
+    s41RentRows.length === 3 && s41RentRows[2].date === `${FUTURE_YEAR}-03-31` && parseFloat(s41RentRows[2].amount) === 100 &&
       s41RentRows[2].recurrence === "monthly" && s41RentRows[1].recurrence === "none",
     `After a One-time Feb 28 row the series continues on Mar 31 at $100.00 (got ${s41RentRows.map((r) => `${r.date}:${r.amount}:${r.recurrence}`).join(",")})`
   );
 
   // 41.5 One-off migration: series that stopped under the old rule (newest row One-time) end for good
+  // Deliberately in the past: an old series that stopped under the old rule
   const s41OldGroup = require("crypto").randomUUID();
   const [, , s41OldTrashed] = await Transaction.bulkCreate([
     { title: "Suite 41 Old Stopped", amount: 5, date: "2026-01-01", type: "EXPENSE", category: "Other", isCleared: true, recurrence: "weekly", recurringGroupId: s41OldGroup },
@@ -7627,6 +7678,7 @@ async function runTestSuite() {
       s45List.body[0].accountName === "Suite45 Visa",
     "Rules are created and listed in priority order (lowest number first) with the account's name"
   );
+  // Fixed past dates: rules match on the payee name only
   const s45Eats = await api("POST", "/api/expenses", { name: "SUITE45 UBER EATS order", amount: 20, due_date: "2026-09-01", is_paid: true });
   const s45Ride = await api("POST", "/api/expenses", { name: "Suite45 Uber trip", amount: 15, due_date: "2026-09-01", is_paid: true });
   const s45EatsRow = await Transaction.findByPk(s45Eats.body.id);
@@ -7669,6 +7721,9 @@ async function runTestSuite() {
   await Transaction.destroy({ where: { title: { [Op.like]: "suite45 %" } }, force: true });
 
   console.log("\n--- Suite 47: Checking import (RBC format): match, new, re-import ---");
+  // Suites 47-53 use fixed past dates: test/fixtures/*.csv hold Sep 2026 rows, the rows created here are
+  // meant to match them, and an import only compares rows with each other. Past dates stay past, so this is
+  // safe on any run date (the Ledger checks pass an explicit from=, since its default window is 3 months).
   const s47Checking = await s45GetChecking();
   const s47Accounts = await api("GET", "/api/import/accounts");
   assert(
@@ -7873,7 +7928,9 @@ async function runTestSuite() {
 
   console.log("\n--- Suite 50: Review inbox ---");
   const s50Inbox = await api("GET", "/api/import/review");
-  const s50All = await api("GET", "/api/expenses/all");
+  // The imported rows carry the CSV fixtures' fixed past dates, so ask the Ledger from before them
+  // (its default window is only the last 3 months)
+  const s50All = await api("GET", "/api/expenses/all?from=2025-01-01");
   const s50Imported = [...s47Commit.body.ids, ...s48Commit.body.ids, ...s48EditCommit.body.ids].filter((id) => id !== s47Streaming.id);
   assert(
     s50Inbox.status === 200 && s50Imported.every((id) => s50Inbox.body.some((r) => r.id === id)) &&
@@ -8341,7 +8398,7 @@ async function runTestSuite() {
   );
 
   // A fixed "today" of Mar 5, 2026: the last statement closed Feb 28 (statement day 31), due Mar 25
-  const s54Today = "2026-03-05";
+  const s54Today = "2026-03-05"; // fixed: every statement and forecast call below passes s54Today
   await s54Card.update({ initialBalance: 700 });
   const s54Row = (title, amount, date, extra = {}) =>
     Transaction.create({
@@ -8585,6 +8642,7 @@ async function runTestSuite() {
   );
   // This month's scheduled transfer counts as saved: the monthly amount stays the same once it's set up
   const { getSinkingFunds: s55Funds } = require("../services/sinkingFundService");
+  // Fixed dates: every s55Funds call below passes "2026-10-28" as today
   const s55Jan = await Account.create({
     name: "Suite55 Jan Fund", type: "SAVINGS_GOAL", initialBalance: 0, targetAmount: 1050, dueDate: "2027-01-30",
     linkedRecurringGroupId: s55Bill.recurringGroupId,
@@ -8648,20 +8706,22 @@ async function runTestSuite() {
       `a hydro bill that varies, a series with only two amounts, or a change from 50 days ago (got ${JSON.stringify(s56Pending)})`
   );
   const s56Tomorrow = getTorontoOffsetDate(1);
+  // Read the digest without the month close, which on the 1st lists the month's price rises too
+  const s56Msg = (digest) => withoutMonthClose(digest?.message);
   const s56D1 = await s56Digest(null, { todayStr: s56Today });
   const s56D2 = await s56Digest(null, { todayStr: s56Today });
   const s56D2b = await s56Digest(null, { todayStr: s56Tomorrow });
   assert(
-    s56D1?.message.includes("Suite56 Netflix $16.49 → $18.99") && !s56D1.message.includes("Hydro") &&
-      (s56D2?.message || "").includes("Suite56 Netflix $16.49 → $18.99") &&
-      !(s56D2b?.message || "").includes("Suite56 Netflix"),
+    s56Msg(s56D1).includes("Suite56 Netflix $16.49 → $18.99") && !s56Msg(s56D1).includes("Hydro") &&
+      s56Msg(s56D2).includes("Suite56 Netflix $16.49 → $18.99") &&
+      !s56Msg(s56D2b).includes("Suite56 Netflix"),
     `The digest (sent to ntfy) says "Suite56 Netflix $16.49 → $18.99" on one day: a retry that day repeats it, ` +
       `the next day's digest doesn't (got ${JSON.stringify(s56D1?.message)})`
   );
   const s56Run2 = await s56Sweep({ todayStr: s56Today });
   const s56D3 = await s56Digest(null, { todayStr: s56Tomorrow });
   assert(
-    s56Run2.priceAlerts === 0 && !(s56D3?.message || "").includes("Suite56 Netflix"),
+    s56Run2.priceAlerts === 0 && !s56Msg(s56D3).includes("Suite56 Netflix"),
     `The next night the same change is not alerted again (got ${s56Run2.priceAlerts})`
   );
   // The next charges at the new price are not a change; once the new price is steady, a later rise is a new alert
@@ -8679,8 +8739,8 @@ async function runTestSuite() {
   const s56Run4 = await s56Sweep({ todayStr: s56Today });
   const s56D4 = await s56Digest(null, { todayStr: s56Today });
   assert(
-    s56Run3.priceAlerts === 0 && s56Run4.priceAlerts === 1 && s56D4?.message.includes("Suite56 Netflix $18.99 → $20.99") &&
-      !s56D4.message.includes("$16.49"),
+    s56Run3.priceAlerts === 0 && s56Run4.priceAlerts === 1 && s56Msg(s56D4).includes("Suite56 Netflix $18.99 → $20.99") &&
+      !s56Msg(s56D4).includes("$16.49"),
     `Same price again: no alert; a new rise ($18.99 -> $20.99) alerts once more (got ${s56Run3.priceAlerts}/${s56Run4.priceAlerts})`
   );
   await Transaction.destroy({ where: { title: { [Op.like]: "Suite56 %" } }, force: true });
@@ -10456,9 +10516,11 @@ async function runTestSuite() {
   const s71Parked = await Account.findAll({ where: { type: "DEBT", isActive: { [Op.ne]: false } } });
   for (const d of s71Parked) await d.update({ isActive: false });
   // Paid to $0 but not archived (Pay never archives), and older than the rest: it must not take a slot from an owing debt
+  const s71Due = getTorontoOffsetDate(20);
+  const s71DueLabel = `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(s71Due.slice(5, 7)) - 1]} ${Number(s71Due.slice(8))}`;
   const s71PaidOff = await Account.create({ name: "Suite71 Old Phone Plan", type: "DEBT", initialBalance: 0, targetAmount: 300, minimumPayment: 50, isActive: true });
   await new Promise((r) => setTimeout(r, 15));
-  const s71Loan = await Account.create({ name: "Suite71 Car Loan", type: "DEBT", initialBalance: 7500, targetAmount: 10000, minimumPayment: 350, dueDate: "2026-11-15", interestRate: 8.5, isActive: true });
+  const s71Loan = await Account.create({ name: "Suite71 Car Loan", type: "DEBT", initialBalance: 7500, targetAmount: 10000, minimumPayment: 350, dueDate: s71Due, interestRate: 8.5, isActive: true });
   await new Promise((r) => setTimeout(r, 15));
   const s71Family = await Account.create({ name: "Suite71 Family Loan", type: "DEBT", initialBalance: 600, targetAmount: null, minimumPayment: null, dueDate: null, interestRate: null, isActive: true });
   await new Promise((r) => setTimeout(r, 15));
@@ -10475,7 +10537,7 @@ async function runTestSuite() {
   const f71 = (await s71Get(`/api/export/widget.json?key=${s71Key}`)).body || {};
   assert(
     f71.debt1_name === "Suite71 Car Loan" && f71.debt1_balance === "$7,500" && f71.debt1_balance_raw === 7500 && f71.debt1_payment === "$350" &&
-      f71.debt1_due === "Nov 15" && f71.debt1_rate === "8.5%" && f71.debt1_pct_paid === 25,
+      f71.debt1_due === s71DueLabel && f71.debt1_rate === "8.5%" && f71.debt1_pct_paid === 25,
     `Debt with an original amount: % paid = (10,000 - 7,500) / 10,000 (got ${JSON.stringify(f71).match(/"debt1_[^}]*?"debt2_/)?.[0]})`
   );
   assert(
@@ -10547,10 +10609,10 @@ async function runTestSuite() {
   const { DEBT_INTEREST_START_KEY: s72StartKey, DEBT_INTEREST_SETTING_KEY: s72EnabledKey } = require("../services/debtInterestService");
   const s72StartBefore = await Setting.findByPk(s72StartKey);
   const s72EnabledBefore = await Setting.findByPk(s72EnabledKey);
-  await Setting.upsert({ key: s72StartKey, value: "2027-01-01" });
+  await Setting.upsert({ key: s72StartKey, value: `${FUTURE_YEAR}-01-01` });
   await Setting.upsert({ key: s72EnabledKey, value: "true" });
   const s72Checking = await Account.findOne({ where: { name: "Primary Checking" } });
-  const s72Today = "2027-06-10"; // fixed: the window runs to 2027-08-08
+  const s72Today = `${FUTURE_YEAR}-06-10`; // fixed calendar in FUTURE_YEAR: the window runs to Aug 8
   const s72Made = [];
   const s72Debt = async (fields) => {
     const d = await Account.create({ type: "DEBT", autoPay: false, isActive: true, paymentFrequency: "monthly", interestRate: 0, ...fields });
@@ -10571,26 +10633,26 @@ async function runTestSuite() {
 
   // 72.1 Monthly debt at 12% APR. The sweep already moved its due date on from May 15, and nothing was paid
   //      in May's cycle, so May's payment is overdue and paid today; then Jun 15 and Jul 15
-  const s72Loan = await s72Debt({ name: "Suite72 Loan", initialBalance: 1000, targetAmount: 1000, minimumPayment: 100, interestRate: 12, dueDate: "2027-06-15", dueDay: 15 });
+  const s72Loan = await s72Debt({ name: "Suite72 Loan", initialBalance: 1000, targetAmount: 1000, minimumPayment: 100, interestRate: 12, dueDate: `${FUTURE_YEAR}-06-15`, dueDay: 15 });
   let s72F = await s72Fc();
   let s72LoanItems = s72Items(s72F, "Suite72 Loan payment");
   assert(
     s72LoanItems.map((i) => `${i.date}:${i.amount}${i.overdue ? ":overdue" : ""}`).join(",") ===
-      "2027-06-10:-100:overdue,2027-06-15:-100,2027-07-15:-100",
+      `${FUTURE_YEAR}-06-10:-100:overdue,${FUTURE_YEAR}-06-15:-100,${FUTURE_YEAR}-07-15:-100`,
     `Unpaid May due date is an overdue payment today, then one payment per due date (got ${s72LoanItems.map((i) => `${i.date}:${i.amount}`).join(",")})`
   );
   const s72Next = (s72F.manualDebtPayments || []).find((p) => p.debtId === s72Loan.id);
   assert(
-    s72Next && s72Next.dueDate === "2027-05-15" && s72Next.date === s72Today && s72Next.overdue === true && s72Next.amount === 100 && s72Next.title === "Suite72 Loan payment",
+    s72Next && s72Next.dueDate === `${FUTURE_YEAR}-05-15` && s72Next.date === s72Today && s72Next.overdue === true && s72Next.amount === 100 && s72Next.title === "Suite72 Loan payment",
     `manualDebtPayments lists the overdue May 15 payment first (got ${JSON.stringify(s72Next)})`
   );
 
   // 72.2 A payment in May's cycle (Apr 15, May 15] covers May: counted once, from Jun 15 on, interest included
-  await s72Pay(s72Loan, "2027-05-14", 100);
+  await s72Pay(s72Loan, `${FUTURE_YEAR}-05-14`, 100);
   s72F = await s72Fc();
   s72LoanItems = s72Items(s72F, "Suite72 Loan payment");
   assert(
-    s72LoanItems.map((i) => `${i.date}:${i.amount}`).join(",") === "2027-06-15:-100,2027-07-15:-100",
+    s72LoanItems.map((i) => `${i.date}:${i.amount}`).join(",") === `${FUTURE_YEAR}-06-15:-100,${FUTURE_YEAR}-07-15:-100`,
     `Paid in May's cycle: nothing overdue, one payment on each of Jun 15 and Jul 15 (got ${s72LoanItems.map((i) => `${i.date}:${i.amount}`).join(",")})`
   );
   const s72LoanProj = (s72F.debts || []).find((d) => d.id === s72Loan.id);
@@ -10600,55 +10662,55 @@ async function runTestSuite() {
   );
 
   // 72.3 A payment already scheduled in Jun's cycle (May 15, Jun 15] skips Jun 15; it shows once, as itself
-  await s72Pay(s72Loan, "2027-06-12", 100, false);
+  await s72Pay(s72Loan, `${FUTURE_YEAR}-06-12`, 100, false);
   s72F = await s72Fc();
   s72LoanItems = s72Items(s72F, "Suite72 Loan payment");
   const s72Scheduled = s72Items(s72F, "Payment for Suite72 Loan");
   assert(
-    s72LoanItems.map((i) => i.date).join(",") === "2027-07-15" && s72Scheduled.map((i) => `${i.date}:${i.amount}`).join(",") === "2027-06-12:-100",
+    s72LoanItems.map((i) => i.date).join(",") === `${FUTURE_YEAR}-07-15` && s72Scheduled.map((i) => `${i.date}:${i.amount}`).join(",") === `${FUTURE_YEAR}-06-12:-100`,
     `A payment in the cycle skips that due date; Checking pays $100 once (got ${s72LoanItems.map((i) => i.date).join(",")} + ${s72Scheduled.map((i) => i.date).join(",")})`
   );
 
   // 72.4 A late payment for an overdue due date covers only that due date, not the next one too
-  const s72Late = await s72Debt({ name: "Suite72 Late", initialBalance: 600, minimumPayment: 50, dueDate: "2027-06-20", dueDay: 20 });
-  await s72Pay(s72Late, "2027-06-08", 50); // May 20 was due; paid late on Jun 8
+  const s72Late = await s72Debt({ name: "Suite72 Late", initialBalance: 600, minimumPayment: 50, dueDate: `${FUTURE_YEAR}-06-20`, dueDay: 20 });
+  await s72Pay(s72Late, `${FUTURE_YEAR}-06-08`, 50); // May 20 was due; paid late on Jun 8
   s72F = await s72Fc();
   assert(
-    s72Items(s72F, "Suite72 Late payment").map((i) => i.date).join(",") === "2027-06-20,2027-07-20",
+    s72Items(s72F, "Suite72 Late payment").map((i) => i.date).join(",") === `${FUTURE_YEAR}-06-20,${FUTURE_YEAR}-07-20`,
     `A late payment covers the overdue May 20 only; Jun 20 and Jul 20 still count (got ${s72Items(s72F, "Suite72 Late payment").map((i) => i.date).join(",")})`
   );
 
   // 72.5 Never past payoff: $150 left at $100 a month pays $100, then $50, then nothing
-  const s72Small = await s72Debt({ name: "Suite72 Small", initialBalance: 150, minimumPayment: 100, dueDate: "2027-06-20", dueDay: 20 });
-  await s72Pay(s72Small, "2027-05-20", 100);
+  const s72Small = await s72Debt({ name: "Suite72 Small", initialBalance: 150, minimumPayment: 100, dueDate: `${FUTURE_YEAR}-06-20`, dueDay: 20 });
+  await s72Pay(s72Small, `${FUTURE_YEAR}-05-20`, 100);
   s72F = await s72Fc();
   assert(
-    s72Items(s72F, "Suite72 Small payment").map((i) => `${i.date}:${i.amount}`).join(",") === "2027-06-20:-100,2027-07-20:-50",
+    s72Items(s72F, "Suite72 Small payment").map((i) => `${i.date}:${i.amount}`).join(",") === `${FUTURE_YEAR}-06-20:-100,${FUTURE_YEAR}-07-20:-50`,
     `Last payment capped at the balance, none after $0 (got ${s72Items(s72F, "Suite72 Small payment").map((i) => `${i.date}:${i.amount}`).join(",")})`
   );
 
   // 72.5b A stored due date several periods back (edited to the past) owes one overdue payment today, not three
-  const s72Stale = await s72Debt({ name: "Suite72 Stale", initialBalance: 2000, minimumPayment: 100, dueDate: "2027-03-20", dueDay: 20 });
+  const s72Stale = await s72Debt({ name: "Suite72 Stale", initialBalance: 2000, minimumPayment: 100, dueDate: `${FUTURE_YEAR}-03-20`, dueDay: 20 });
   s72F = await s72Fc();
   assert(
     s72Items(s72F, "Suite72 Stale payment").map((i) => `${i.date}:${i.amount}:${i.dueDate}`).join(",") ===
-      "2027-06-10:-100:2027-05-20,2027-06-20:-100:2027-06-20,2027-07-20:-100:2027-07-20",
+      `${FUTURE_YEAR}-06-10:-100:${FUTURE_YEAR}-05-20,${FUTURE_YEAR}-06-20:-100:${FUTURE_YEAR}-06-20,${FUTURE_YEAR}-07-20:-100:${FUTURE_YEAR}-07-20`,
     `Only the latest passed due date (May 20) is overdue today (got ${s72Items(s72F, "Suite72 Stale payment").map((i) => `${i.date}:${i.dueDate}`).join(",")})`
   );
 
   // 72.6 Bi-weekly: every 14 days; the payment on Jun 5 covers the Jun 3 due date
-  const s72Bi = await s72Debt({ name: "Suite72 Biweekly", initialBalance: 1000, minimumPayment: 60, paymentFrequency: "bi-weekly", dueDate: "2027-06-17", dueDay: 17 });
-  await s72Pay(s72Bi, "2027-06-05", 60);
+  const s72Bi = await s72Debt({ name: "Suite72 Biweekly", initialBalance: 1000, minimumPayment: 60, paymentFrequency: "bi-weekly", dueDate: `${FUTURE_YEAR}-06-17`, dueDay: 17 });
+  await s72Pay(s72Bi, `${FUTURE_YEAR}-06-05`, 60);
   s72F = await s72Fc();
   assert(
     s72Items(s72F, "Suite72 Biweekly payment").map((i) => `${i.date}:${i.amount}`).join(",") ===
-      "2027-06-17:-60,2027-07-01:-60,2027-07-15:-60,2027-07-29:-60",
+      `${FUTURE_YEAR}-06-17:-60,${FUTURE_YEAR}-07-01:-60,${FUTURE_YEAR}-07-15:-60,${FUTURE_YEAR}-07-29:-60`,
     `Bi-weekly debt pays every 14 days (got ${s72Items(s72F, "Suite72 Biweekly payment").map((i) => i.date).join(",")})`
   );
 
   // 72.7 Not projected: auto-pay debts keep their own line, and a debt with no minimum payment pays nothing
-  const s72Auto = await s72Debt({ name: "Suite72 Auto", initialBalance: 500, minimumPayment: 40, autoPay: true, dueDate: "2027-06-25", dueDay: 25 });
-  const s72NoMin = await s72Debt({ name: "Suite72 NoMin", initialBalance: 500, minimumPayment: null, dueDate: "2027-06-25", dueDay: 25 });
+  const s72Auto = await s72Debt({ name: "Suite72 Auto", initialBalance: 500, minimumPayment: 40, autoPay: true, dueDate: `${FUTURE_YEAR}-06-25`, dueDay: 25 });
+  const s72NoMin = await s72Debt({ name: "Suite72 NoMin", initialBalance: 500, minimumPayment: null, dueDate: `${FUTURE_YEAR}-06-25`, dueDay: 25 });
   s72F = await s72Fc();
   assert(
     s72Items(s72F, "Auto-Pay for Suite72 Auto").length === 2 && s72Items(s72F, "Suite72 Auto payment").length === 0 &&
@@ -10658,7 +10720,7 @@ async function runTestSuite() {
 
   // 72.8 Safe to Spend and the lowest point drop by the payment. A yearly debt whose due date passed
   //      before the sweep ran pays today, and its next payment is a year away
-  const s72Yearly = await s72Debt({ name: "Suite72 Yearly", initialBalance: 900, minimumPayment: 200, paymentFrequency: "yearly", dueDate: "2027-06-01", dueDay: 1 });
+  const s72Yearly = await s72Debt({ name: "Suite72 Yearly", initialBalance: 900, minimumPayment: 200, paymentFrequency: "yearly", dueDate: `${FUTURE_YEAR}-06-01`, dueDay: 1 });
   const s72Cushion = [{ date: s72Today, amount: 100000, title: "Suite72 cushion" }];
   const s72With = await s72Forecast(60, null, s72Cushion, { todayStr: s72Today });
   await s72Yearly.update({ isActive: false });
@@ -10718,7 +10780,8 @@ async function runTestSuite() {
   const s72DashAfter = (await s72Send("GET", `/api/dashboard?year=${s72Y}&month=${s72M}`)).body || {};
   const s72FcAfter = (await s72Send("GET", "/api/forecast?days=60")).body;
   assert(
-    s72Paid.status === 200 && !(s72DashAfter.upcomingDebtPayments || []).some((p) => p.debtId === s72Overdue.id) &&
+    // Only today's overdue row must go: on the 1st the next due date (the 30th/31st) is in this month's list too
+    s72Paid.status === 200 && !(s72DashAfter.upcomingDebtPayments || []).some((p) => p.debtId === s72Overdue.id && p.date === s72RealToday) &&
       !s72Items(s72FcAfter, "Suite72 Overdue payment").some((i) => i.date === s72RealToday),
     "After paying, the overdue payment leaves Upcoming Bills and the forecast"
   );
@@ -11013,10 +11076,17 @@ async function runTestSuite() {
   try {
     s77ProdLimits = require(s77Path);
   } finally {
-    process.env.NODE_ENV = s77SavedEnv.NODE_ENV;
-    process.env.RELAX_RATE_LIMIT = s77SavedEnv.RELAX_RATE_LIMIT;
+    // Assigning undefined to process.env stores the string "undefined", so remove a key that was unset
+    for (const [key, value] of Object.entries(s77SavedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     delete require.cache[s77Path];
   }
+  assert(
+    Object.entries(s77SavedEnv).every(([key, value]) => (value === undefined ? !(key in process.env) : process.env[key] === value)),
+    "Suite 77 puts NODE_ENV and RELAX_RATE_LIMIT back as they were (an unset key stays unset, not \"undefined\")"
+  );
   const s77App = require("express")();
   s77App.post("/login", s77ProdLimits.loginLimiter, (req, res) => res.json({ ok: true }));
   const s77Server = await new Promise((resolve) => {
