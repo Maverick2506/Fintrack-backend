@@ -2466,7 +2466,8 @@ async function runTestSuite() {
   // 18b. Editing a TRANSFER to target a DEBT account keeps it a TRANSFER (debt payments are transfers, C5)
   const s18Card = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 18 Card", currentBalance: 300.0, creditLimit: 1000.0, dueDate: "2026-11-20" }
+    // Due date kept well past the digest's 5-day card window (Suite 26 expects nothing due)
+    { name: "Suite 18 Card", currentBalance: 300.0, creditLimit: 1000.0, dueDate: getTorontoOffsetDate(20) }
   );
   assert(s18Card.status === 201 && s18Card.body.id, "Creates test card for transfer re-derivation");
   const s18CardId = s18Card.body.id;
@@ -4303,7 +4304,7 @@ async function runTestSuite() {
   const subCancelFutureUnpaid = await Transaction.create({
     title: "Spotify Family",
     amount: 18.99,
-    date: "2026-11-10",
+    date: getTorontoOffsetDate(30), // always in the future, so cancel removes it
     type: "EXPENSE",
     category: "Entertainment",
     recurrence: "monthly",
@@ -10990,6 +10991,46 @@ async function runTestSuite() {
   assert(
     s76Pair.every((r) => r.status === 200) && s76AfterPair === s76Before + 3,
     `Simultaneous sign-outs each add 1 (got ${s76Pair.map((r) => r.status).join(",")}, version ${s76Before} -> ${s76AfterPair})`
+  );
+
+  // --- Suite 77: RELAX_RATE_LIMIT never relaxes limits in production ---
+  console.log("\n--- Suite 77: RELAX_RATE_LIMIT is ignored in production (login stays at 10 tries) ---");
+  const s77Path = require.resolve("../middleware/rateLimit");
+  const { isRelaxedEnv: s77IsRelaxed } = require(s77Path);
+  assert(s77IsRelaxed({ NODE_ENV: "production", RELAX_RATE_LIMIT: "true" }) === false, "production + RELAX_RATE_LIMIT=true is not relaxed");
+  assert(s77IsRelaxed({ NODE_ENV: "production" }) === false, "production without the flag is not relaxed");
+  assert(s77IsRelaxed({ NODE_ENV: "test" }) === true, "test is always relaxed");
+  assert(s77IsRelaxed({ NODE_ENV: "development", RELAX_RATE_LIMIT: "true" }) === true, "development + RELAX_RATE_LIMIT=true is relaxed");
+  assert(s77IsRelaxed({ NODE_ENV: "development" }) === false, "development without the flag is not relaxed");
+
+  // Load the real module as production would (with the flag set) and check the
+  // login limiter lets 10 tries through and blocks the 11th.
+  const s77SavedEnv = { NODE_ENV: process.env.NODE_ENV, RELAX_RATE_LIMIT: process.env.RELAX_RATE_LIMIT };
+  delete require.cache[s77Path];
+  process.env.NODE_ENV = "production";
+  process.env.RELAX_RATE_LIMIT = "true";
+  let s77ProdLimits;
+  try {
+    s77ProdLimits = require(s77Path);
+  } finally {
+    process.env.NODE_ENV = s77SavedEnv.NODE_ENV;
+    process.env.RELAX_RATE_LIMIT = s77SavedEnv.RELAX_RATE_LIMIT;
+    delete require.cache[s77Path];
+  }
+  const s77App = require("express")();
+  s77App.post("/login", s77ProdLimits.loginLimiter, (req, res) => res.json({ ok: true }));
+  const s77Server = await new Promise((resolve) => {
+    const srv = s77App.listen(0, () => resolve(srv));
+  });
+  const s77Statuses = [];
+  for (let i = 0; i < 11; i++) {
+    const r = await request({ hostname: "localhost", port: s77Server.address().port, path: "/login", method: "POST" });
+    s77Statuses.push(r.status);
+  }
+  await new Promise((resolve) => s77Server.close(resolve));
+  assert(
+    s77Statuses.slice(0, 10).every((st) => st === 200) && s77Statuses[10] === 429,
+    `Production login limiter allows 10 tries then returns 429 even with RELAX_RATE_LIMIT=true (got ${s77Statuses.join(",")})`
   );
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");

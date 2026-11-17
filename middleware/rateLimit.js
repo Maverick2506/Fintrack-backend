@@ -1,8 +1,12 @@
 const rateLimit = require("express-rate-limit");
 
-const isRelaxed =
-  process.env.NODE_ENV === "test" ||
-  process.env.RELAX_RATE_LIMIT === "true";
+// Tests always get relaxed limits. RELAX_RATE_LIMIT only works outside
+// production, so a stray env var on Render can't open up the login limit.
+const isRelaxedEnv = (env = process.env) =>
+  env.NODE_ENV === "test" ||
+  (env.NODE_ENV !== "production" && env.RELAX_RATE_LIMIT === "true");
+
+const isRelaxed = isRelaxedEnv();
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -36,4 +40,4 @@ const apiLimiter = rateLimit({
   message: { error: "Too many requests. Try again shortly." },
 });
 
-module.exports = { loginLimiter, aiLimiter, feedLimiter, apiLimiter };
+module.exports = { loginLimiter, aiLimiter, feedLimiter, apiLimiter, isRelaxedEnv };
