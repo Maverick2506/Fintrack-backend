@@ -2466,7 +2466,8 @@ async function runTestSuite() {
   // 18b. Editing a TRANSFER to target a DEBT account keeps it a TRANSFER (debt payments are transfers, C5)
   const s18Card = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 18 Card", currentBalance: 300.0, creditLimit: 1000.0, dueDate: "2026-11-20" }
+    // Due date kept well past the digest's 5-day card window (Suite 26 expects nothing due)
+    { name: "Suite 18 Card", currentBalance: 300.0, creditLimit: 1000.0, dueDate: getTorontoOffsetDate(20) }
   );
   assert(s18Card.status === 201 && s18Card.body.id, "Creates test card for transfer re-derivation");
   const s18CardId = s18Card.body.id;
@@ -4303,7 +4304,7 @@ async function runTestSuite() {
   const subCancelFutureUnpaid = await Transaction.create({
     title: "Spotify Family",
     amount: 18.99,
-    date: "2026-11-10",
+    date: getTorontoOffsetDate(30), // always in the future, so cancel removes it
     type: "EXPENSE",
     category: "Entertainment",
     recurrence: "monthly",
