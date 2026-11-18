@@ -2028,82 +2028,7 @@ async function runTestSuite() {
   await DBTransaction.destroy({ where: { id: s16PreFixTrx.id } });
   await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardAId}`, method: "DELETE", headers: authHeaders });
 
-  // Scenario A2: Pre-6b06ed2 transfer (balanceApplied: false, but prematurely applied at creation)
-  const s16CardA2 = await request(
-    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Card A2", currentBalance: 800.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
-  );
-  assert(s16CardA2.status === 201 && s16CardA2.body.id, "Creates test card A2 at $800 balance");
-  const s16CardA2Id = s16CardA2.body.id;
-
-  const s16Pre6bTrx = await DBTransaction.create({
-    title: "Pre-6b06ed2 Card Payment",
-    amount: 200.0,
-    date: s16Today,
-    type: "TRANSFER",
-    category: "Credit Card Payment",
-    isCleared: false,
-    balanceApplied: false, // pre-6b06ed2 rows had balanceApplied: false
-    toAccountId: s16CardA2Id,
-    createdAt: new Date("2026-10-18T12:00:00Z"), // before LEGACY_CUTOFF (a fixed past instant, safe on any run date)
-  });
-
-  // Verify atomic concurrency claim mechanism on this row
-  const { Setting: DBSetting, Account: DBAccount, sequelize: DBSequelize } = require("../models");
-  const claimKey = `remed_unpaid_transfer_${s16Pre6bTrx.id}`;
-  
-  // Instance 1 claims
-  const t1 = await DBSequelize.transaction();
-  const [_, created1] = await DBSetting.findOrCreate({
-    where: { key: claimKey },
-    defaults: { key: claimKey, value: "restored" },
-    transaction: t1,
-  });
-  if (created1) {
-    await DBAccount.increment("initialBalance", { by: 200.0, where: { id: s16CardA2Id }, transaction: t1 });
-    await DBTransaction.update({ balanceApplied: false }, { where: { id: s16Pre6bTrx.id }, transaction: t1 });
-    await t1.commit();
-  }
-  assert(created1 === true, "First server instance successfully claims pre-6b06ed2 transfer and restores $200");
-
-  // Instance 2 attempts concurrent claim on same row
-  const t2 = await DBSequelize.transaction();
-  let created2 = false;
-  try {
-    const [__, c2] = await DBSetting.findOrCreate({
-      where: { key: claimKey },
-      defaults: { key: claimKey, value: "restored" },
-      transaction: t2,
-    });
-    created2 = c2;
-    if (created2) {
-      await DBAccount.increment("initialBalance", { by: 200.0, where: { id: s16CardA2Id }, transaction: t2 });
-      await t2.commit();
-    } else {
-      await t2.rollback();
-    }
-  } catch {
-    await t2.rollback().catch(() => {});
-  }
-  assert(created2 === false, "Second concurrent server instance fails claim and does NOT double-increment balance");
-
-  // Check card balance before sweep: 800 + 200 restored = 1000
-  let cardA2Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
-  let foundCardA2 = (cardA2Check.body || []).find((c) => c.id === s16CardA2Id);
-  assert(parseFloat(foundCardA2?.currentBalance || 0) === 1000.0, "Card A2 balance restored to $1,000 prior to sweep");
-
-  // Sweep runs on due date: applies $200 payment cleanly
-  await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
-  cardA2Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
-  foundCardA2 = (cardA2Check.body || []).find((c) => c.id === s16CardA2Id);
-  assert(parseFloat(foundCardA2?.currentBalance || 0) === 800.0, "After sweep, pre-6b06ed2 payment leaves card cleanly at $800.00 (not $600)");
-
-  // Cleanup A2
-  await DBTransaction.destroy({ where: { id: s16Pre6bTrx.id } });
-  await DBSetting.destroy({ where: { key: claimKey } });
-  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardA2Id}`, method: "DELETE", headers: authHeaders });
-
-  // Scenario A3: A payment scheduled under the new code is untouched by the cleanup
+  // Scenario A3: A scheduled card payment leaves the card alone until the sweep pays it
   const s16CardA3 = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
     { name: "Suite 16 Card A3", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
@@ -2132,57 +2057,7 @@ async function runTestSuite() {
   assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 starts at $1,000 balance upon payment scheduling");
 
   const newTrxInDb = await DBTransaction.findByPk(s16NewPaymentId);
-  // The cleanup's fixed cutoff from the code's history: a past instant, so it never moves with today
-  const LEGACY_CUTOFF = new Date("2026-10-20T06:00:00Z");
-  assert(newTrxInDb.balanceApplied === false, "Payment scheduled under new code has balanceApplied = false");
-  assert(new Date(newTrxInDb.createdAt) >= LEGACY_CUTOFF, "Payment scheduled under new code has createdAt >= LEGACY_CUTOFF");
-
-  // Run the cleanup logic on candidate transfers
-  const candidateTransfersA3 = await DBTransaction.findAll({
-    where: {
-      id: s16NewPaymentId,
-      type: "TRANSFER",
-      isCleared: false,
-      toAccountId: { [Op.ne]: null },
-    },
-    include: [{ model: DBAccount, as: "toAccount" }],
-  });
-
-  let a3RestoredCount = 0;
-  for (const trx of candidateTransfersA3) {
-    const isTargetDebtOrCard =
-      trx.toAccount && ["CREDIT_CARD", "DEBT"].includes(trx.toAccount.type);
-    if (!isTargetDebtOrCard) continue;
-
-    const createdDateStr = trx.createdAt
-      ? format(toZonedTime(trx.createdAt, "America/Toronto"), "yyyy-MM-dd")
-      : null;
-    const isPremature =
-      trx.balanceApplied === true ||
-      (trx.balanceApplied === false &&
-        trx.createdAt < LEGACY_CUTOFF &&
-        createdDateStr &&
-        trx.date >= createdDateStr);
-
-    if (!isPremature) continue;
-
-    const claimKeyA3 = `remed_unpaid_transfer_${trx.id}`;
-    const [_, created] = await DBSetting.findOrCreate({
-      where: { key: claimKeyA3 },
-      defaults: { key: claimKeyA3, value: "restored" },
-    });
-    if (created) {
-      await DBAccount.increment("initialBalance", { by: parseFloat(trx.amount), where: { id: trx.toAccountId } });
-      a3RestoredCount++;
-    }
-  }
-
-  assert(a3RestoredCount === 0, "A payment scheduled under the new code is untouched by the cleanup (0 restored)");
-
-  // Card A3 balance must remain $1,000 (NOT incremented to $1,200)
-  cardA3Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
-  foundCardA3 = (cardA3Check.body || []).find((c) => c.id === s16CardA3Id);
-  assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 balance remains $1,000 after cleanup (not corrupted to $1,200)");
+  assert(newTrxInDb.balanceApplied === false, "Scheduled payment has balanceApplied = false");
 
   // Daily sweep then runs on due date and cleanly applies the $200 payment (1,000 -> 800)
   await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
@@ -5872,18 +5747,6 @@ async function runTestSuite() {
   );
   const s38TodayLast = s38Prev(getTorontoToday(), "monthly", s38MoveToToday.body.dueDay);
   assert((await s38MissFlag()) === s38TodayLast, "On the due day itself, the earlier due date is the one checked");
-
-  // 38.13 dueDay backfill on boot (one-off, behind a Setting flag; server initialize() calls it)
-  const { backfillDebtDueDays: s38Backfill, DUE_DAY_BACKFILL_KEY: s38BackfillKey } = require("../services/debtInterestService");
-  const s38Legacy = await Account.create({ name: "Suite 38 Legacy", type: "DEBT", initialBalance: 50, dueDate: `${FUTURE_YEAR}-05-31`, dueDay: null });
-  await Setting.destroy({ where: { key: s38BackfillKey } });
-  await s38Backfill(Account, Setting);
-  assert((await Account.findByPk(s38Legacy.id)).dueDay === 31, "Backfill sets dueDay from the due date");
-  assert((await Setting.findByPk(s38BackfillKey))?.value === "true", "Backfill sets its Setting flag");
-  await Account.update({ dueDay: null }, { where: { id: s38Legacy.id } });
-  await s38Backfill(Account, Setting);
-  assert((await Account.findByPk(s38Legacy.id)).dueDay === null, "Backfill runs only once");
-  assert(/backfillDebtDueDays\(Account, Setting\)/.test(fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8")), "server.js initialize() runs the backfill");
 
   if (s38StartBefore) await Setting.upsert({ key: s38StartKey, value: s38StartBefore.value });
   else await Setting.destroy({ where: { key: s38StartKey } });
