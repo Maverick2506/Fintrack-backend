@@ -1,5 +1,6 @@
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -119,11 +120,7 @@ router.post(
     const dbTx = await sequelize.transaction();
     try {
       const debt = await Account.findByPk(req.params.id, { transaction: dbTx });
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
 
       if (!debt || debt.type !== "DEBT") {
         await dbTx.rollback();

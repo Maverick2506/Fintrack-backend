@@ -1,6 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { sequelize, Transaction, Account } = require("../models");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -373,11 +374,7 @@ router.post(
         }
       }
 
-      let [fromAccount] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      let fromAccount = await getPrimaryCheckingAccount(dbTx);
 
       // Resolve whether this expense pays down a specific Debt or Credit Card.
       // Name matching only runs when the client sent no target field at all (e.g. quick add);
@@ -569,11 +566,7 @@ router.put(
         if (req.body.creditCardId) {
           fromAccountId = req.body.creditCardId;
         } else {
-          const [checking] = await Account.findOrCreate({
-            where: { name: "Primary Checking" },
-            defaults: { type: "CHECKING", initialBalance: 0.0 },
-            transaction: dbTx,
-          });
+          const checking = await getPrimaryCheckingAccount(dbTx);
           fromAccountId = checking.id;
         }
       }

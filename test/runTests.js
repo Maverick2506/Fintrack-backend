@@ -11172,6 +11172,38 @@ async function runTestSuite() {
     );
   }
 
+  // 78.2 Renaming Checking never makes a second one: an expense, a paycheque, a debt payment and a goal
+  // contribution all find Checking by type (getPrimaryCheckingAccount), not by the name "Primary Checking"
+  const s78Checking = await require("../services/checkingService").getPrimaryCheckingAccount();
+  const s78CheckingName = s78Checking.name;
+  await Account.update({ name: `Suite78 Renamed Chequing ${s78Stamp}` }, { where: { id: s78Checking.id } });
+  const s78CheckingCount = await Account.count({ where: { type: "CHECKING" } });
+  const s78Expense = await s78("POST", "/api/expenses", { name: `Suite78 Groceries ${s78Stamp}`, amount: 12.5, category: "Essentials", due_date: getTorontoToday(), is_paid: true });
+  const s78Pay = await s78("POST", "/api/paycheques", { name: `Suite78 Pay ${s78Stamp}`, amount: 25, payment_date: getTorontoToday() });
+  const s78DebtPay = await s78("POST", `/api/debts/${s78DebtRes.body.id}/pay`, { amount: 5 });
+  const s78GoalPay = await s78("POST", `/api/savings-goals/${s78GoalRes.body.id}/contribute`, { amount: 5 });
+  assert(
+    [s78Expense, s78Pay, s78DebtPay, s78GoalPay].map((r) => r.status).join(",") === "201,201,200,200",
+    `Expense, paycheque, debt payment and goal contribution save with Checking renamed (got ${[s78Expense, s78Pay, s78DebtPay, s78GoalPay].map((r) => r.status)})`
+  );
+  const s78CheckingAfter = await Account.count({ where: { type: "CHECKING" } });
+  const s78ByName = await Account.count({ where: { name: "Primary Checking" } });
+  assert(
+    s78CheckingAfter === s78CheckingCount && s78ByName === 0,
+    `No second Checking is created (CHECKING accounts ${s78CheckingCount} -> ${s78CheckingAfter}, named "Primary Checking": ${s78ByName})`
+  );
+  const s78ExpenseRow = await Transaction.findByPk(s78Expense.body.id);
+  const s78PayRow = await Transaction.findByPk(s78Pay.body.id);
+  const s78DebtPayRow = await Transaction.findOne({ where: { toAccountId: s78DebtRes.body.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]] });
+  const s78GoalPayRow = await Transaction.findOne({ where: { toAccountId: s78GoalRes.body.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]] });
+  assert(
+    s78ExpenseRow?.fromAccountId === s78Checking.id && s78PayRow?.toAccountId === s78Checking.id &&
+      s78DebtPayRow?.fromAccountId === s78Checking.id && s78GoalPayRow?.fromAccountId === s78Checking.id,
+    "All four rows move the renamed Checking account"
+  );
+  await Transaction.destroy({ where: { id: [s78ExpenseRow?.id, s78PayRow?.id].filter(Boolean) }, force: true });
+  await Account.update({ name: s78CheckingName }, { where: { id: s78Checking.id } });
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

@@ -2,6 +2,7 @@ const { sequelize, Account, Transaction, Setting, NetWorthSnapshot } = require("
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const { adjustAccountForTransaction } = require("./accountBalanceService");
+const { getPrimaryCheckingAccount } = require("./checkingService");
 const {
   DEBT_INTEREST_START_KEY,
   computePeriodInterest,
@@ -245,11 +246,7 @@ const runDailySweep = async (options = {}) => {
     });
 
     if (dueAutoPayDebts.length > 0) {
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
 
       for (const debt of dueAutoPayDebts) {
         const remaining = parseFloat(debt.initialBalance) || 0;

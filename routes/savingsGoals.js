@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const express = require("express");
 const { sequelize, Account, Transaction } = require("../models");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const { subDays } = require("date-fns");
@@ -357,11 +358,7 @@ router.post(
     const dbTx = await sequelize.transaction();
     try {
       const goal = await Account.findByPk(req.params.id, { transaction: dbTx });
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
 
       if (!goal || goal.type !== "SAVINGS_GOAL") {
         await dbTx.rollback();
@@ -508,11 +505,7 @@ router.post(
         await dbTx.rollback();
         return res.status(409).json({ error: refusal });
       }
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
       // One scheduled transfer per contribution date up to the due date, so the transfers stop once
       // the bill is covered. They share a group id (one "series" in the Ledger) but none recurs, so
       // the generator never adds more. The last one is what's left, so they add up to the target.
