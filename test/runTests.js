@@ -11269,6 +11269,15 @@ async function runTestSuite() {
   );
   await Transaction.destroy({ where: { id: [s78OldPay.id, s78OldTrashed.id, s78OldBuy.id, s78OldCard.id] }, force: true });
 
+  // 78.5 The series routes refuse an id that isn't a UUID with 400 "Invalid series id"
+  const s78BadEnd = await s78("POST", "/api/recurring/not-a-uuid/end", {});
+  const s78BadCancel = await s78("POST", "/api/subscriptions/not-a-uuid/cancel");
+  assert(
+    s78BadEnd.status === 400 && s78BadEnd.body?.error === "Invalid series id" &&
+      s78BadCancel.status === 400 && s78BadCancel.body?.error === "Invalid series id",
+    `End series and cancel subscription refuse "not-a-uuid" (got ${s78BadEnd.status} ${s78BadEnd.body?.error}, ${s78BadCancel.status} ${s78BadCancel.body?.error})`
+  );
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

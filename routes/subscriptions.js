@@ -3,6 +3,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const { sequelize } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
 const { asyncHandler } = require("../middleware/errorHandler");
+const { validateSeriesIdParam } = require("../middleware/validate");
 const { endSeries, resolveSeries } = require("../services/seriesService");
 const { getSubscriptionsSummary } = require("../services/subscriptionService");
 const router = express.Router();
@@ -25,11 +26,9 @@ router.get(
 // POST /api/subscriptions/:recurringGroupId/cancel (Fix #2)
 router.post(
   "/:recurringGroupId/cancel",
+  validateSeriesIdParam,
   asyncHandler(async (req, res) => {
     const { recurringGroupId } = req.params;
-    if (!recurringGroupId) {
-      return res.status(400).json({ error: "Missing subscription identifier." });
-    }
 
     const nowZoned = toZonedTime(new Date(), TIMEZONE);
     const todayStr = format(nowZoned, "yyyy-MM-dd", { timeZone: TIMEZONE });
