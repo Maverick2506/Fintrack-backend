@@ -2536,8 +2536,8 @@ async function runTestSuite() {
     "Editing transfer to target a DEBT account keeps type TRANSFER"
   );
   assert(
-    s18RetargetDebt.body.category === "Debt",
-    "Editing transfer to target debt sets category to Debt"
+    s18RetargetDebt.body.category === "Debt Payment",
+    "Editing transfer to target debt sets category to Debt Payment"
   );
 
   // Edit transaction back to target the credit card: re-derives as TRANSFER
@@ -11137,7 +11137,7 @@ async function runTestSuite() {
   assert(s78CardRes.status === 201 && s78DebtRes.status === 201 && s78GoalRes.status === 201, `Suite 78 creates a card, a debt and a goal (${s78CardRes.status} ${s78DebtRes.status} ${s78GoalRes.status})`);
   const s78Flows = [
     { label: "Card payment", id: s78CardRes.body.id, path: `/api/credit-cards/${s78CardRes.body.id}/pay`, sign: -1, field: "currentBalance", category: "Credit Card Payment" },
-    { label: "Debt payment", id: s78DebtRes.body.id, path: `/api/debts/${s78DebtRes.body.id}/pay`, sign: -1, field: "total_remaining", category: "Debt" },
+    { label: "Debt payment", id: s78DebtRes.body.id, path: `/api/debts/${s78DebtRes.body.id}/pay`, sign: -1, field: "total_remaining", category: "Debt Payment" },
     { label: "Goal contribution", id: s78GoalRes.body.id, path: `/api/savings-goals/${s78GoalRes.body.id}/contribute`, sign: 1, field: "current_amount", category: "Savings Transfer" },
   ];
   for (const flow of s78Flows) {
@@ -11203,6 +11203,71 @@ async function runTestSuite() {
   );
   await Transaction.destroy({ where: { id: [s78ExpenseRow?.id, s78PayRow?.id].filter(Boolean) }, force: true });
   await Account.update({ name: s78CheckingName }, { where: { id: s78Checking.id } });
+
+  // 78.3 Debt payments get the system category "Debt Payment": the Pay button, auto-pay and a Ledger
+  // payment to a debt. "Debt" with no debt stays a purchase; a card payment stays "Credit Card Payment".
+  const s78AutoDebt = await Account.create({
+    name: `Suite78 Auto Loan ${s78Stamp}`, type: "DEBT", initialBalance: 300, targetAmount: 300,
+    minimumPayment: 50, dueDate: getTorontoToday(), autoPay: true, paymentFrequency: "monthly", isActive: true,
+  });
+  await require("../services/dailySweepService").runDailySweep({ todayStr: getTorontoToday() });
+  const s78AutoRow = await Transaction.findOne({ where: { toAccountId: s78AutoDebt.id, title: `Auto-Pay for ${s78AutoDebt.name}` } });
+  assert(
+    s78AutoRow && s78AutoRow.type === "TRANSFER" && s78AutoRow.category === "Debt Payment" && s78AutoRow.balanceApplied === true &&
+      (await s78Bal(s78AutoDebt.id)) === 250,
+    `Auto-pay saves a "Debt Payment" TRANSFER and lowers the debt once (got ${s78AutoRow?.category}, $${await s78Bal(s78AutoDebt.id)})`
+  );
+  const s78LedgerDebt = await s78("POST", "/api/expenses", { name: `Suite78 extra loan payment ${s78Stamp}`, amount: 7, category: "Debt", targetAccountId: s78DebtRes.body.id, due_date: getTorontoToday(), is_paid: true });
+  const s78LedgerCard = await s78("POST", "/api/expenses", { name: `Suite78 card payment ${s78Stamp}`, amount: 7, category: "Debt", targetAccountId: s78CardRes.body.id, due_date: getTorontoToday(), is_paid: true });
+  const s78LedgerBuy = await s78("POST", "/api/expenses", { name: `Suite78 lawyer fee ${s78Stamp}`, amount: 7, category: "Debt", targetAccountId: null, due_date: getTorontoToday(), is_paid: true });
+  const s78Cats = await Promise.all([s78LedgerDebt, s78LedgerCard, s78LedgerBuy].map(async (r) => {
+    const row = await Transaction.findByPk(r.body.id);
+    return `${row?.type}/${row?.category}`;
+  }));
+  assert(
+    s78Cats.join(",") === "TRANSFER/Debt Payment,TRANSFER/Credit Card Payment,EXPENSE/Debt",
+    `Ledger "Debt" to a debt is a Debt Payment, to a card a Credit Card Payment, to nothing a Debt purchase (got ${s78Cats})`
+  );
+  // Choosing "General Debt Expense" on a debt payment makes it a Debt purchase again; picking the debt
+  // back makes it a Debt Payment
+  const s78Unlink = await s78("PUT", `/api/expenses/${s78LedgerDebt.body.id}`, { category: "Debt Payment", targetAccountId: null });
+  const s78Unlinked = await Transaction.findByPk(s78LedgerDebt.body.id);
+  const s78Relink = await s78("PUT", `/api/expenses/${s78LedgerDebt.body.id}`, { category: "Debt", targetAccountId: s78DebtRes.body.id });
+  const s78Relinked = await Transaction.findByPk(s78LedgerDebt.body.id);
+  assert(
+    s78Unlink.status === 200 && s78Unlinked.type === "EXPENSE" && s78Unlinked.category === "Debt" && s78Unlinked.toAccountId === null &&
+      s78Relink.status === 200 && s78Relinked.type === "TRANSFER" && s78Relinked.category === "Debt Payment",
+    `Editing: no debt -> EXPENSE/Debt (got ${s78Unlinked.type}/${s78Unlinked.category}), the debt again -> TRANSFER/Debt Payment (got ${s78Relinked.type}/${s78Relinked.category})`
+  );
+
+  // 78.4 The one-off relabel (debt_payment_category_v1) changes only debt TRANSFERs saved as "Debt",
+  // Trash included, runs once, and leaves spending totals alone
+  const { runDebtPaymentCategoryMigration: s78Migrate, DEBT_PAYMENT_CATEGORY_KEY: s78MigrateKey } = require("../services/debtPaymentCategoryService");
+  const s78Checking2 = await require("../services/checkingService").getPrimaryCheckingAccount();
+  const s78OldRow = (fields) => Transaction.create({ title: `Suite78 old ${s78Stamp}`, amount: 11, date: getTorontoToday(), isCleared: true, balanceApplied: true, ...fields });
+  const s78OldPay = await s78OldRow({ type: "TRANSFER", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: s78DebtRes.body.id });
+  const s78OldTrashed = await s78OldRow({ type: "TRANSFER", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: s78DebtRes.body.id });
+  await s78OldTrashed.destroy();
+  const s78OldBuy = await s78OldRow({ type: "EXPENSE", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: null });
+  const s78OldCard = await s78OldRow({ type: "TRANSFER", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: s78CardRes.body.id });
+  const s78SpendBefore = await s78("GET", "/api/spending-summary");
+  await Setting.destroy({ where: { key: s78MigrateKey } });
+  const s78Relabelled = await s78Migrate();
+  const s78Again = await s78Migrate();
+  const s78After = await Promise.all(
+    [s78OldPay, s78OldTrashed, s78OldBuy, s78OldCard].map(async (r) => (await Transaction.findByPk(r.id, { paranoid: false })).category)
+  );
+  const s78SpendAfter = await s78("GET", "/api/spending-summary");
+  assert(
+    s78After.join(",") === "Debt Payment,Debt Payment,Debt,Debt",
+    `Relabel: debt TRANSFERs (live and trashed) become Debt Payment; the purchase and the card transfer keep Debt (got ${s78After})`
+  );
+  assert(s78Relabelled >= 2 && s78Again === null && (await Setting.findByPk(s78MigrateKey))?.value === "true", `The relabel runs once (first ${s78Relabelled} rows, then ${s78Again})`);
+  assert(
+    JSON.stringify(s78SpendAfter.body) === JSON.stringify(s78SpendBefore.body),
+    "Spending summary is the same before and after the relabel"
+  );
+  await Transaction.destroy({ where: { id: [s78OldPay.id, s78OldTrashed.id, s78OldBuy.id, s78OldCard.id] }, force: true });
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 

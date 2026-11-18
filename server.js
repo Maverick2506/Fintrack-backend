@@ -27,6 +27,7 @@ const { assertAuthConfiguration } = require("./config/auth");
 const { runDailySweep } = require("./services/dailySweepService");
 const { getPrimaryCheckingAccount } = require("./services/checkingService");
 const { backfillDebtDueDays } = require("./services/debtInterestService");
+const { runDebtPaymentCategoryMigration } = require("./services/debtPaymentCategoryService");
 const authRoutes = require("./routes/auth");
 const expenseRoutes = require("./routes/expenses");
 const debtRoutes = require("./routes/debts");
@@ -716,6 +717,17 @@ async function initialize() {
       await backfillDebtDueDays(Account, Setting);
     } catch (migErr) {
       console.warn("Transactions schema/backfill notice:", migErr.message);
+    }
+
+    // One-off: debt payments saved with the purchase category "Debt" become "Debt Payment"
+    // (Setting debt_payment_category_v1, one transaction with the flag)
+    try {
+      const relabelled = await runDebtPaymentCategoryMigration();
+      if (relabelled !== null) {
+        console.log(`✅ Relabelled ${relabelled} debt payments from "Debt" to "Debt Payment".`);
+      }
+    } catch (catErr) {
+      console.error("❌ Debt payment category migration failed; it will retry on the next start:", catErr);
     }
 
     // One-off: older series had no recurringGroupId and were grouped by type and title. Each one gets

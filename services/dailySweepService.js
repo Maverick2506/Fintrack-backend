@@ -304,7 +304,7 @@ const runDailySweep = async (options = {}) => {
             amount: paymentAmount,
             date: todayString,
             type: "TRANSFER",
-            category: "Debt",
+            category: "Debt Payment",
             isCleared: true,
             balanceApplied: false,
             fromAccountId: checking.id,

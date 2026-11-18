@@ -528,7 +528,7 @@ const buildPreview = async (account, rows, dbTx = null) => {
       };
     }
     if (payee) {
-      return { ...base, status: "new", category: payee.type === "DEBT" ? "Debt" : "Credit Card Payment", ruleId: null };
+      return { ...base, status: "new", category: payee.type === "DEBT" ? "Debt Payment" : "Credit Card Payment", ruleId: null };
     }
     if (refund) return { ...base, status: "new", ...refundCategoryFor(row, purchases, rules) };
     const { category, ruleId } = categoryFor(row, account, rules, history);
@@ -672,7 +672,7 @@ const commitImport = async ({ accountId, rows, mapping }) => {
       let fields;
       let amount = row.amount;
       if (row.toCard) {
-        const category = row.toCard.type === "DEBT" ? "Debt" : "Credit Card Payment";
+        const category = row.toCard.type === "DEBT" ? "Debt Payment" : "Credit Card Payment";
         fields = { type: "TRANSFER", category, fromAccountId: account.id, toAccountId: row.toCard.id };
       } else if (row.refund) {
         // Negative spending: lowers the category's spending and moves the balance back

@@ -2,6 +2,7 @@ const express = require("express");
 const crypto = require("crypto");
 const { sequelize, Transaction, Account } = require("../models");
 const { getPrimaryCheckingAccount } = require("../services/checkingService");
+const { paymentCategoryFor, PAYDOWN_CATEGORIES } = require("../constants/categories");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -103,7 +104,7 @@ const resolvePaydownTargetId = async (
     if (acc) return acc.id;
   }
 
-  if (category === "Debt" && title) {
+  if (PAYDOWN_CATEGORIES.includes(category) && title) {
     const candidates = await Account.findAll({
       where: {
         type: { [Op.in]: ["DEBT", "CREDIT_CARD"] },
@@ -455,10 +456,7 @@ router.post(
       const isDebtPayment = targetAccount && targetAccount.type === "DEBT";
       const trxType =
         isCreditCardPayment || isDebtPayment ? "TRANSFER" : "EXPENSE";
-      const trxCategory =
-        isCreditCardPayment && finalCategory === "Debt"
-          ? "Credit Card Payment"
-          : finalCategory;
+      const trxCategory = paymentCategoryFor(finalCategory, targetAccount?.type);
 
       // Phase L: Idempotent clientRef check
       if (req.body.clientRef) {
@@ -591,7 +589,7 @@ router.put(
           dbTx
         );
       } else if (hasExplicitTarget && !explicitTarget) {
-        if (nextCategory === "Debt") {
+        if (PAYDOWN_CATEGORIES.includes(nextCategory)) {
           // User explicitly chose "General Debt Expense": do not re-link by name (B6)
           nextToAccountId = null;
         } else if (
@@ -605,7 +603,7 @@ router.put(
         } else {
           nextToAccountId = null;
         }
-      } else if (nextCategory === "Debt" && !nextToAccountId) {
+      } else if (PAYDOWN_CATEGORIES.includes(nextCategory) && !nextToAccountId) {
         nextToAccountId = await resolvePaydownTargetId(
           null,
           nextCategory,
@@ -763,10 +761,7 @@ router.put(
           taxApplied: nextTaxApplied,
           date: req.body.due_date || req.body.payment_date || trx.date,
           type: nextType,
-          category:
-            isCreditCardPayment && nextCategory === "Debt"
-              ? "Credit Card Payment"
-              : nextCategory,
+          category: paymentCategoryFor(nextCategory, targetAccount?.type),
           isCleared: nextIsCleared,
           recurrence: nextRecurrence,
           recurringGroupId: nextRecurringGroupId,

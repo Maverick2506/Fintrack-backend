@@ -29,6 +29,22 @@ const SYSTEM_CATEGORIES = [
   "Debt Payment",
 ];
 
+/**
+ * The category a Debt-picker payment is saved with, from the account it pays: a card payment is a
+ * "Credit Card Payment", a debt payment a "Debt Payment" (both system categories, not spending).
+ * "Debt" with no card or debt stays a purchase in the Debt category, and a "Debt Payment" that no
+ * longer pays a debt becomes one.
+ */
+const paymentCategoryFor = (category, targetType) => {
+  if (category !== "Debt" && category !== "Debt Payment") return category;
+  if (targetType === "CREDIT_CARD") return "Credit Card Payment";
+  if (targetType === "DEBT") return "Debt Payment";
+  return !targetType ? "Debt" : category;
+};
+
+/** Categories that pick the card or debt being paid by name ("Payment for <name>") when none is sent */
+const PAYDOWN_CATEGORIES = ["Debt", "Debt Payment"];
+
 /** Every category POST /expenses accepts. */
 const TRANSACTION_CATEGORIES = [...EXPENSE_CATEGORIES, ...SYSTEM_CATEGORIES];
 
@@ -44,4 +60,6 @@ module.exports = {
   SYSTEM_CATEGORIES,
   TRANSACTION_CATEGORIES,
   canonicalCategory,
+  paymentCategoryFor,
+  PAYDOWN_CATEGORIES,
 };

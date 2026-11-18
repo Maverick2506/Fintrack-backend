@@ -147,7 +147,7 @@ router.post(
           amount: paymentAmount,
           date: getTodayString(),
           type: "TRANSFER",
-          category: "Debt",
+          category: "Debt Payment",
           isCleared: true,
           balanceApplied: false,
           fromAccountId: checking.id,
