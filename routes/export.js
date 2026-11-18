@@ -5,8 +5,7 @@ const { toZonedTime, format } = require("date-fns-tz");
 const { Op } = require("sequelize");
 const { Account, Transaction, Setting, Budget } = require("../models");
 const authMiddleware = require("../middleware/authMiddleware");
-const { getPaychequeProjection } = require("../services/projectionService");
-const { getForecast } = require("../services/forecastService");
+const { getForecast, getForecastIncome } = require("../services/forecastService");
 const { normalizePayeeTitle } = require("../utils/payeeNormalizer");
 const { EXPENSE_CATEGORIES } = require("../constants/categories");
 const { usesArchivedAccount } = require("../services/accountArchiveService");
@@ -181,7 +180,6 @@ const getFinancialData = async () => {
   const startOfMonth = `${year}-${String(month).padStart(2, "0")}-01`;
   const lastDay = new Date(year, month, 0).getDate();
   const endOfMonth = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
-  const currentMonthPrefix = todayStr.slice(0, 7);
   const generatedAt = format(nowZoned, "yyyy-MM-dd HH:mm", { timeZone: TIMEZONE });
   // History window: the last 12 months, i.e. after this date a year ago
   const historyStart = `${year - 1}${todayStr.slice(4)}`;
@@ -290,16 +288,12 @@ const getFinancialData = async () => {
   const clearedExpenses = parseFloat(monthExpensesSum || 0);
   const netFlow = clearedIncome - clearedExpenses;
 
-  // Paycheque projection for remaining month
-  let totalProjectedIncome = 0;
-  let projectedPaychequeDates = [];
-  try {
-    const projection = await getPaychequeProjection(todayStr, currentMonthPrefix);
-    totalProjectedIncome = projection.totalProjectedIncome;
-    projectedPaychequeDates = projection.projectedPaychequeDates;
-  } catch (err) {
-    console.error("Paycheque projection error in export:", err);
-  }
+  // Income still to come this month: the forecast's income from today to month end, the same
+  // paydays and amounts Safe to Spend plans with (Expected pay, the cautious variable-pay amount)
+  const { total: totalProjectedIncome, dates: projectedPaychequeDates } = getForecastIncome(
+    forecast,
+    endOfMonth
+  );
 
   const upcomingBillsFromChecking = upcomingBills.filter(
     (b) => !b.fromAccount || b.fromAccount.type === "CHECKING"

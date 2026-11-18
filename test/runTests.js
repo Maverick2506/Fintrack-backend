@@ -11278,6 +11278,47 @@ async function runTestSuite() {
     `End series and cancel subscription refuse "not-a-uuid" (got ${s78BadEnd.status} ${s78BadEnd.body?.error}, ${s78BadCancel.status} ${s78BadCancel.body?.error})`
   );
 
+  // 78.6 The Gem feed's "projected income this month" comes from the forecast Safe to Spend uses: the sum
+  // of its income from today to month end (variable pay plans with the cautious amount; Expected pay
+  // with its amount), and the feed's Safe to Spend is the forecast's
+  const s78FeedKey = (await s78("GET", "/api/export/gemini-config")).body.feedKey;
+  const s78MonthEnd = (() => {
+    const [y, m] = getTorontoToday().split("-").map(Number);
+    return `${y}-${String(m).padStart(2, "0")}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, "0")}`;
+  })();
+  const s78FeedCheck = async (label) => {
+    const [feed, forecastRes] = await Promise.all([
+      request({ hostname: "localhost", port: 8000, path: `/api/export/financial-feed.csv?key=${s78FeedKey}`, method: "GET" }),
+      s78("GET", "/api/forecast?days=60"),
+    ]);
+    const fc = forecastRes.body;
+    const rows = s36ParseCsv(feed.raw || "");
+    const projectedRow = rows.find((r) => r[0] === "OVERVIEW" && r[2] === "Projected Upcoming Income");
+    const safeRow = rows.find((r) => r[0] === "FORECAST" && r[1] === "SAFE_TO_SPEND");
+    const incomeDays = fc.days.filter((d) => d.date <= s78MonthEnd && d.items.some((it) => it.amount > 0));
+    const expected = Math.round(incomeDays.reduce((sum, d) => sum + d.items.reduce((s, it) => s + (it.amount > 0 ? it.amount : 0), 0), 0) * 100) / 100;
+    const projected = projectedRow ? parseFloat(projectedRow[3].replace("$", "")) : NaN;
+    const datesNamed = incomeDays.every((d) => projectedRow?.[4].includes(d.date));
+    assert(
+      feed.status === 200 && projected === expected && datesNamed,
+      `${label}: feed projected income $${projected} = forecast income to month end $${expected} (${fc.incomeSource}, dates ${incomeDays.map((d) => d.date).join(" ") || "none"})`
+    );
+    assert(safeRow && parseFloat(safeRow[2]) === fc.safeToSpend, `${label}: feed SAFE_TO_SPEND ${safeRow?.[2]} matches the forecast's ${fc.safeToSpend}`);
+    return fc;
+  };
+  // Variable weekly pay; the newest was 6 days ago, so the next estimated paycheque is tomorrow
+  const s78PayAmounts = [900, 1500, 1100, 1300, 1600, 1000, 1400, 1200];
+  for (let i = 0; i < s78PayAmounts.length; i++) {
+    await Transaction.create({ title: "Suite78 Shift Pay", amount: s78PayAmounts[i], date: getTorontoOffsetDate(-6 - 7 * i), type: "INCOME", category: "Income", isCleared: true, toAccountId: s78Checking.id });
+  }
+  const s78VarFc = await s78FeedCheck("Variable pay");
+  assert(s78VarFc.incomeSource === "estimated", `Variable pay forecast plans with estimated paycheques (got ${s78VarFc.incomeSource})`);
+  await Transaction.destroy({ where: { title: "Suite78 Shift Pay" }, force: true });
+  const s78Expected = await s78("PUT", "/api/settings/expected-pay", { nextDate: getTorontoOffsetDate(1), amount: 1234.56, cadence: "weekly" });
+  assert(s78Expected.status === 200, `Expected pay saved (got ${s78Expected.status})`);
+  await s78FeedCheck("Expected pay");
+  await s78("DELETE", "/api/settings/expected-pay");
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

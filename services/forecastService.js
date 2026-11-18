@@ -928,8 +928,27 @@ const getForecast = async (daysCount = 60, dbTx = null, extraItems = [], options
   };
 };
 
+/**
+ * The income in a forecast from its first day (today) through endDateStr: what Safe to Spend counts as
+ * income (every money-in item, the same rule as nextPayday). { total, dates } with dates once each.
+ */
+const getForecastIncome = (forecast, endDateStr) => {
+  let total = 0;
+  const dates = [];
+  for (const day of forecast?.days || []) {
+    if (day.date > endDateStr) break;
+    const income = day.items.reduce((sum, it) => sum + (it.amount > 0 && !it.simulated ? it.amount : 0), 0);
+    if (income > 0) {
+      total += income;
+      dates.push(day.date);
+    }
+  }
+  return { total: Math.round(total * 100) / 100, dates };
+};
+
 module.exports = {
   getForecast,
+  getForecastIncome,
   getManualDebtPaymentsBetween,
   isManualDebt,
   addCalendarDays,
