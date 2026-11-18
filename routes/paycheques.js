@@ -1,5 +1,6 @@
 const express = require("express");
 const { Transaction, Account } = require("../models");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
 const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
@@ -47,10 +48,7 @@ router.post(
   validateBody(schemas.createPaycheque),
   asyncHandler(async (req, res) => {
     const { name, amount, payment_date, recurrence } = req.body;
-    const [checking] = await Account.findOrCreate({
-      where: { name: "Primary Checking" },
-      defaults: { type: "CHECKING", initialBalance: 0.0 },
-    });
+    const checking = await getPrimaryCheckingAccount();
 
     // Phase L: Idempotent clientRef check
     if (req.body.clientRef) {

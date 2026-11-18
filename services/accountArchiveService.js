@@ -264,7 +264,7 @@ const recordFinalPayment = async (account, dbTx) => {
         ? "Savings Transfer"
         : account.type === "CREDIT_CARD"
         ? "Credit Card Payment"
-        : "Debt",
+        : "Debt Payment",
       isCleared: true,
       balanceApplied: false,
       fromAccountId: isGoal ? account.id : checking.id,

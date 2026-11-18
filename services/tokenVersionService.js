@@ -30,4 +30,4 @@ const isTokenVersionCurrent = async (decoded) => {
   return tv >= (await getTokenVersion());
 };
 
-module.exports = { getTokenVersion, bumpTokenVersion, isTokenVersionCurrent, TOKEN_VERSION_KEY: SETTING_KEY };
+module.exports = { getTokenVersion, bumpTokenVersion, isTokenVersionCurrent };

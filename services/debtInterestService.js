@@ -162,30 +162,7 @@ const isDebtInterestEnabled = async (Setting, dbTx = null) => {
   return record ? record.value !== "false" : true;
 };
 
-const DUE_DAY_BACKFILL_KEY = "debt_due_day_backfilled_v1";
-
-// One-off (Setting flag): store each debt's due day from its due date. A debt that already drifted
-// (31st -> 28th) keeps the 28th until the user sets its due date again. Runs from server initialize().
-const backfillDebtDueDays = async (Account, Setting) => {
-  const done = await Setting.findByPk(DUE_DAY_BACKFILL_KEY);
-  if (done && done.value === "true") return 0;
-  const debts = await Account.findAll({ where: { type: "DEBT", dueDay: null } });
-  let count = 0;
-  for (const debt of debts) {
-    const day = getDebtAnchorDay(debt);
-    if (day) {
-      await debt.update({ dueDay: day }, { fields: ["dueDay"] });
-      count++;
-    }
-  }
-  if (count > 0) console.log(`✅ Backfilled dueDay on ${count} debts.`);
-  await Setting.upsert({ key: DUE_DAY_BACKFILL_KEY, value: "true" });
-  return count;
-};
-
 module.exports = {
-  DUE_DAY_BACKFILL_KEY,
-  backfillDebtDueDays,
   DEBT_INTEREST_SETTING_KEY,
   DEBT_INTEREST_START_KEY,
   PERIODS_PER_YEAR,

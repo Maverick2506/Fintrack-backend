@@ -2,6 +2,7 @@ const { sequelize, Account, Transaction, Setting, NetWorthSnapshot } = require("
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const { adjustAccountForTransaction } = require("./accountBalanceService");
+const { getPrimaryCheckingAccount } = require("./checkingService");
 const {
   DEBT_INTEREST_START_KEY,
   computePeriodInterest,
@@ -245,11 +246,7 @@ const runDailySweep = async (options = {}) => {
     });
 
     if (dueAutoPayDebts.length > 0) {
-      const [checking] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      const checking = await getPrimaryCheckingAccount(dbTx);
 
       for (const debt of dueAutoPayDebts) {
         const remaining = parseFloat(debt.initialBalance) || 0;
@@ -299,12 +296,23 @@ const runDailySweep = async (options = {}) => {
           continue;
         }
 
-        // Atomic decrement avoids lost updates if another balance transaction occurred concurrently
-        await Account.increment("initialBalance", {
-          by: -paymentAmount,
-          where: { id: debt.id },
-          transaction: dbTx,
-        });
+        // The balance service lowers the debt (one place moves balances) and marks the row applied.
+        // forceApply: the sweep's own today may differ from the clock's (catch-up runs, tests).
+        const autoPay = await Transaction.create(
+          {
+            title: `Auto-Pay for ${debt.name}`,
+            amount: paymentAmount,
+            date: todayString,
+            type: "TRANSFER",
+            category: "Debt Payment",
+            isCleared: true,
+            balanceApplied: false,
+            fromAccountId: checking.id,
+            toAccountId: debt.id,
+          },
+          { transaction: dbTx }
+        );
+        await adjustAccountForTransaction(autoPay, 1, dbTx, true);
 
         await debt.reload({ transaction: dbTx });
         if (debt.initialBalance <= 0) {
@@ -313,21 +321,6 @@ const runDailySweep = async (options = {}) => {
             { where: { id: debt.id }, transaction: dbTx }
           );
         }
-
-        await Transaction.create(
-          {
-            title: `Auto-Pay for ${debt.name}`,
-            amount: paymentAmount,
-            date: todayString,
-            type: "TRANSFER",
-            category: "Debt",
-            isCleared: true,
-            balanceApplied: true,
-            fromAccountId: checking.id,
-            toAccountId: debt.id,
-          },
-          { transaction: dbTx }
-        );
         autoPayCount++;
       }
     }

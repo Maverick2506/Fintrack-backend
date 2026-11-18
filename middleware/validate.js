@@ -34,9 +34,19 @@ const validateQuery = (schema) => (req, res, next) => {
 };
 
 // Rejects non-UUID :id params with 400 instead of a database "invalid input syntax for uuid" 500 (B14)
+const isUuid = (value) => z.string().uuid().safeParse(value).success;
+
 const validateIdParam = (req, res, next, id) => {
-  if (!z.string().uuid().safeParse(id).success) {
+  if (!isUuid(id)) {
     return res.status(400).json({ error: "Invalid id: expected a UUID." });
+  }
+  next();
+};
+
+// :recurringGroupId on the series routes (end a series, cancel a subscription): checked before any DB call
+const validateSeriesIdParam = (req, res, next) => {
+  if (!isUuid(req.params.recurringGroupId)) {
+    return res.status(400).json({ error: "Invalid series id" });
   }
   next();
 };
@@ -568,5 +578,6 @@ module.exports = {
   validateBody,
   validateQuery,
   validateIdParam,
+  validateSeriesIdParam,
   schemas,
 };

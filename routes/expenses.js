@@ -1,6 +1,8 @@
 const express = require("express");
 const crypto = require("crypto");
 const { sequelize, Transaction, Account } = require("../models");
+const { getPrimaryCheckingAccount } = require("../services/checkingService");
+const { paymentCategoryFor, PAYDOWN_CATEGORIES } = require("../constants/categories");
 const { Op } = require("sequelize");
 const { toZonedTime, format } = require("date-fns-tz");
 const authMiddleware = require("../middleware/authMiddleware");
@@ -102,7 +104,7 @@ const resolvePaydownTargetId = async (
     if (acc) return acc.id;
   }
 
-  if (category === "Debt" && title) {
+  if (PAYDOWN_CATEGORIES.includes(category) && title) {
     const candidates = await Account.findAll({
       where: {
         type: { [Op.in]: ["DEBT", "CREDIT_CARD"] },
@@ -373,11 +375,7 @@ router.post(
         }
       }
 
-      let [fromAccount] = await Account.findOrCreate({
-        where: { name: "Primary Checking" },
-        defaults: { type: "CHECKING", initialBalance: 0.0 },
-        transaction: dbTx,
-      });
+      let fromAccount = await getPrimaryCheckingAccount(dbTx);
 
       // Resolve whether this expense pays down a specific Debt or Credit Card.
       // Name matching only runs when the client sent no target field at all (e.g. quick add);
@@ -458,10 +456,7 @@ router.post(
       const isDebtPayment = targetAccount && targetAccount.type === "DEBT";
       const trxType =
         isCreditCardPayment || isDebtPayment ? "TRANSFER" : "EXPENSE";
-      const trxCategory =
-        isCreditCardPayment && finalCategory === "Debt"
-          ? "Credit Card Payment"
-          : finalCategory;
+      const trxCategory = paymentCategoryFor(finalCategory, targetAccount?.type);
 
       // Phase L: Idempotent clientRef check
       if (req.body.clientRef) {
@@ -569,11 +564,7 @@ router.put(
         if (req.body.creditCardId) {
           fromAccountId = req.body.creditCardId;
         } else {
-          const [checking] = await Account.findOrCreate({
-            where: { name: "Primary Checking" },
-            defaults: { type: "CHECKING", initialBalance: 0.0 },
-            transaction: dbTx,
-          });
+          const checking = await getPrimaryCheckingAccount(dbTx);
           fromAccountId = checking.id;
         }
       }
@@ -598,7 +589,7 @@ router.put(
           dbTx
         );
       } else if (hasExplicitTarget && !explicitTarget) {
-        if (nextCategory === "Debt") {
+        if (PAYDOWN_CATEGORIES.includes(nextCategory)) {
           // User explicitly chose "General Debt Expense": do not re-link by name (B6)
           nextToAccountId = null;
         } else if (
@@ -612,7 +603,7 @@ router.put(
         } else {
           nextToAccountId = null;
         }
-      } else if (nextCategory === "Debt" && !nextToAccountId) {
+      } else if (PAYDOWN_CATEGORIES.includes(nextCategory) && !nextToAccountId) {
         nextToAccountId = await resolvePaydownTargetId(
           null,
           nextCategory,
@@ -770,10 +761,7 @@ router.put(
           taxApplied: nextTaxApplied,
           date: req.body.due_date || req.body.payment_date || trx.date,
           type: nextType,
-          category:
-            isCreditCardPayment && nextCategory === "Debt"
-              ? "Credit Card Payment"
-              : nextCategory,
+          category: paymentCategoryFor(nextCategory, targetAccount?.type),
           isCleared: nextIsCleared,
           recurrence: nextRecurrence,
           recurringGroupId: nextRecurringGroupId,

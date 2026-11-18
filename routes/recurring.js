@@ -6,7 +6,7 @@ const { addDays, addMonths, addYears } = require("date-fns");
 const { toZonedTime, format } = require("date-fns-tz");
 const cronAuthMiddleware = require("../middleware/cronAuthMiddleware");
 const authMiddleware = require("../middleware/authMiddleware");
-const { validateBody, validateIdParam, schemas } = require("../middleware/validate");
+const { validateBody, validateSeriesIdParam, schemas } = require("../middleware/validate");
 const { asyncHandler } = require("../middleware/errorHandler");
 const {
   endSeries,
@@ -618,7 +618,7 @@ router.all("/trigger-recurring", cronAuthMiddleware, async (req, res) => {
 router.post(
   "/:recurringGroupId/end",
   authMiddleware,
-  (req, res, next) => validateIdParam(req, res, next, req.params.recurringGroupId),
+  validateSeriesIdParam,
   validateBody(schemas.endSeries),
   asyncHandler(async (req, res) => {
     const dryRun = req.body.dryRun === true;

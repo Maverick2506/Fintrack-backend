@@ -2028,82 +2028,7 @@ async function runTestSuite() {
   await DBTransaction.destroy({ where: { id: s16PreFixTrx.id } });
   await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardAId}`, method: "DELETE", headers: authHeaders });
 
-  // Scenario A2: Pre-6b06ed2 transfer (balanceApplied: false, but prematurely applied at creation)
-  const s16CardA2 = await request(
-    { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
-    { name: "Suite 16 Card A2", currentBalance: 800.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
-  );
-  assert(s16CardA2.status === 201 && s16CardA2.body.id, "Creates test card A2 at $800 balance");
-  const s16CardA2Id = s16CardA2.body.id;
-
-  const s16Pre6bTrx = await DBTransaction.create({
-    title: "Pre-6b06ed2 Card Payment",
-    amount: 200.0,
-    date: s16Today,
-    type: "TRANSFER",
-    category: "Credit Card Payment",
-    isCleared: false,
-    balanceApplied: false, // pre-6b06ed2 rows had balanceApplied: false
-    toAccountId: s16CardA2Id,
-    createdAt: new Date("2026-10-18T12:00:00Z"), // before LEGACY_CUTOFF (a fixed past instant, safe on any run date)
-  });
-
-  // Verify atomic concurrency claim mechanism on this row
-  const { Setting: DBSetting, Account: DBAccount, sequelize: DBSequelize } = require("../models");
-  const claimKey = `remed_unpaid_transfer_${s16Pre6bTrx.id}`;
-  
-  // Instance 1 claims
-  const t1 = await DBSequelize.transaction();
-  const [_, created1] = await DBSetting.findOrCreate({
-    where: { key: claimKey },
-    defaults: { key: claimKey, value: "restored" },
-    transaction: t1,
-  });
-  if (created1) {
-    await DBAccount.increment("initialBalance", { by: 200.0, where: { id: s16CardA2Id }, transaction: t1 });
-    await DBTransaction.update({ balanceApplied: false }, { where: { id: s16Pre6bTrx.id }, transaction: t1 });
-    await t1.commit();
-  }
-  assert(created1 === true, "First server instance successfully claims pre-6b06ed2 transfer and restores $200");
-
-  // Instance 2 attempts concurrent claim on same row
-  const t2 = await DBSequelize.transaction();
-  let created2 = false;
-  try {
-    const [__, c2] = await DBSetting.findOrCreate({
-      where: { key: claimKey },
-      defaults: { key: claimKey, value: "restored" },
-      transaction: t2,
-    });
-    created2 = c2;
-    if (created2) {
-      await DBAccount.increment("initialBalance", { by: 200.0, where: { id: s16CardA2Id }, transaction: t2 });
-      await t2.commit();
-    } else {
-      await t2.rollback();
-    }
-  } catch {
-    await t2.rollback().catch(() => {});
-  }
-  assert(created2 === false, "Second concurrent server instance fails claim and does NOT double-increment balance");
-
-  // Check card balance before sweep: 800 + 200 restored = 1000
-  let cardA2Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
-  let foundCardA2 = (cardA2Check.body || []).find((c) => c.id === s16CardA2Id);
-  assert(parseFloat(foundCardA2?.currentBalance || 0) === 1000.0, "Card A2 balance restored to $1,000 prior to sweep");
-
-  // Sweep runs on due date: applies $200 payment cleanly
-  await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
-  cardA2Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
-  foundCardA2 = (cardA2Check.body || []).find((c) => c.id === s16CardA2Id);
-  assert(parseFloat(foundCardA2?.currentBalance || 0) === 800.0, "After sweep, pre-6b06ed2 payment leaves card cleanly at $800.00 (not $600)");
-
-  // Cleanup A2
-  await DBTransaction.destroy({ where: { id: s16Pre6bTrx.id } });
-  await DBSetting.destroy({ where: { key: claimKey } });
-  await request({ hostname: "localhost", port: 8000, path: `/api/credit-cards/${s16CardA2Id}`, method: "DELETE", headers: authHeaders });
-
-  // Scenario A3: A payment scheduled under the new code is untouched by the cleanup
+  // Scenario A3: A scheduled card payment leaves the card alone until the sweep pays it
   const s16CardA3 = await request(
     { hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "POST", headers: authHeaders },
     { name: "Suite 16 Card A3", currentBalance: 1000.0, creditLimit: 2000.0, dueDate: getTorontoOffsetDate(28) }
@@ -2132,57 +2057,7 @@ async function runTestSuite() {
   assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 starts at $1,000 balance upon payment scheduling");
 
   const newTrxInDb = await DBTransaction.findByPk(s16NewPaymentId);
-  // The cleanup's fixed cutoff from the code's history: a past instant, so it never moves with today
-  const LEGACY_CUTOFF = new Date("2026-10-20T06:00:00Z");
-  assert(newTrxInDb.balanceApplied === false, "Payment scheduled under new code has balanceApplied = false");
-  assert(new Date(newTrxInDb.createdAt) >= LEGACY_CUTOFF, "Payment scheduled under new code has createdAt >= LEGACY_CUTOFF");
-
-  // Run the cleanup logic on candidate transfers
-  const candidateTransfersA3 = await DBTransaction.findAll({
-    where: {
-      id: s16NewPaymentId,
-      type: "TRANSFER",
-      isCleared: false,
-      toAccountId: { [Op.ne]: null },
-    },
-    include: [{ model: DBAccount, as: "toAccount" }],
-  });
-
-  let a3RestoredCount = 0;
-  for (const trx of candidateTransfersA3) {
-    const isTargetDebtOrCard =
-      trx.toAccount && ["CREDIT_CARD", "DEBT"].includes(trx.toAccount.type);
-    if (!isTargetDebtOrCard) continue;
-
-    const createdDateStr = trx.createdAt
-      ? format(toZonedTime(trx.createdAt, "America/Toronto"), "yyyy-MM-dd")
-      : null;
-    const isPremature =
-      trx.balanceApplied === true ||
-      (trx.balanceApplied === false &&
-        trx.createdAt < LEGACY_CUTOFF &&
-        createdDateStr &&
-        trx.date >= createdDateStr);
-
-    if (!isPremature) continue;
-
-    const claimKeyA3 = `remed_unpaid_transfer_${trx.id}`;
-    const [_, created] = await DBSetting.findOrCreate({
-      where: { key: claimKeyA3 },
-      defaults: { key: claimKeyA3, value: "restored" },
-    });
-    if (created) {
-      await DBAccount.increment("initialBalance", { by: parseFloat(trx.amount), where: { id: trx.toAccountId } });
-      a3RestoredCount++;
-    }
-  }
-
-  assert(a3RestoredCount === 0, "A payment scheduled under the new code is untouched by the cleanup (0 restored)");
-
-  // Card A3 balance must remain $1,000 (NOT incremented to $1,200)
-  cardA3Check = await request({ hostname: "localhost", port: 8000, path: "/api/credit-cards", method: "GET", headers: authHeaders });
-  foundCardA3 = (cardA3Check.body || []).find((c) => c.id === s16CardA3Id);
-  assert(parseFloat(foundCardA3?.currentBalance || 0) === 1000.0, "Card A3 balance remains $1,000 after cleanup (not corrupted to $1,200)");
+  assert(newTrxInDb.balanceApplied === false, "Scheduled payment has balanceApplied = false");
 
   // Daily sweep then runs on due date and cleanly applies the $200 payment (1,000 -> 800)
   await request({ hostname: "localhost", port: 8000, path: "/api/daily-check", method: "GET" });
@@ -2536,8 +2411,8 @@ async function runTestSuite() {
     "Editing transfer to target a DEBT account keeps type TRANSFER"
   );
   assert(
-    s18RetargetDebt.body.category === "Debt",
-    "Editing transfer to target debt sets category to Debt"
+    s18RetargetDebt.body.category === "Debt Payment",
+    "Editing transfer to target debt sets category to Debt Payment"
   );
 
   // Edit transaction back to target the credit card: re-derives as TRANSFER
@@ -5872,18 +5747,6 @@ async function runTestSuite() {
   );
   const s38TodayLast = s38Prev(getTorontoToday(), "monthly", s38MoveToToday.body.dueDay);
   assert((await s38MissFlag()) === s38TodayLast, "On the due day itself, the earlier due date is the one checked");
-
-  // 38.13 dueDay backfill on boot (one-off, behind a Setting flag; server initialize() calls it)
-  const { backfillDebtDueDays: s38Backfill, DUE_DAY_BACKFILL_KEY: s38BackfillKey } = require("../services/debtInterestService");
-  const s38Legacy = await Account.create({ name: "Suite 38 Legacy", type: "DEBT", initialBalance: 50, dueDate: `${FUTURE_YEAR}-05-31`, dueDay: null });
-  await Setting.destroy({ where: { key: s38BackfillKey } });
-  await s38Backfill(Account, Setting);
-  assert((await Account.findByPk(s38Legacy.id)).dueDay === 31, "Backfill sets dueDay from the due date");
-  assert((await Setting.findByPk(s38BackfillKey))?.value === "true", "Backfill sets its Setting flag");
-  await Account.update({ dueDay: null }, { where: { id: s38Legacy.id } });
-  await s38Backfill(Account, Setting);
-  assert((await Account.findByPk(s38Legacy.id)).dueDay === null, "Backfill runs only once");
-  assert(/backfillDebtDueDays\(Account, Setting\)/.test(fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8")), "server.js initialize() runs the backfill");
 
   if (s38StartBefore) await Setting.upsert({ key: s38StartKey, value: s38StartBefore.value });
   else await Setting.destroy({ where: { key: s38StartKey } });
@@ -11118,6 +10981,206 @@ async function runTestSuite() {
     s77Statuses.slice(0, 10).every((st) => st === 200) && s77Statuses[10] === 429,
     `Production login limiter allows 10 tries then returns 429 even with RELAX_RATE_LIMIT=true (got ${s77Statuses.join(",")})`
   );
+
+  // --- Suite 78: payments, Checking, debt payment category, series ids, Gem feed income (Audit PR 2) ---
+  console.log("\n--- Suite 78: One path for balances, one Checking, Debt Payment, series ids, feed income ---");
+  // Suite 76 signed every device out, so this suite logs in again
+  const s78Token = (await request({ hostname: "localhost", port: 8000, path: "/api/auth/login", method: "POST", headers: { "Content-Type": "application/json" } }, { devBypass: true })).body.token;
+  const s78Headers = { "Content-Type": "application/json", Authorization: `Bearer ${s78Token}` };
+  const s78 = (method, path, body = null) => s33(method, path, body, s78Headers);
+  const s78Bal = async (id) => parseFloat((await Account.findByPk(id)).initialBalance);
+
+  // 78.1 Card payment, debt payment and goal contribution all move their account once, through the balance
+  // service: the row ends balanceApplied, deleting it puts the balance back, restoring moves it again,
+  // and two submits at once never move the balance without a row (or save a row without moving it).
+  const s78Stamp = Date.now();
+  const s78CardRes = await s78("POST", "/api/credit-cards", { name: `Suite78 Card ${s78Stamp}`, creditLimit: 1000, currentBalance: 500 });
+  const s78DebtRes = await s78("POST", "/api/debts", { name: `Suite78 Loan ${s78Stamp}`, total_amount: 400 });
+  const s78GoalRes = await s78("POST", "/api/savings-goals", { name: `Suite78 Goal ${s78Stamp}`, goal_amount: 1000 });
+  assert(s78CardRes.status === 201 && s78DebtRes.status === 201 && s78GoalRes.status === 201, `Suite 78 creates a card, a debt and a goal (${s78CardRes.status} ${s78DebtRes.status} ${s78GoalRes.status})`);
+  const s78Flows = [
+    { label: "Card payment", id: s78CardRes.body.id, path: `/api/credit-cards/${s78CardRes.body.id}/pay`, sign: -1, field: "currentBalance", category: "Credit Card Payment" },
+    { label: "Debt payment", id: s78DebtRes.body.id, path: `/api/debts/${s78DebtRes.body.id}/pay`, sign: -1, field: "total_remaining", category: "Debt Payment" },
+    { label: "Goal contribution", id: s78GoalRes.body.id, path: `/api/savings-goals/${s78GoalRes.body.id}/contribute`, sign: 1, field: "current_amount", category: "Savings Transfer" },
+  ];
+  for (const flow of s78Flows) {
+    const before = await s78Bal(flow.id);
+    const payRes = await s78("POST", flow.path, { amount: 40 });
+    const after = await s78Bal(flow.id);
+    const expected = Math.round((before + flow.sign * 40) * 100) / 100;
+    assert(payRes.status === 200 && after === expected, `${flow.label} moves the balance once ($${before} -> $${after}, expected $${expected})`);
+    assert(parseFloat(payRes.body[flow.field]) === expected, `${flow.label} response shows the balance after the payment (${flow.field} = ${payRes.body[flow.field]})`);
+    const row = await Transaction.findOne({ where: { toAccountId: flow.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]] });
+    assert(row && row.balanceApplied === true && row.isCleared === true && parseFloat(row.amount) === 40, `${flow.label} row is a cleared TRANSFER marked balanceApplied`);
+    assert(row && row.category === flow.category, `${flow.label} row has category ${flow.category} (got ${row && row.category})`);
+
+    const delRes = await s78("DELETE", `/api/expenses/${row.id}`);
+    assert((delRes.status === 200 || delRes.status === 204) && (await s78Bal(flow.id)) === before, `Deleting the ${flow.label.toLowerCase()} puts the balance back to $${before}`);
+    const restoreRes = await s78("POST", "/api/expenses/restore", { ids: [row.id] });
+    const afterRestore = await s78Bal(flow.id);
+    assert(restoreRes.status === 200 && afterRestore === expected, `Restoring the ${flow.label.toLowerCase()} from the Trash moves the balance again ($${afterRestore})`);
+    const restoredRow = await Transaction.findByPk(row.id);
+    assert(restoredRow && restoredRow.balanceApplied === true, `Restored ${flow.label.toLowerCase()} is still marked balanceApplied`);
+
+    // Two submits at once: each saved row moved the balance exactly once, and a failed submit left nothing
+    const rowsBefore = await Transaction.count({ where: { toAccountId: flow.id, type: "TRANSFER" } });
+    const twice = await Promise.all([s78("POST", flow.path, { amount: 10 }), s78("POST", flow.path, { amount: 10 })]);
+    const okCount = twice.filter((r) => r.status === 200).length;
+    const added = (await Transaction.count({ where: { toAccountId: flow.id, type: "TRANSFER" } })) - rowsBefore;
+    const newRows = await Transaction.findAll({ where: { toAccountId: flow.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]], limit: Math.max(added, 1) });
+    const moved = Math.round(((await s78Bal(flow.id)) - expected) * 100) / 100;
+    assert(
+      okCount >= 1 && added === okCount && moved === flow.sign * 10 * okCount && newRows.slice(0, added).every((r) => r.balanceApplied === true),
+      `${flow.label} double submit: ${okCount} succeeded, ${added} rows saved, balance moved $${moved} (one move per saved row)`
+    );
+  }
+
+  // 78.2 Renaming Checking never makes a second one: an expense, a paycheque, a debt payment and a goal
+  // contribution all find Checking by type (getPrimaryCheckingAccount), not by the name "Primary Checking"
+  const s78Checking = await require("../services/checkingService").getPrimaryCheckingAccount();
+  const s78CheckingName = s78Checking.name;
+  await Account.update({ name: `Suite78 Renamed Chequing ${s78Stamp}` }, { where: { id: s78Checking.id } });
+  const s78CheckingCount = await Account.count({ where: { type: "CHECKING" } });
+  const s78Expense = await s78("POST", "/api/expenses", { name: `Suite78 Groceries ${s78Stamp}`, amount: 12.5, category: "Essentials", due_date: getTorontoToday(), is_paid: true });
+  const s78Pay = await s78("POST", "/api/paycheques", { name: `Suite78 Pay ${s78Stamp}`, amount: 25, payment_date: getTorontoToday() });
+  const s78DebtPay = await s78("POST", `/api/debts/${s78DebtRes.body.id}/pay`, { amount: 5 });
+  const s78GoalPay = await s78("POST", `/api/savings-goals/${s78GoalRes.body.id}/contribute`, { amount: 5 });
+  assert(
+    [s78Expense, s78Pay, s78DebtPay, s78GoalPay].map((r) => r.status).join(",") === "201,201,200,200",
+    `Expense, paycheque, debt payment and goal contribution save with Checking renamed (got ${[s78Expense, s78Pay, s78DebtPay, s78GoalPay].map((r) => r.status)})`
+  );
+  const s78CheckingAfter = await Account.count({ where: { type: "CHECKING" } });
+  const s78ByName = await Account.count({ where: { name: "Primary Checking" } });
+  assert(
+    s78CheckingAfter === s78CheckingCount && s78ByName === 0,
+    `No second Checking is created (CHECKING accounts ${s78CheckingCount} -> ${s78CheckingAfter}, named "Primary Checking": ${s78ByName})`
+  );
+  const s78ExpenseRow = await Transaction.findByPk(s78Expense.body.id);
+  const s78PayRow = await Transaction.findByPk(s78Pay.body.id);
+  const s78DebtPayRow = await Transaction.findOne({ where: { toAccountId: s78DebtRes.body.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]] });
+  const s78GoalPayRow = await Transaction.findOne({ where: { toAccountId: s78GoalRes.body.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]] });
+  assert(
+    s78ExpenseRow?.fromAccountId === s78Checking.id && s78PayRow?.toAccountId === s78Checking.id &&
+      s78DebtPayRow?.fromAccountId === s78Checking.id && s78GoalPayRow?.fromAccountId === s78Checking.id,
+    "All four rows move the renamed Checking account"
+  );
+  await Transaction.destroy({ where: { id: [s78ExpenseRow?.id, s78PayRow?.id].filter(Boolean) }, force: true });
+  await Account.update({ name: s78CheckingName }, { where: { id: s78Checking.id } });
+
+  // 78.3 Debt payments get the system category "Debt Payment": the Pay button, auto-pay and a Ledger
+  // payment to a debt. "Debt" with no debt stays a purchase; a card payment stays "Credit Card Payment".
+  const s78AutoDebt = await Account.create({
+    name: `Suite78 Auto Loan ${s78Stamp}`, type: "DEBT", initialBalance: 300, targetAmount: 300,
+    minimumPayment: 50, dueDate: getTorontoToday(), autoPay: true, paymentFrequency: "monthly", isActive: true,
+  });
+  await require("../services/dailySweepService").runDailySweep({ todayStr: getTorontoToday() });
+  const s78AutoRow = await Transaction.findOne({ where: { toAccountId: s78AutoDebt.id, title: `Auto-Pay for ${s78AutoDebt.name}` } });
+  assert(
+    s78AutoRow && s78AutoRow.type === "TRANSFER" && s78AutoRow.category === "Debt Payment" && s78AutoRow.balanceApplied === true &&
+      (await s78Bal(s78AutoDebt.id)) === 250,
+    `Auto-pay saves a "Debt Payment" TRANSFER and lowers the debt once (got ${s78AutoRow?.category}, $${await s78Bal(s78AutoDebt.id)})`
+  );
+  const s78LedgerDebt = await s78("POST", "/api/expenses", { name: `Suite78 extra loan payment ${s78Stamp}`, amount: 7, category: "Debt", targetAccountId: s78DebtRes.body.id, due_date: getTorontoToday(), is_paid: true });
+  const s78LedgerCard = await s78("POST", "/api/expenses", { name: `Suite78 card payment ${s78Stamp}`, amount: 7, category: "Debt", targetAccountId: s78CardRes.body.id, due_date: getTorontoToday(), is_paid: true });
+  const s78LedgerBuy = await s78("POST", "/api/expenses", { name: `Suite78 lawyer fee ${s78Stamp}`, amount: 7, category: "Debt", targetAccountId: null, due_date: getTorontoToday(), is_paid: true });
+  const s78Cats = await Promise.all([s78LedgerDebt, s78LedgerCard, s78LedgerBuy].map(async (r) => {
+    const row = await Transaction.findByPk(r.body.id);
+    return `${row?.type}/${row?.category}`;
+  }));
+  assert(
+    s78Cats.join(",") === "TRANSFER/Debt Payment,TRANSFER/Credit Card Payment,EXPENSE/Debt",
+    `Ledger "Debt" to a debt is a Debt Payment, to a card a Credit Card Payment, to nothing a Debt purchase (got ${s78Cats})`
+  );
+  // Choosing "General Debt Expense" on a debt payment makes it a Debt purchase again; picking the debt
+  // back makes it a Debt Payment
+  const s78Unlink = await s78("PUT", `/api/expenses/${s78LedgerDebt.body.id}`, { category: "Debt Payment", targetAccountId: null });
+  const s78Unlinked = await Transaction.findByPk(s78LedgerDebt.body.id);
+  const s78Relink = await s78("PUT", `/api/expenses/${s78LedgerDebt.body.id}`, { category: "Debt", targetAccountId: s78DebtRes.body.id });
+  const s78Relinked = await Transaction.findByPk(s78LedgerDebt.body.id);
+  assert(
+    s78Unlink.status === 200 && s78Unlinked.type === "EXPENSE" && s78Unlinked.category === "Debt" && s78Unlinked.toAccountId === null &&
+      s78Relink.status === 200 && s78Relinked.type === "TRANSFER" && s78Relinked.category === "Debt Payment",
+    `Editing: no debt -> EXPENSE/Debt (got ${s78Unlinked.type}/${s78Unlinked.category}), the debt again -> TRANSFER/Debt Payment (got ${s78Relinked.type}/${s78Relinked.category})`
+  );
+
+  // 78.4 The one-off relabel (debt_payment_category_v1) changes only debt TRANSFERs saved as "Debt",
+  // Trash included, runs once, and leaves spending totals alone
+  const { runDebtPaymentCategoryMigration: s78Migrate, DEBT_PAYMENT_CATEGORY_KEY: s78MigrateKey } = require("../services/debtPaymentCategoryService");
+  const s78Checking2 = await require("../services/checkingService").getPrimaryCheckingAccount();
+  const s78OldRow = (fields) => Transaction.create({ title: `Suite78 old ${s78Stamp}`, amount: 11, date: getTorontoToday(), isCleared: true, balanceApplied: true, ...fields });
+  const s78OldPay = await s78OldRow({ type: "TRANSFER", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: s78DebtRes.body.id });
+  const s78OldTrashed = await s78OldRow({ type: "TRANSFER", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: s78DebtRes.body.id });
+  await s78OldTrashed.destroy();
+  const s78OldBuy = await s78OldRow({ type: "EXPENSE", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: null });
+  const s78OldCard = await s78OldRow({ type: "TRANSFER", category: "Debt", fromAccountId: s78Checking2.id, toAccountId: s78CardRes.body.id });
+  const s78SpendBefore = await s78("GET", "/api/spending-summary");
+  await Setting.destroy({ where: { key: s78MigrateKey } });
+  const s78Relabelled = await s78Migrate();
+  const s78Again = await s78Migrate();
+  const s78After = await Promise.all(
+    [s78OldPay, s78OldTrashed, s78OldBuy, s78OldCard].map(async (r) => (await Transaction.findByPk(r.id, { paranoid: false })).category)
+  );
+  const s78SpendAfter = await s78("GET", "/api/spending-summary");
+  assert(
+    s78After.join(",") === "Debt Payment,Debt Payment,Debt,Debt",
+    `Relabel: debt TRANSFERs (live and trashed) become Debt Payment; the purchase and the card transfer keep Debt (got ${s78After})`
+  );
+  assert(s78Relabelled >= 2 && s78Again === null && (await Setting.findByPk(s78MigrateKey))?.value === "true", `The relabel runs once (first ${s78Relabelled} rows, then ${s78Again})`);
+  assert(
+    JSON.stringify(s78SpendAfter.body) === JSON.stringify(s78SpendBefore.body),
+    "Spending summary is the same before and after the relabel"
+  );
+  await Transaction.destroy({ where: { id: [s78OldPay.id, s78OldTrashed.id, s78OldBuy.id, s78OldCard.id] }, force: true });
+
+  // 78.5 The series routes refuse an id that isn't a UUID with 400 "Invalid series id"
+  const s78BadEnd = await s78("POST", "/api/recurring/not-a-uuid/end", {});
+  const s78BadCancel = await s78("POST", "/api/subscriptions/not-a-uuid/cancel");
+  assert(
+    s78BadEnd.status === 400 && s78BadEnd.body?.error === "Invalid series id" &&
+      s78BadCancel.status === 400 && s78BadCancel.body?.error === "Invalid series id",
+    `End series and cancel subscription refuse "not-a-uuid" (got ${s78BadEnd.status} ${s78BadEnd.body?.error}, ${s78BadCancel.status} ${s78BadCancel.body?.error})`
+  );
+
+  // 78.6 The Gem feed's "projected income this month" comes from the forecast Safe to Spend uses: the sum
+  // of its income from today to month end (variable pay plans with the cautious amount; Expected pay
+  // with its amount), and the feed's Safe to Spend is the forecast's
+  const s78FeedKey = (await s78("GET", "/api/export/gemini-config")).body.feedKey;
+  const s78MonthEnd = (() => {
+    const [y, m] = getTorontoToday().split("-").map(Number);
+    return `${y}-${String(m).padStart(2, "0")}-${String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, "0")}`;
+  })();
+  const s78FeedCheck = async (label) => {
+    const [feed, forecastRes] = await Promise.all([
+      request({ hostname: "localhost", port: 8000, path: `/api/export/financial-feed.csv?key=${s78FeedKey}`, method: "GET" }),
+      s78("GET", "/api/forecast?days=60"),
+    ]);
+    const fc = forecastRes.body;
+    const rows = s36ParseCsv(feed.raw || "");
+    const projectedRow = rows.find((r) => r[0] === "OVERVIEW" && r[2] === "Projected Upcoming Income");
+    const safeRow = rows.find((r) => r[0] === "FORECAST" && r[1] === "SAFE_TO_SPEND");
+    const incomeDays = fc.days.filter((d) => d.date <= s78MonthEnd && d.items.some((it) => it.amount > 0));
+    const expected = Math.round(incomeDays.reduce((sum, d) => sum + d.items.reduce((s, it) => s + (it.amount > 0 ? it.amount : 0), 0), 0) * 100) / 100;
+    const projected = projectedRow ? parseFloat(projectedRow[3].replace("$", "")) : NaN;
+    const datesNamed = incomeDays.every((d) => projectedRow?.[4].includes(d.date));
+    assert(
+      feed.status === 200 && projected === expected && datesNamed,
+      `${label}: feed projected income $${projected} = forecast income to month end $${expected} (${fc.incomeSource}, dates ${incomeDays.map((d) => d.date).join(" ") || "none"})`
+    );
+    assert(safeRow && parseFloat(safeRow[2]) === fc.safeToSpend, `${label}: feed SAFE_TO_SPEND ${safeRow?.[2]} matches the forecast's ${fc.safeToSpend}`);
+    return fc;
+  };
+  // Variable weekly pay; the newest was 6 days ago, so the next estimated paycheque is tomorrow
+  const s78PayAmounts = [900, 1500, 1100, 1300, 1600, 1000, 1400, 1200];
+  for (let i = 0; i < s78PayAmounts.length; i++) {
+    await Transaction.create({ title: "Suite78 Shift Pay", amount: s78PayAmounts[i], date: getTorontoOffsetDate(-6 - 7 * i), type: "INCOME", category: "Income", isCleared: true, toAccountId: s78Checking.id });
+  }
+  const s78VarFc = await s78FeedCheck("Variable pay");
+  assert(s78VarFc.incomeSource === "estimated", `Variable pay forecast plans with estimated paycheques (got ${s78VarFc.incomeSource})`);
+  await Transaction.destroy({ where: { title: "Suite78 Shift Pay" }, force: true });
+  const s78Expected = await s78("PUT", "/api/settings/expected-pay", { nextDate: getTorontoOffsetDate(1), amount: 1234.56, cadence: "weekly" });
+  assert(s78Expected.status === 200, `Expected pay saved (got ${s78Expected.status})`);
+  await s78FeedCheck("Expected pay");
+  await s78("DELETE", "/api/settings/expected-pay");
 
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
