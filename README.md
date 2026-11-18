@@ -4,7 +4,7 @@ Personal financial tracking API powered by Express, Sequelize (PostgreSQL in pro
 
 ## Hosting & Environment Variables
 
-The API runs on Render (long-running Node process), the frontend on Vercel, and PostgreSQL on Neon. Set these on the Render service:
+The API runs on Render (long-running Node process), the frontend on Vercel, and PostgreSQL on Neon. These are every environment variable the code reads. Set them on the Render service:
 
 | Variable | Required in production | Purpose |
 | --- | --- | --- |
@@ -12,9 +12,36 @@ The API runs on Render (long-running Node process), the frontend on Vercel, and 
 | `JWT_SECRET` | Yes (boot fails without it) | Random value, ideally 32+ characters (`openssl rand -hex 32`); shorter values log a warning. Changing it signs everyone out. |
 | `SUPER_SECRET_PASSWORD_HASH` | One of these two | Optional upgrade: login password hash from `node scripts/hash-password.js "<password>"`. |
 | `SUPER_SECRET_PASSWORD` | One of these two | Plaintext login password (still supported; logs a warning). Ignored when the hash is set. |
-| `CRON_SECRET` | Yes | Bearer token for the nightly GitHub Actions workflow |
+| `CRON_SECRET` | Yes | Bearer token for the nightly and morning GitHub Actions workflows (`/api/cron/*`) |
+| `GEMINI_API_KEY` | For AI features | Google Gemini key. Without it the app works, but Ask FinTrack, receipt reading, AI categories and AI-written commentary are off. |
+| `GEMINI_MODEL_FAST` | No (default `gemini-3.5-flash`) | Model for AI categories and the Sunday digest wrap-up (also the receipt model unless `GEMINI_MODEL_RECEIPT` is set) |
+| `GEMINI_MODEL_CHAT` | No (default `gemini-3.5-flash`) | Model for Ask FinTrack chat |
+| `GEMINI_MODEL_ADVICE` | No (default `gemini-3.5-flash`) | Model for financial advice and month-close commentary |
+| `GEMINI_MODEL_RECEIPT` | No (default: `GEMINI_MODEL_FAST`) | Model for reading receipt photos |
 | `PUBLIC_BACKEND_URL` | No | Overrides the feed base URL (defaults to `https://fintrack-backend-rzrh.onrender.com` in production). Feed URLs are never built from request headers in production. |
+| `FRONTEND_URL` | No (default `https://fintrack-frontend-jet.vercel.app`) | App links in the Gem feed |
 | `ENABLE_IN_PROCESS_CRON` | No (default on) | Set to `false` to rely only on the GitHub Actions workflow. Overlapping runs are safe: the sweep takes a Postgres advisory lock. |
+| `PORT` | No (Render sets it; default `8000`) | Port the server listens on |
+| `DB_ALTER_SYNC` | No | `true` runs `sequelize.sync({ alter: true })` at boot. Leave unset in production; new columns use guarded migrations in `server.js`. |
+| `DB_SSL_REJECT_UNAUTHORIZED` | No (default on) | `false` accepts a database certificate that can't be verified. Leave unset for Neon. |
+| `DB_LOGGING` | No | `true` logs every SQL query |
+| `DB_DIALECT` | No (default `postgres`) | Sequelize dialect for `DATABASE_URL` |
+| `RELAX_RATE_LIMIT` | No | `true` loosens rate limits in development and test. Ignored in production. |
+
+`NODE_ENV` (`production` on Render, `test` for the test server), `USE_PRODUCTION_DB` (restore script only) and `ALLOW_DEV_BYPASS` (local dev and test login without a password; never in production) are for local work and scripts, not Render.
+
+### GitHub Actions secrets
+
+Set under **Fintrack-backend** → **Settings** → **Secrets and variables** → **Actions**. They are used by the workflows, not by the server.
+
+| Name | Kind | Used by | Purpose |
+| --- | --- | --- | --- |
+| `CRON_SECRET` | Secret | nightly-jobs, morning-digest | Same value as on Render |
+| `BACKUPS_REPO_TOKEN` | Secret | nightly-jobs | Fine-grained token with write access to the private `fintrack-backups` repository |
+| `BACKUP_AGE_RECIPIENT` | Variable | nightly-jobs | Public `age` key backups are encrypted to (see below) |
+| `NTFY_TOPIC` | Secret | morning-digest | ntfy.sh topic the morning digest is pushed to |
+| `NTFY_TOKEN` | Secret (optional) | morning-digest | ntfy access token, for a protected topic |
+| `BACKEND_URL` | Variable (optional) | nightly-jobs | Overrides the backend URL (defaults to the Render URL) |
 
 ## Cold-Start Pinger (Render Free Tier)
 
