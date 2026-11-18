@@ -789,8 +789,12 @@ async function runTestSuite() {
     headers: authHeaders,
   });
   const allTxs = allLedgerRes.body?.rows || [];
-  const bad30thRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === `${rentStart.slice(0, 8)}30`);
-  assert(!bad30thRent, "No duplicate rent transaction generated for the 30th of that month");
+  // Every row of the series stays on the 1st (no drift to the 30th or any other day), whatever last month was
+  const rentRows = allTxs.filter((t) => t.name === "Automated Suite Rent");
+  assert(
+    rentRows.length >= 2 && rentRows.every((t) => t.date.endsWith("-01")),
+    `Every rent row in the series is on the 1st of a month, never drifting to another day (got ${rentRows.map((t) => t.date).join(",")})`
+  );
 
   const nextRent = allTxs.find((t) => t.name === "Automated Suite Rent" && t.date === rentNext);
   assert(nextRent, `Next recurring rent instance generated on exactly the 1st of this month (${rentNext})`);
@@ -2552,9 +2556,17 @@ async function runTestSuite() {
 
   // Clean up Suite 18 records
   await request({ hostname: "localhost", port: 8000, path: `/api/expenses/${s18TrxId}`, method: "DELETE", headers: authHeaders });
-  // The card still owes $300 and a card with a balance can't be removed (409), so zero it and delete it for good;
-  // otherwise it stays active and its due date shows up in later suites' digests and forecasts
-  await Account.update({ initialBalance: 0 }, { where: { id: s18CardId } });
+  // The card still owes $300 and a card with a balance can't be removed (409), so sync it to $0 through the
+  // real balance path (Sync with statement) and delete it for good; otherwise it stays active and its due date
+  // shows up in later suites' digests and forecasts
+  const s18CardZero = await request(
+    { hostname: "localhost", port: 8000, path: `/api/accounts/${s18CardId}/reconcile`, method: "POST", headers: authHeaders },
+    { actualBalance: 0, reason: "adjustment" }
+  );
+  assert(
+    s18CardZero.status === 201 && parseFloat((await Account.findByPk(s18CardId)).initialBalance) === 0,
+    `Syncing the Suite 18 card to $0 brings its balance to $0 (got ${s18CardZero.status} ${s18CardZero.raw || ""})`
+  );
   const s18CardDelete = await request(
     { hostname: "localhost", port: 8000, path: `/api/credit-cards/${s18CardId}`, method: "DELETE", headers: authHeaders },
     { mode: "delete" }
@@ -5854,6 +5866,10 @@ async function runTestSuite() {
   // Move the due date through the API so dueDay follows it, as in the app. Writing only dueDate left
   // dueDay on the old day, and whenever today + 10 fell in the next month the two disagreed
   const s38MoveToToday = await s33("PUT", `/api/debts/${s38MissId}`, { next_due_date: getTorontoToday() });
+  assert(
+    s38MoveToToday.status === 200 && s38MoveToToday.body.dueDay === Number(getTorontoToday().slice(8)),
+    `Moving the debt's due date to today also moves dueDay to today's day (got ${s38MoveToToday.status}, dueDay ${s38MoveToToday.body?.dueDay})`
+  );
   const s38TodayLast = s38Prev(getTorontoToday(), "monthly", s38MoveToToday.body.dueDay);
   assert((await s38MissFlag()) === s38TodayLast, "On the due day itself, the earlier due date is the one checked");
 
@@ -10781,7 +10797,7 @@ async function runTestSuite() {
   const s72FcAfter = (await s72Send("GET", "/api/forecast?days=60")).body;
   assert(
     // Only today's overdue row must go: on the 1st the next due date (the 30th/31st) is in this month's list too
-    s72Paid.status === 200 && !(s72DashAfter.upcomingDebtPayments || []).some((p) => p.debtId === s72Overdue.id && p.date === s72RealToday) &&
+    s72Paid.status === 200 && !(s72DashAfter.upcomingDebtPayments || []).some((p) => p.debtId === s72Overdue.id && (p.overdue || p.date === s72RealToday)) &&
       !s72Items(s72FcAfter, "Suite72 Overdue payment").some((i) => i.date === s72RealToday),
     "After paying, the overdue payment leaves Upcoming Bills and the forecast"
   );
