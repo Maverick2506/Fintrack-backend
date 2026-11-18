@@ -10,6 +10,7 @@ const { setBalanceAnchor } = require("../services/balanceAnchorService");
 const crypto = require("crypto");
 const { getCardStatement } = require("../services/statementService");
 const { getPrimaryCheckingAccount } = require("../services/checkingService");
+const { adjustAccountForTransaction } = require("../services/accountBalanceService");
 const { getCardFundBills, settleCardFundBills } = require("../services/sinkingFundService");
 const { getNextOccurrenceDate, getSeriesTemplate } = require("./recurring");
 const router = express.Router();
@@ -86,15 +87,8 @@ router.post(
       }
 
       const paymentAmount = parseFloat(req.body.amount);
-      // Atomic increment avoids lost updates under concurrency
-      await Account.increment("initialBalance", {
-        by: -paymentAmount,
-        where: { id: card.id },
-        transaction: dbTx,
-      });
-      await card.reload({ transaction: dbTx });
-
-      // Record as TRANSFER (not EXPENSE) to prevent double-counting card spending
+      // Record as TRANSFER (not EXPENSE) to prevent double-counting card spending. The balance
+      // service lowers the card (one place moves balances) and marks the row applied.
       const payment = await Transaction.create(
         {
           title: `Payment for ${card.name}`,
@@ -103,12 +97,15 @@ router.post(
           type: "TRANSFER",
           category: "Credit Card Payment",
           isCleared: true,
-          balanceApplied: true,
+          balanceApplied: false,
           fromAccountId: checking.id,
           toAccountId: card.id,
         },
         { transaction: dbTx }
       );
+      // forceApply: a payment made now always moves the card, even if midnight passed since its date
+      await adjustAccountForTransaction(payment, 1, dbTx, true);
+      await card.reload({ transaction: dbTx });
       // The bills on this payment that savings goals save for: each checked fund pays min(saved, bill)
       const cardFunds = await settleCardFundBills(card, payment, req.body.fundBills, getTodayString(), dbTx);
 

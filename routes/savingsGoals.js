@@ -10,6 +10,7 @@ const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
 const { groupSeries, ACTIVE_RECURRENCES } = require("./recurring");
 const { getSinkingFunds } = require("../services/sinkingFundService");
+const { adjustAccountForTransaction } = require("../services/accountBalanceService");
 const router = express.Router();
 router.param("id", validateIdParam);
 
@@ -368,15 +369,8 @@ router.post(
       }
 
       const amount = parseFloat(req.body.amount);
-      // Atomic increment avoids lost updates under concurrency
-      await Account.increment("initialBalance", {
-        by: amount,
-        where: { id: goal.id },
-        transaction: dbTx,
-      });
-      await goal.reload({ transaction: dbTx });
-
-      await Transaction.create(
+      // The balance service raises the goal (one place moves balances) and marks the row applied
+      const contribution = await Transaction.create(
         {
           title: `Contribution to ${goal.name}`,
           amount,
@@ -386,10 +380,12 @@ router.post(
           fromAccountId: checking.id,
           toAccountId: goal.id,
           isCleared: true,
-          balanceApplied: true,
+          balanceApplied: false,
         },
         { transaction: dbTx }
       );
+      await adjustAccountForTransaction(contribution, 1, dbTx, true);
+      await goal.reload({ transaction: dbTx });
 
       await dbTx.commit();
       res.json({

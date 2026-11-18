@@ -11119,6 +11119,59 @@ async function runTestSuite() {
     `Production login limiter allows 10 tries then returns 429 even with RELAX_RATE_LIMIT=true (got ${s77Statuses.join(",")})`
   );
 
+  // --- Suite 78: payments, Checking, debt payment category, series ids, Gem feed income (Audit PR 2) ---
+  console.log("\n--- Suite 78: One path for balances, one Checking, Debt Payment, series ids, feed income ---");
+  // Suite 76 signed every device out, so this suite logs in again
+  const s78Token = (await request({ hostname: "localhost", port: 8000, path: "/api/auth/login", method: "POST", headers: { "Content-Type": "application/json" } }, { devBypass: true })).body.token;
+  const s78Headers = { "Content-Type": "application/json", Authorization: `Bearer ${s78Token}` };
+  const s78 = (method, path, body = null) => s33(method, path, body, s78Headers);
+  const s78Bal = async (id) => parseFloat((await Account.findByPk(id)).initialBalance);
+
+  // 78.1 Card payment, debt payment and goal contribution all move their account once, through the balance
+  // service: the row ends balanceApplied, deleting it puts the balance back, restoring moves it again,
+  // and two submits at once never move the balance without a row (or save a row without moving it).
+  const s78Stamp = Date.now();
+  const s78CardRes = await s78("POST", "/api/credit-cards", { name: `Suite78 Card ${s78Stamp}`, creditLimit: 1000, currentBalance: 500 });
+  const s78DebtRes = await s78("POST", "/api/debts", { name: `Suite78 Loan ${s78Stamp}`, total_amount: 400 });
+  const s78GoalRes = await s78("POST", "/api/savings-goals", { name: `Suite78 Goal ${s78Stamp}`, goal_amount: 1000 });
+  assert(s78CardRes.status === 201 && s78DebtRes.status === 201 && s78GoalRes.status === 201, `Suite 78 creates a card, a debt and a goal (${s78CardRes.status} ${s78DebtRes.status} ${s78GoalRes.status})`);
+  const s78Flows = [
+    { label: "Card payment", id: s78CardRes.body.id, path: `/api/credit-cards/${s78CardRes.body.id}/pay`, sign: -1, field: "currentBalance", category: "Credit Card Payment" },
+    { label: "Debt payment", id: s78DebtRes.body.id, path: `/api/debts/${s78DebtRes.body.id}/pay`, sign: -1, field: "total_remaining", category: "Debt" },
+    { label: "Goal contribution", id: s78GoalRes.body.id, path: `/api/savings-goals/${s78GoalRes.body.id}/contribute`, sign: 1, field: "current_amount", category: "Savings Transfer" },
+  ];
+  for (const flow of s78Flows) {
+    const before = await s78Bal(flow.id);
+    const payRes = await s78("POST", flow.path, { amount: 40 });
+    const after = await s78Bal(flow.id);
+    const expected = Math.round((before + flow.sign * 40) * 100) / 100;
+    assert(payRes.status === 200 && after === expected, `${flow.label} moves the balance once ($${before} -> $${after}, expected $${expected})`);
+    assert(parseFloat(payRes.body[flow.field]) === expected, `${flow.label} response shows the balance after the payment (${flow.field} = ${payRes.body[flow.field]})`);
+    const row = await Transaction.findOne({ where: { toAccountId: flow.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]] });
+    assert(row && row.balanceApplied === true && row.isCleared === true && parseFloat(row.amount) === 40, `${flow.label} row is a cleared TRANSFER marked balanceApplied`);
+    assert(row && row.category === flow.category, `${flow.label} row has category ${flow.category} (got ${row && row.category})`);
+
+    const delRes = await s78("DELETE", `/api/expenses/${row.id}`);
+    assert((delRes.status === 200 || delRes.status === 204) && (await s78Bal(flow.id)) === before, `Deleting the ${flow.label.toLowerCase()} puts the balance back to $${before}`);
+    const restoreRes = await s78("POST", "/api/expenses/restore", { ids: [row.id] });
+    const afterRestore = await s78Bal(flow.id);
+    assert(restoreRes.status === 200 && afterRestore === expected, `Restoring the ${flow.label.toLowerCase()} from the Trash moves the balance again ($${afterRestore})`);
+    const restoredRow = await Transaction.findByPk(row.id);
+    assert(restoredRow && restoredRow.balanceApplied === true, `Restored ${flow.label.toLowerCase()} is still marked balanceApplied`);
+
+    // Two submits at once: each saved row moved the balance exactly once, and a failed submit left nothing
+    const rowsBefore = await Transaction.count({ where: { toAccountId: flow.id, type: "TRANSFER" } });
+    const twice = await Promise.all([s78("POST", flow.path, { amount: 10 }), s78("POST", flow.path, { amount: 10 })]);
+    const okCount = twice.filter((r) => r.status === 200).length;
+    const added = (await Transaction.count({ where: { toAccountId: flow.id, type: "TRANSFER" } })) - rowsBefore;
+    const newRows = await Transaction.findAll({ where: { toAccountId: flow.id, type: "TRANSFER" }, order: [["createdAt", "DESC"]], limit: Math.max(added, 1) });
+    const moved = Math.round(((await s78Bal(flow.id)) - expected) * 100) / 100;
+    assert(
+      okCount >= 1 && added === okCount && moved === flow.sign * 10 * okCount && newRows.slice(0, added).every((r) => r.balanceApplied === true),
+      `${flow.label} double submit: ${okCount} succeeded, ${added} rows saved, balance moved $${moved} (one move per saved row)`
+    );
+  }
+
   console.log("\n  [CLEANUP] All temporary test records purged from database.");
 
   console.log("\n==================================================");

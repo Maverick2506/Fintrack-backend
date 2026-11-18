@@ -7,6 +7,7 @@ const { validateBody, validateIdParam, schemas } = require("../middleware/valida
 const { asyncHandler } = require("../middleware/errorHandler");
 const { retireAccount } = require("../services/accountArchiveService");
 const { findMissedPayment } = require("../services/debtInterestService");
+const { adjustAccountForTransaction } = require("../services/accountBalanceService");
 const router = express.Router();
 
 // Day of month from a YYYY-MM-DD due date (R3)
@@ -141,15 +142,9 @@ router.post(
         });
       }
 
-      await Account.increment("initialBalance", {
-        by: -paymentAmount,
-        where: { id: debt.id },
-        transaction: dbTx,
-      });
-      await debt.reload({ transaction: dbTx });
-
-      // Record as a TRANSFER to the debt (like card payments): it lowers checking and the debt, not spending (C5)
-      await Transaction.create(
+      // Record as a TRANSFER to the debt (like card payments): it lowers checking and the debt, not spending (C5).
+      // The balance service lowers the debt (one place moves balances) and marks the row applied.
+      const payment = await Transaction.create(
         {
           title: `Payment for ${debt.name}`,
           amount: paymentAmount,
@@ -157,12 +152,15 @@ router.post(
           type: "TRANSFER",
           category: "Debt",
           isCleared: true,
-          balanceApplied: true,
+          balanceApplied: false,
           fromAccountId: checking.id,
           toAccountId: debt.id,
         },
         { transaction: dbTx }
       );
+      // forceApply: a payment made now always moves the debt, even if midnight passed since its date
+      await adjustAccountForTransaction(payment, 1, dbTx, true);
+      await debt.reload({ transaction: dbTx });
 
       await dbTx.commit();
       res.json(formatDebtResponse(debt));
